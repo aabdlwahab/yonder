@@ -41,6 +41,8 @@ use util::{
 
 /// How long to wait for SSH to connect when no askpass prompt has opened.
 const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);
+const SERVER_BINARY_CHECK_ATTEMPTS: u32 = 3;
+const SERVER_BINARY_CHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub(crate) struct SshRemoteConnection {
     socket: SshSocket,
@@ -1039,16 +1041,36 @@ impl SshRemoteConnection {
         let dst_path =
             paths::remote_server_dir_relative().join(RelPath::from_unix_str(&binary_name).unwrap());
 
-        let binary_exists_on_server = self
-            .socket
-            .run_command(
-                self.ssh_shell_kind,
-                &dst_path.display(self.path_style()),
-                &["version"],
-                true,
-            )
-            .await
-            .is_ok();
+        // A single failed check over a flaky link used to count as "missing",
+        // which sent Yonder off to build a server locally. Retry before deciding.
+        let mut binary_exists_on_server = false;
+        for attempt in 1..=SERVER_BINARY_CHECK_ATTEMPTS {
+            match self
+                .socket
+                .run_command(
+                    self.ssh_shell_kind,
+                    &dst_path.display(self.path_style()),
+                    &["version"],
+                    true,
+                )
+                .await
+            {
+                Ok(_) => {
+                    binary_exists_on_server = true;
+                    break;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "checking for the server binary (attempt {attempt} of {SERVER_BINARY_CHECK_ATTEMPTS}) failed: {error:#}"
+                    );
+                    if attempt < SERVER_BINARY_CHECK_ATTEMPTS {
+                        cx.background_executor()
+                            .timer(SERVER_BINARY_CHECK_RETRY_DELAY)
+                            .await;
+                    }
+                }
+            }
+        }
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
