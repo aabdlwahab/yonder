@@ -11584,10 +11584,18 @@ pub fn find_existing_workspace(
         let active_window = cx.active_window();
 
         if open_options.workspace_matching != WorkspaceMatching::None {
+            // When the caller names a window, only look there: Yonder brings a
+            // project into the window you're working in instead of switching
+            // you to another window that happens to have it open.
             for window in cx
                 .windows()
                 .into_iter()
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .filter(|window| {
+                    open_options
+                        .requesting_window
+                        .is_none_or(|requested| requested == *window)
+                })
             {
                 if let Ok(multi_workspace) = window.read(cx) {
                     let active_workspace = multi_workspace.workspace();
