@@ -155,6 +155,12 @@ impl OpenRequest {
         }
 
         for url in request.urls {
+            // The OS-registered scheme is `yonder://` so this fork doesn't steal Zed's links;
+            // the handlers below still speak upstream's `zed://` form.
+            let url = match url.strip_prefix("yonder://") {
+                Some(rest) => format!("zed://{rest}"),
+                None => url,
+            };
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {

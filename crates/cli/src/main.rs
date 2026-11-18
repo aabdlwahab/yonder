@@ -48,7 +48,7 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "zed",
+    name = "yonder",
     disable_version_flag = true,
     before_help = "The Zed CLI binary.
 This CLI is a separate binary that invokes Zed.
@@ -1109,7 +1109,7 @@ mod flatpak {
             let flatpak_dir = Path::new("/flatpak");
             let args = restart_cli_args(flatpak_dir, &["project".into()]);
             let parsed =
-                crate::Args::try_parse_from(std::iter::once(OsString::from("zed")).chain(args))
+                crate::Args::try_parse_from(std::iter::once(OsString::from("yonder")).chain(args))
                     .unwrap();
 
             assert_eq!(parsed.zed, Some(flatpak_dir.join("libexec/zed-editor")));
@@ -1413,7 +1413,7 @@ mod mac_os {
             user_data_dir: Option<&str>,
         ) -> io::Result<ExitStatus> {
             let path = match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/yonder"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             };
 
@@ -1427,7 +1427,7 @@ mod mac_os {
 
         fn path(&self) -> PathBuf {
             match self {
-                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/zed"),
+                Bundle::App { app_bundle, .. } => app_bundle.join("Contents/MacOS/yonder"),
                 Bundle::LocalPath { executable, .. } => executable.clone(),
             }
         }
