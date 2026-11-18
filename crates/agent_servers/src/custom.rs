@@ -232,7 +232,7 @@ impl AgentServer for CustomAgentServer {
             extra_env.insert("NO_BROWSER".to_owned(), "1".to_owned());
         }
         if is_registry_agent {
-            match agent_id.as_ref() {
+            match project::agent_server_store::registry_id_for_agent(agent_id.as_ref()) {
                 CLAUDE_AGENT_ID => {
                     extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
                 }
