@@ -182,6 +182,7 @@ project_bookmarks.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
+fleet_panel.workspace = true
 release_channel.workspace = true
 remote.workspace = true
 repl.workspace = true

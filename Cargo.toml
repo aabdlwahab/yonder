@@ -177,6 +177,7 @@ members = [
     "crates/proto",
     "crates/proxy_handshake",
     "crates/recent_projects",
+    "crates/fleet_panel",
     "crates/refineable",
     "crates/refineable/derive_refineable",
     "crates/release_channel",
@@ -454,6 +455,7 @@ prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
 proxy_handshake = { path = "crates/proxy_handshake" }
 recent_projects = { path = "crates/recent_projects" }
+fleet_panel = { path = "crates/fleet_panel" }
 refineable = { path = "crates/refineable" }
 release_channel = { path = "crates/release_channel" }
 remote = { path = "crates/remote" }

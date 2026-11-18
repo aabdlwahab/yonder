@@ -6362,6 +6362,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "recent_projects",
+ "remote",
+ "settings",
+ "ui",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "float-cmp"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22564,6 +22579,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "fleet_panel",
  "fs",
  "futures 0.3.34",
  "git",
