@@ -199,7 +199,8 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        // Zed's update server would replace Yonder with upstream Zed.
+        false
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
