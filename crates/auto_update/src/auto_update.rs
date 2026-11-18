@@ -326,6 +326,13 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         .map(|channel| channel.poll_for_updates())
         .unwrap_or(false)
     {
+        drop(window.prompt(
+            gpui::PromptLevel::Info,
+            "Yonder doesn't update itself.",
+            Some("New versions come from rebuilding Yonder from its source repository."),
+            &["OK"],
+            cx,
+        ));
         return;
     }
 

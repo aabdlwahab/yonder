@@ -44,10 +44,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dev => "Yonder-Editor-Dev",
+        ReleaseChannel::Nightly => "Yonder-Editor-Nightly",
+        ReleaseChannel::Preview => "Yonder-Editor-Preview",
+        ReleaseChannel::Stable => "Yonder-Editor-Stable",
     }
 }
 
@@ -199,16 +199,17 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        // Zed's update server would replace Yonder with upstream Zed.
+        false
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "Yonder Dev",
+            ReleaseChannel::Nightly => "Yonder Nightly",
+            ReleaseChannel::Preview => "Yonder Preview",
+            ReleaseChannel::Stable => "Yonder",
         }
     }
 
@@ -227,10 +228,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dev => "io.github.aabdlwahab.Yonder-Dev",
+            ReleaseChannel::Nightly => "io.github.aabdlwahab.Yonder-Nightly",
+            ReleaseChannel::Preview => "io.github.aabdlwahab.Yonder-Preview",
+            ReleaseChannel::Stable => "io.github.aabdlwahab.Yonder",
         }
     }
 

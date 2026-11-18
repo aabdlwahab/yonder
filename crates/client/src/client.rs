@@ -544,9 +544,10 @@ pub struct TelemetrySettings {
 impl settings::Settings for TelemetrySettings {
     fn from_settings(content: &SettingsContent) -> Self {
         let telemetry = content.telemetry.as_ref().unwrap();
+        // Yonder never reports usage data or crash dumps to Zed's servers.
         Self {
-            diagnostics: telemetry.diagnostics.unwrap(),
-            metrics: telemetry.metrics.unwrap(),
+            diagnostics: false,
+            metrics: false,
             anthropic_retention: telemetry.anthropic_retention.unwrap(),
         }
     }
@@ -874,6 +875,9 @@ impl Client {
         try_provider: bool,
         cx: &AsyncApp,
     ) -> Result<Credentials> {
+        if !ZED_ACCOUNT_SIGN_IN_ENABLED {
+            anyhow::bail!("Yonder does not use Zed accounts, so sign-in is turned off.");
+        }
         let is_reauthenticating = if self.status().borrow().is_signed_out() {
             self.set_status(Status::Authenticating, cx);
             false
@@ -1918,8 +1922,11 @@ impl ProtoClient for Client {
     }
 }
 
+/// Yonder has no Zed account, so collaboration and Zed-hosted services stay signed out.
+const ZED_ACCOUNT_SIGN_IN_ENABLED: bool = false;
+
 /// prefix for the zed:// url scheme
-pub const ZED_URL_SCHEME: &str = "zed";
+pub const ZED_URL_SCHEME: &str = "yonder";
 
 /// A parsed Zed link that can be handled internally by the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
