@@ -1758,7 +1758,19 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     if let Some(connection_options) = request.remote_connection {
         let open_behavior = request.open_behavior;
         let location = workspace::SerializedWorkspaceLocation::Remote(connection_options.clone());
-        let base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
+        let mut base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
+        // When projects open in the existing window, a link to a remote project
+        // joins the window you're working in instead of opening a new one.
+        if base_open_options.add_dirs_to_sidebar && base_open_options.requesting_window.is_none() {
+            base_open_options.requesting_window = cx
+                .active_window()
+                .and_then(|window| window.downcast::<workspace::MultiWorkspace>())
+                .or_else(|| {
+                    cx.windows()
+                        .into_iter()
+                        .find_map(|window| window.downcast::<workspace::MultiWorkspace>())
+                });
+        }
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
             open_remote_project(connection_options, paths, app_state, base_open_options, cx).await
