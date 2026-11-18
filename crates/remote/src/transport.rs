@@ -291,7 +291,14 @@ async fn build_remote_server_from_source(
         if binary_exists_on_server {
             return Ok(None);
         }
-        log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
+        // Building is turned off, so don't fall back to a local cross-compile
+        // (which needs zig); say what is missing instead.
+        anyhow::bail!(
+            "The Yonder server isn't installed on this machine. Install it in ~/{} on the \
+             machine and connect again. (Building it here is turned off by \
+             ZED_BUILD_REMOTE_SERVER={build_remote_server}.)",
+            paths::remote_server_dir_relative().display(util::paths::PathStyle::Unix),
+        );
     }
 
     async fn run_cmd(command: &mut Command) -> Result<()> {
