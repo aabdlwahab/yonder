@@ -210,6 +210,38 @@ static EXTENSION_TO_REGISTRY_IDS: LazyLock<HashMap<&'static str, &'static str>> 
         ])
     });
 
+/// Yonder lets one registry agent run under several accounts. A settings entry
+/// named `claude-acp@work` reuses the `claude-acp` registry agent with its own
+/// environment (for example `CLAUDE_CONFIG_DIR`), so each account is a separate
+/// agent and their threads can run side by side.
+pub fn registry_id_for_agent(agent_name: &str) -> &str {
+    agent_name
+        .split_once('@')
+        .map_or(agent_name, |(registry_id, _)| registry_id)
+}
+
+/// The account part of an account variant's name (`work` in `claude-acp@work`).
+pub fn account_for_agent(agent_name: &str) -> Option<&str> {
+    agent_name
+        .split_once('@')
+        .map(|(_, account)| account)
+        .filter(|account| !account.is_empty())
+}
+
+/// Expands a leading `~/` in account variant environment values, so settings can
+/// name a config folder like `~/.claude-work` on whichever machine runs the agent.
+fn expand_home_in_env(env: &HashMap<String, String>) -> HashMap<String, String> {
+    env.iter()
+        .map(|(key, value)| {
+            let value = match value.strip_prefix("~/") {
+                Some(relative) => paths::home_dir().join(relative).to_string_lossy().into_owned(),
+                None => value.clone(),
+            };
+            (key.clone(), value)
+        })
+        .collect()
+}
+
 impl AgentServerStore {
     pub fn migrate_agent_server_from_extensions(
         &mut self,
@@ -376,7 +408,8 @@ impl AgentServerStore {
                     );
                 }
                 CustomAgentServerSettings::Registry { env, .. } => {
-                    let Some(agent) = registry_agents_by_id.get(name) else {
+                    let registry_id = registry_id_for_agent(name);
+                    let Some(agent) = registry_agents_by_id.get(registry_id) else {
                         if registry_store.is_some() {
                             log::debug!("Registry agent '{}' not found in ACP registry", name);
                         }
@@ -384,6 +417,16 @@ impl AgentServerStore {
                     };
 
                     let agent_name = AgentId(name.clone().into());
+                    let account = account_for_agent(name);
+                    let env = if account.is_some() {
+                        expand_home_in_env(env)
+                    } else {
+                        env.clone()
+                    };
+                    let display_name = match account {
+                        Some(account) => format!("{} · {account}", agent.metadata().name).into(),
+                        None => agent.metadata().name.clone(),
+                    };
                     match agent {
                         RegistryAgent::Binary(agent) => {
                             if !agent.supports_current_platform {
@@ -404,7 +447,7 @@ impl AgentServerStore {
                                         project_environment: project_environment.clone(),
                                         installation_dir: paths::external_agents_dir()
                                             .join("registry")
-                                            .join(sanitize_path_component(name)),
+                                            .join(sanitize_path_component(registry_id)),
                                         version: agent.metadata.version.clone(),
                                         targets: agent.targets.clone(),
                                         env: env.clone(),
@@ -414,7 +457,7 @@ impl AgentServerStore {
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
                                     agent.metadata.icon_path.clone(),
-                                    Some(agent.metadata.name.clone()),
+                                    Some(display_name),
                                 ),
                             );
                         }
@@ -426,7 +469,7 @@ impl AgentServerStore {
                                         fs: fs.clone(),
                                         node_runtime: node_runtime.clone(),
                                         project_environment: project_environment.clone(),
-                                        registry_id: Arc::from(name.as_str()),
+                                        registry_id: Arc::from(registry_id),
                                         version: agent.metadata.version.clone(),
                                         package: agent.package.clone(),
                                         args: agent.args.clone(),
@@ -437,7 +480,7 @@ impl AgentServerStore {
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
                                     agent.metadata.icon_path.clone(),
-                                    Some(agent.metadata.name.clone()),
+                                    Some(display_name),
                                 ),
                             );
                         }
@@ -752,12 +795,18 @@ impl AgentServerStore {
                     let (icon, display_name, source) = metadata
                         .remove(&agent_id)
                         .or_else(|| {
+                            let registry_id =
+                                AgentId(registry_id_for_agent(agent_id.as_ref()).to_string().into());
                             AgentRegistryStore::try_global(cx)
-                                .and_then(|store| store.read(cx).agent(&agent_id))
+                                .and_then(|store| store.read(cx).agent(&registry_id))
                                 .map(|s| {
+                                    let display_name = match account_for_agent(agent_id.as_ref()) {
+                                        Some(account) => format!("{} · {account}", s.name()).into(),
+                                        None => s.name().clone(),
+                                    };
                                     (
                                         s.icon_path().cloned(),
-                                        Some(s.name().clone()),
+                                        Some(display_name),
                                         ExternalAgentSource::Registry,
                                     )
                                 })
@@ -1762,6 +1811,29 @@ impl settings::Settings for AllAgentServersSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_variants_resolve_to_their_registry_agent() {
+        assert_eq!(registry_id_for_agent("claude-acp"), "claude-acp");
+        assert_eq!(registry_id_for_agent("claude-acp@work"), "claude-acp");
+        assert_eq!(account_for_agent("claude-acp@work"), Some("work"));
+        assert_eq!(account_for_agent("claude-acp"), None);
+        assert_eq!(account_for_agent("claude-acp@"), None);
+    }
+
+    #[test]
+    fn account_variant_env_expands_home_relative_paths() {
+        let env = HashMap::from_iter([
+            ("CLAUDE_CONFIG_DIR".to_string(), "~/.claude-work".to_string()),
+            ("OTHER".to_string(), "/absolute".to_string()),
+        ]);
+        let expanded = expand_home_in_env(&env);
+        assert_eq!(
+            expanded.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(paths::home_dir().join(".claude-work").to_string_lossy().as_ref())
+        );
+        assert_eq!(expanded.get("OTHER").map(String::as_str), Some("/absolute"));
+    }
     use crate::agent_registry_store::{
         AgentRegistryStore, RegistryAgent, RegistryAgentMetadata, RegistryNpxAgent,
     };
