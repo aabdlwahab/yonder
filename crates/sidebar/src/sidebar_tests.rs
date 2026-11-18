@@ -2069,6 +2069,13 @@ async fn test_window_frame_corners_follow_content(cx: &mut TestAppContext) {
         "title bar and status bar hidden"
     );
 
+    // These checks are about the Threads sidebar on the left, next to the window
+    // controls; Yonder's default puts it on the right, so pin the side here.
+    cx.update(|_, cx| {
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.threads_sidebar.position = SidebarDockPosition::Left;
+        AgentSettings::override_global(settings, cx);
+    });
     multi_workspace.update_in(cx, |multi_workspace, window, cx| {
         multi_workspace.toggle_sidebar(window, cx);
     });
@@ -2111,6 +2118,20 @@ async fn test_headers_follow_title_bar_visibility(cx: &mut TestAppContext) {
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    // These checks are about the Threads sidebar on the left, next to the window
+    // controls; Yonder's default puts it on the right, so pin the side here. It is
+    // a user setting because the helper below changes settings between readings.
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings
+                .agent
+                .get_or_insert_default()
+                .threads_sidebar
+                .get_or_insert_default()
+                .position = Some(SidebarDockPosition::Left);
+        });
+    });
+    cx.run_until_parked();
 
     let thread_list = header_search_offsets("sidebar-header-search", cx);
     assert_eq!(thread_list.hidden, thread_list.fullscreen);
@@ -6571,7 +6592,15 @@ async fn test_focused_thread_tracks_user_intent(cx: &mut TestAppContext) {
             workspace.panel::<AgentPanel>(cx).is_some(),
             "Agent panel should exist"
         );
-        let dock = workspace.left_dock().read(cx);
+        let dock = [
+            workspace.left_dock(),
+            workspace.right_dock(),
+            workspace.bottom_dock(),
+        ]
+        .into_iter()
+        .find(|dock| dock.read(cx).panel::<AgentPanel>().is_some())
+        .expect("the agent panel should be in a dock")
+        .read(cx);
         assert!(
             dock.is_open(),
             "Clicking a thread should open the agent panel dock"
