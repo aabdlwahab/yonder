@@ -20,8 +20,10 @@ use remote::{RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, Re
 use semver::Version;
 use settings::{Settings, SettingsStore, SshConnection};
 use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
-    AppState, MultiWorkspace, OpenOptions, Workspace,
+    AppState, MultiWorkspace, OpenMode, OpenOptions, SerializedWorkspaceLocation, Workspace,
+    WorkspaceDb,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::DetachAndPromptErr,
 };
@@ -42,6 +44,12 @@ const FLEET_PANEL_KEY: &str = "FleetPanel";
 /// How long the pointer must rest on a project before its machine is connected in advance.
 const PREWARM_HOVER_DELAY: Duration = Duration::from_millis(250);
 
+/// The laptop itself, listed above the SSH machines.
+const LOCAL_MACHINE_KEY: &str = "local";
+const LOCAL_MACHINE_LABEL: &str = "This Mac";
+/// How many recent local projects the panel lists.
+const LOCAL_PROJECT_LIMIT: usize = 8;
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -49,9 +57,17 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, _: &OpenSwitcher, window, cx| {
             let workspace_handle = cx.weak_entity();
-            let projects = fleet_machines(cx)
+            let local_projects = workspace
+                .panel::<FleetPanel>(cx)
+                .map(|panel| panel.read(cx).local_projects.clone())
+                .unwrap_or_default();
+            let projects = local_projects
                 .into_iter()
-                .flat_map(|machine| machine.projects)
+                .chain(
+                    fleet_machines(cx)
+                        .into_iter()
+                        .flat_map(|machine| machine.projects),
+                )
                 .collect();
             workspace.toggle_modal(window, cx, |window, cx| {
                 Picker::uniform_list(
@@ -72,9 +88,18 @@ struct FleetMachine {
     projects: Vec<FleetProject>,
 }
 
+/// Where a project's files live.
+#[derive(Clone)]
+enum ProjectLocation {
+    /// On this laptop, opened directly.
+    Local,
+    /// On an SSH machine, opened through the Yonder server there.
+    Ssh(SshConnection),
+}
+
 #[derive(Clone)]
 struct FleetProject {
-    connection: SshConnection,
+    location: ProjectLocation,
     machine_key: String,
     machine_label: SharedString,
     name: SharedString,
@@ -116,7 +141,7 @@ fn fleet_machines(cx: &App) -> Vec<FleetMachine> {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| project.paths.join(", "));
                     FleetProject {
-                        connection: connection.clone(),
+                        location: ProjectLocation::Ssh(connection.clone()),
                         machine_key: key.clone(),
                         machine_label: label.clone(),
                         name: name.into(),
@@ -131,6 +156,21 @@ fn fleet_machines(cx: &App) -> Vec<FleetMachine> {
             }
         })
         .collect()
+}
+
+fn local_fleet_project(paths: Vec<PathBuf>) -> FleetProject {
+    let name = paths
+        .first()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Untitled".to_string());
+    FleetProject {
+        location: ProjectLocation::Local,
+        machine_key: LOCAL_MACHINE_KEY.to_string(),
+        machine_label: LOCAL_MACHINE_LABEL.into(),
+        name: name.into(),
+        paths,
+    }
 }
 
 fn connection_options(connection: &SshConnection, cx: &App) -> RemoteConnectionOptions {
@@ -170,7 +210,14 @@ fn open_fleet_project(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let options = connection_options(&project.connection, cx);
+    let connection = match &project.location {
+        ProjectLocation::Local => {
+            open_local_project(project, window, cx);
+            return;
+        }
+        ProjectLocation::Ssh(connection) => connection,
+    };
+    let options = connection_options(connection, cx);
     let connection_state = if remote::has_active_connection(&options, cx) {
         "warm"
     } else {
@@ -194,6 +241,36 @@ fn open_fleet_project(
     .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
 }
 
+/// Opens a project on this laptop in the current window. Deferred, because the
+/// window is still being updated while this runs.
+fn open_local_project(project: &FleetProject, window: &mut Window, cx: &mut Context<Workspace>) {
+    let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+        return;
+    };
+    let paths = project.paths.clone();
+    let label = format!("{}/{}", project.machine_label, project.name);
+    cx.defer(move |cx| {
+        let started = Instant::now();
+        let Some(task) = handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+            })
+            .log_err()
+        else {
+            return;
+        };
+        cx.spawn(async move |_| {
+            if task.await.log_err().is_some() {
+                log::info!(
+                    "fleet: switched to {label} in {} ms (local)",
+                    started.elapsed().as_millis()
+                );
+            }
+        })
+        .detach();
+    });
+}
+
 /// Connections opened ahead of a click. The global connection pool only keeps
 /// connections that something still holds, so they are held here.
 #[derive(Default)]
@@ -207,7 +284,10 @@ impl Global for WarmConnections {}
 /// Connects to `project`'s machine in the background so opening it skips the
 /// SSH handshake and server check. Does nothing if a connection already exists.
 fn prewarm(project: &FleetProject, cx: &mut App) {
-    let options = connection_options(&project.connection, cx);
+    let ProjectLocation::Ssh(connection) = &project.location else {
+        return;
+    };
+    let options = connection_options(connection, cx);
     if remote::has_active_connection(&options, cx) {
         return;
     }
@@ -289,6 +369,10 @@ pub struct FleetPanel {
     position: DockPosition,
     collapsed_machines: HashSet<String>,
     hover_prewarm: Option<Task<()>>,
+    app_state: Arc<AppState>,
+    /// Recent projects on this laptop, newest first, from Yonder's own history.
+    local_projects: Vec<FleetProject>,
+    load_local_projects: Option<Task<()>>,
     _settings_subscription: Subscription,
 }
 
@@ -298,20 +382,50 @@ impl FleetPanel {
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
         let workspace_handle = workspace.clone();
-        workspace.update_in(&mut cx, |_, _, cx| {
-            cx.new(|cx| Self::new(workspace_handle, cx))
+        workspace.update_in(&mut cx, |workspace, _, cx| {
+            let app_state = workspace.app_state().clone();
+            cx.new(|cx| Self::new(workspace_handle, app_state, cx))
         })
     }
 
-    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
-        Self {
+    fn new(workspace: WeakEntity<Workspace>, app_state: Arc<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut panel = Self {
             workspace,
+            app_state,
             focus_handle: cx.focus_handle(),
             position: DockPosition::Left,
             collapsed_machines: HashSet::default(),
             hover_prewarm: None,
+            local_projects: Vec::new(),
+            load_local_projects: None,
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
-        }
+        };
+        panel.refresh_local_projects(cx);
+        panel
+    }
+
+    /// Runs while the workspace may still be mid-update (the panel is created
+    /// inside it), so it must not read the workspace entity.
+    fn refresh_local_projects(&mut self, cx: &mut Context<Self>) {
+        let fs = self.app_state.fs.clone();
+        let db = WorkspaceDb::global(cx);
+        self.load_local_projects = Some(cx.spawn(async move |this, cx| {
+            let recent = db
+                .recent_project_workspaces(fs.as_ref())
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.local_projects = recent
+                    .into_iter()
+                    .filter(|recent| matches!(recent.location, SerializedWorkspaceLocation::Local))
+                    .map(|recent| local_fleet_project(recent.paths.paths().to_vec()))
+                    .take(LOCAL_PROJECT_LIMIT)
+                    .collect();
+                cx.notify();
+            })
+            .log_err();
+        }));
     }
 
     fn toggle_machine(&mut self, key: &str, cx: &mut Context<Self>) {
@@ -333,18 +447,19 @@ impl FleetPanel {
         }));
     }
 
-    /// The machine and folders of the project shown in this workspace, if it is an SSH project.
+    /// The machine and folders of the project shown in this workspace.
     fn active_location(&self, cx: &App) -> Option<(String, Vec<PathBuf>)> {
         let workspace = self.workspace.upgrade()?;
         let project = workspace.read(cx).project().read(cx);
-        let RemoteConnectionOptions::Ssh(options) = project.remote_connection_options(cx)? else {
-            return None;
+        let key = match project.remote_connection_options(cx) {
+            None => LOCAL_MACHINE_KEY.to_string(),
+            Some(RemoteConnectionOptions::Ssh(options)) => machine_key(
+                options.username.as_deref(),
+                &options.host.to_string(),
+                options.port,
+            ),
+            Some(_) => return None,
         };
-        let key = machine_key(
-            options.username.as_deref(),
-            &options.host.to_string(),
-            options.port,
-        );
         let paths = project
             .visible_worktrees(cx)
             .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
@@ -383,7 +498,14 @@ impl FleetPanel {
 
 impl Render for FleetPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let machines = fleet_machines(cx);
+        let remote_machines = fleet_machines(cx);
+        let has_remote_machines = !remote_machines.is_empty();
+        let machines = std::iter::once(FleetMachine {
+            key: LOCAL_MACHINE_KEY.to_string(),
+            label: LOCAL_MACHINE_LABEL.into(),
+            projects: self.local_projects.clone(),
+        })
+        .chain(remote_machines);
         let active = self.active_location(cx);
 
         let mut list = v_flex()
@@ -392,11 +514,8 @@ impl Render for FleetPanel {
             .overflow_y_scroll()
             .py_1();
 
-        if machines.is_empty() {
-            list = list.child(self.render_empty_state());
-        }
-
-        for (machine_index, machine) in machines.iter().enumerate() {
+        for (machine_index, machine) in machines.enumerate() {
+            let is_local = machine.key == LOCAL_MACHINE_KEY;
             let expanded = !self.collapsed_machines.contains(&machine.key);
 
             list = list.child(
@@ -411,7 +530,14 @@ impl Render for FleetPanel {
                         let key = machine.key.clone();
                         move |this, _, _, cx| this.toggle_machine(&key, cx)
                     }))
-                    .start_slot(Icon::new(IconName::Server).color(Color::Muted))
+                    .start_slot(
+                        Icon::new(if is_local {
+                            IconName::Screen
+                        } else {
+                            IconName::Server
+                        })
+                        .color(Color::Muted),
+                    )
                     .child(Label::new(machine.label.clone()))
                     .end_slot(
                         Label::new(machine.projects.len().to_string())
@@ -423,6 +549,19 @@ impl Render for FleetPanel {
 
             if !expanded {
                 continue;
+            }
+
+            if is_local {
+                list = list.child(
+                    ListItem::new("fleet-open-folder")
+                        .spacing(ListItemSpacing::Sparse)
+                        .indent_level(1)
+                        .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                        .child(Label::new("Open Folder…").color(Color::Muted))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(workspace::Open::default().boxed_clone(), cx)
+                        }),
+                );
             }
 
             for (project_index, project) in machine.projects.iter().enumerate() {
@@ -457,6 +596,10 @@ impl Render for FleetPanel {
                     })),
                 );
             }
+        }
+
+        if !has_remote_machines {
+            list = list.child(self.render_empty_state());
         }
 
         v_flex()
@@ -515,6 +658,12 @@ impl Panel for FleetPanel {
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
+    }
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            self.refresh_local_projects(cx);
+        }
     }
 
     fn activation_priority(&self) -> u32 {
@@ -690,6 +839,14 @@ mod tests {
             Path::new("/home/me/projects/other")
         ));
         assert!(!same_remote_path(Path::new("~"), Path::new("/home/me/anything")));
+    }
+
+    #[test]
+    fn local_projects_are_named_after_their_first_folder() {
+        let project = local_fleet_project(vec![PathBuf::from("/Users/me/Projects/remote-code")]);
+        assert_eq!(project.name.as_ref(), "remote-code");
+        assert_eq!(project.machine_key, LOCAL_MACHINE_KEY);
+        assert!(matches!(project.location, ProjectLocation::Local));
     }
 
     #[test]
