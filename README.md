@@ -1,50 +1,77 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-# Zed
+# Yonder
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+Yonder is a native desktop editor for working on code that lives on other machines. Your laptop runs only the editor UI. Projects, language servers, terminals and builds stay on the remote machines and run there directly over SSH. They are not in containers.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Yonder is a fork of [Zed](https://github.com/zed-industries/zed). It keeps Zed's editor and remote development, and adds a sidebar of your machines and their projects so you can switch between them quickly.
 
----
+## What it adds to Zed
 
-### Installation
+- **Fleet panel.** A left-dock panel lists every SSH machine in your settings, with its project folders under it. Clicking a project opens it over SSH in the current window, and the open project is highlighted. With no machines configured, the panel offers to add one.
+- **Fast switching.** Each window keeps up to four projects open, so switching back to one of them is instant. When you open a fifth, the least recently shown project is released and reopens from its server next time. Projects with unsaved changes are never released.
+- **Pre-warmed connections.** Resting the pointer on a project in the fleet panel for 250 ms opens its machine's SSH connection ahead of the click. Pre-warming never shows UI, never downloads a server, and skips machines that ask for a password.
+- **Fleet switcher.** `ctrl-cmd-k` on macOS opens a searchable list of every project on every machine. Highlighting a project pre-warms its connection. The fleet panel can also be toggled with the `fleet_panel::ToggleFocus` action.
+- **Switch timing.** Each switch is logged with its duration and whether the connection was already warm. Search the Yonder log for `fleet:`.
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+## How it differs from Zed
 
-Other platforms are not yet available:
+- **Its own identity.** The app, binary (`yonder`), CLI, menus, data and config folders, and macOS bundle IDs (`io.github.aabdlwahab.Yonder*`) are all named Yonder. It can be installed beside Zed without sharing settings. It registers a `yonder://` URL scheme instead of `zed://`.
+- **No Zed services.** Telemetry and crash-report uploads are forced off whatever your settings say. Update checks are disabled, so Zed's update server can never replace Yonder. Zed sign-in is disabled and the title-bar Sign In button is hidden.
+- **Still enabled.** The extension store and the agent registry work as in Zed.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+To keep merges from upstream small, internal crate names, project-level `.zed/` folders and the remote server's directory on the machine still use Zed's names.
 
-### Developing Zed
+## Adding machines and projects
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+The fleet panel reads Zed's `ssh_connections` setting. Add a machine and its project folders in your settings file (**Yonder → Settings → Open Settings File**):
 
-### Contributing
+```json
+{
+  "ssh_connections": [
+    {
+      "host": "build-box.example.com",
+      "username": "me",
+      "nickname": "Build box",
+      "projects": [
+        { "paths": ["~/src/api"] },
+        { "paths": ["~/src/web"] }
+      ]
+    }
+  ]
+}
+```
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+Projects you open with Zed's own remote-project dialog are saved there too. See [Remote Development](./docs/src/remote-development.md) for the full connection options, such as ports, SSH arguments and port forwards.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+## Building
 
-### Licensing
+Yonder builds the same way as Zed. Follow the upstream guides:
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+- [Building on macOS](./docs/src/development/macos.md)
+- [Building on Linux](./docs/src/development/linux.md)
+- [Building on Windows](./docs/src/development/windows.md)
 
-License information for third party dependencies must be correctly provided for CI to pass.
+`cargo run` starts a development build of the `yonder` binary. `script/bundle-mac` packages a macOS app named Yonder and a `Yonder-<arch>.dmg`.
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+There are no Yonder release downloads yet.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+## Status and plans
 
-## Sponsorship
+Done so far:
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+1. The rename, and turning off Zed's telemetry, updates and sign-in.
+2. The fleet panel.
+3. Fast switching: the four-project cap, pre-warming, the fleet switcher and switch timing.
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Next are fleet-wide agent jobs: running agent threads on any machine under different accounts, handing a thread to another agent, and forking threads to run in parallel in their own git worktrees. A phone app that controls Yonder is planned for later.
+
+## Upstream
+
+The `upstream` remote points at [zed-industries/zed](https://github.com/zed-industries/zed) and is fetch-only. Yonder-specific code sits in its own crates where possible (for example `crates/fleet_panel`), and changes to Zed's crates are kept small so upstream can be merged regularly.
+
+Yonder is not affiliated with or endorsed by Zed Industries. Please report Yonder problems here, not to the Zed project.
+
+## Licensing
+
+Like Zed, Yonder's source code is licensed primarily under GPL-3.0-or-later ([LICENSE-GPL](./LICENSE-GPL)), with Apache-2.0 components where marked ([LICENSE-APACHE](./LICENSE-APACHE)). Zed's source code is copyright Zed Industries, Inc. and its contributors.
+
+Third-party license notices are generated with [`cargo-about`](https://github.com/EmbarkStudios/cargo-about). If a license check fails, see `script/licenses/zed-licenses.toml`. New crates that are not published should set `publish = false` under `[package]` in their `Cargo.toml`.
