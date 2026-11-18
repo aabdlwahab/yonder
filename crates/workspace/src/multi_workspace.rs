@@ -25,6 +25,10 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+/// How many projects Yonder keeps open in one window. Switching back to one of
+/// these is instant; older ones are released and reopen from the server.
+pub(crate) const WARM_WORKSPACE_LIMIT: usize = 4;
+
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -305,6 +309,9 @@ struct HeldWorkspace {
 pub struct MultiWorkspace {
     window_id: WindowId,
     held: Vec<HeldWorkspace>,
+    /// See [`WARM_WORKSPACE_LIMIT`]. Tests run without a limit unless they set one,
+    /// so upstream tests that open many workspaces keep passing.
+    pub(crate) warm_workspace_limit: usize,
     project_groups: Vec<ProjectGroupState>,
     /// Source of truth for which workspace is presented in this window, shared
     /// with each member `Workspace` so they can tell whether they own the
@@ -368,6 +375,11 @@ impl MultiWorkspace {
         });
         Self {
             window_id: window.window_handle().window_id(),
+            warm_workspace_limit: if cfg!(any(test, feature = "test-support")) {
+                usize::MAX
+            } else {
+                WARM_WORKSPACE_LIMIT
+            },
             held: vec![HeldWorkspace {
                 workspace,
                 pinned: false,
@@ -1387,6 +1399,7 @@ impl MultiWorkspace {
         if !should_retain_workspaces && !old_active_was_retained {
             self.detach_workspace(&old_active_workspace, cx);
         }
+        self.release_least_recent_workspaces(cx);
 
         // The platform window is shared across all workspaces in this window.
         // The previously-active workspace left the title and edited indicator
@@ -1440,6 +1453,33 @@ impl MultiWorkspace {
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
+    /// Releases the least recently shown workspaces beyond `warm_workspace_limit`.
+    /// Their project rows stay, so reopening one restores it. Workspaces with
+    /// unsaved changes are never released.
+    fn release_least_recent_workspaces(&mut self, cx: &mut Context<Self>) {
+        let excess = self.held.len().saturating_sub(self.warm_workspace_limit);
+        if excess == 0 {
+            return;
+        }
+        let displayed = self.displayed_index();
+        let mut candidates: Vec<(u64, Entity<Workspace>)> = self
+            .held
+            .iter()
+            .enumerate()
+            .filter(|(index, held)| *index != displayed && !held.workspace.read(cx).is_edited())
+            .filter_map(|(_, held)| Some((held.activated_at?, held.workspace.clone())))
+            .collect();
+        candidates.sort_by_key(|(activated_at, _)| *activated_at);
+        for (_, workspace) in candidates.into_iter().take(excess) {
+            log::info!(
+                "releasing workspace {:?} to stay within {} open projects",
+                workspace.entity_id(),
+                self.warm_workspace_limit
+            );
+            self.detach_workspace(&workspace, cx);
+        }
+    }
+
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
