@@ -14,10 +14,16 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+askpass.workspace = true
 collections.workspace = true
+futures.workspace = true
 gpui.workspace = true
+log.workspace = true
+picker.workspace = true
 recent_projects.workspace = true
+release_channel.workspace = true
 remote.workspace = true
+semver.workspace = true
 settings.workspace = true
 ui.workspace = true
 workspace.workspace = true

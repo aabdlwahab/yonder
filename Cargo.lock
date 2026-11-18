@@ -6366,10 +6366,16 @@ name = "fleet_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "askpass",
  "collections",
+ "futures 0.3.34",
  "gpui",
+ "log",
+ "picker",
  "recent_projects",
+ "release_channel",
  "remote",
+ "semver",
  "settings",
  "ui",
  "workspace",

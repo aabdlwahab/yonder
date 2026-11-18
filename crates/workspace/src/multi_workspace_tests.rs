@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::item::test::TestItem;
+use crate::multi_workspace::WARM_WORKSPACE_LIMIT;
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
@@ -1880,5 +1881,71 @@ async fn test_nearest_retained_workspace_skips_disconnected_workspace(cx: &mut T
             None,
             "a disconnected workspace should not be selected as a fallback"
         );
+    });
+}
+
+async fn open_workspaces_beyond_the_limit(
+    cx: &mut TestAppContext,
+    mark_first_edited: bool,
+) -> (
+    Entity<MultiWorkspace>,
+    Vec<Entity<Workspace>>,
+    &mut VisualTestContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let mut projects = Vec::new();
+    for index in 0..WARM_WORKSPACE_LIMIT + 2 {
+        let root = format!("/root_{index}");
+        fs.insert_tree(&root, json!({ "file.txt": "" })).await;
+        projects.push(Project::test(fs.clone(), [std::path::Path::new(&root)], cx).await);
+    }
+
+    let (multi_workspace, cx) = cx
+        .add_window_view(|window, cx| MultiWorkspace::test_new(projects[0].clone(), window, cx));
+    let first_workspace = multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.warm_workspace_limit = WARM_WORKSPACE_LIMIT;
+        multi_workspace.workspace().clone()
+    });
+    if mark_first_edited {
+        first_workspace.update(cx, |workspace, _| workspace.window_edited = true);
+    }
+
+    let mut workspaces = vec![first_workspace];
+    for project in &projects[1..] {
+        let workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        workspaces.push(workspace);
+    }
+    cx.run_until_parked();
+    (multi_workspace, workspaces, cx)
+}
+
+#[gpui::test]
+async fn test_least_recent_workspaces_are_released_beyond_the_limit(cx: &mut TestAppContext) {
+    let (multi_workspace, workspaces, cx) = open_workspaces_beyond_the_limit(cx, false).await;
+
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        let held: Vec<Entity<Workspace>> = multi_workspace.workspaces().cloned().collect();
+        assert_eq!(held.len(), WARM_WORKSPACE_LIMIT);
+        let most_recent = &workspaces[workspaces.len() - WARM_WORKSPACE_LIMIT..];
+        for workspace in most_recent {
+            assert!(held.contains(workspace), "recent workspaces stay open");
+        }
+        assert_eq!(Some(multi_workspace.workspace()), workspaces.last());
+    });
+}
+
+#[gpui::test]
+async fn test_workspaces_with_unsaved_changes_are_never_released(cx: &mut TestAppContext) {
+    let (multi_workspace, workspaces, cx) = open_workspaces_beyond_the_limit(cx, true).await;
+
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        let held: Vec<Entity<Workspace>> = multi_workspace.workspaces().cloned().collect();
+        assert_eq!(held.len(), WARM_WORKSPACE_LIMIT);
+        assert!(held.contains(&workspaces[0]), "the edited workspace stays open");
+        assert!(!held.contains(&workspaces[1]));
+        assert!(!held.contains(&workspaces[2]));
     });
 }
