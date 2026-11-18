@@ -258,6 +258,27 @@ fn handle_rpc_messages_over_child_process_stdio(
     })
 }
 
+/// A prebuilt server kept on this laptop for `platform`, if there is one, in
+/// `remote_servers/yonder/<os>-<arch>/` inside Yonder's data folder (for example
+/// `linux-x86_64/zed-remote-server-dev-build.gz`). A `.gz` copy is preferred
+/// because it uploads faster.
+pub(crate) fn bundled_server_binary(
+    platform: &crate::RemotePlatform,
+    binary_name: &str,
+) -> Option<std::path::PathBuf> {
+    let directory = paths::remote_servers_dir().join("yonder").join(format!(
+        "{}-{}",
+        platform.os.as_str(),
+        platform.arch.as_str()
+    ));
+    [
+        directory.join(format!("{binary_name}.gz")),
+        directory.join(binary_name),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,

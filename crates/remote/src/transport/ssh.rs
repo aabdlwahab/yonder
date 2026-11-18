@@ -1072,6 +1072,34 @@ impl SshRemoteConnection {
             }
         }
 
+        // Yonder can't download its server from Zed's release servers, so it
+        // uploads a prebuilt one kept on the laptop the first time a machine
+        // needs it. The name carries the version, so this runs once per version.
+        if !binary_exists_on_server
+            && let Some(bundled_server) =
+                super::bundled_server_binary(&self.ssh_platform, &binary_name)
+        {
+            delegate.set_status(Some("Installing the Yonder server on this machine"), cx);
+            let compressed = bundled_server.extension().is_some_and(|ext| ext == "gz");
+            let tmp_path = paths::remote_server_dir_relative().join(
+                RelPath::from_unix_str(&format!(
+                    "{binary_name}-upload-{}{}",
+                    std::process::id(),
+                    if compressed { ".gz" } else { "" }
+                ))
+                .context("building the upload path")?,
+            );
+            log::info!(
+                "installing the bundled server {} on the remote machine",
+                bundled_server.display()
+            );
+            self.upload_local_server_binary(&bundled_server, &tmp_path, delegate, cx)
+                .await?;
+            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                .await?;
+            return Ok(dst_path.into());
+        }
+
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.ssh_platform,
