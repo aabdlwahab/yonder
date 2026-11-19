@@ -183,6 +183,10 @@ mod tests {
     use std::{fs, process::Command};
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "synchronous test runs the copy script directly"
+    )]
     fn native_session_copy_preserves_the_id_and_fast_forwards_without_overwriting_diverged_history()
     {
         let dir = tempfile::tempdir().unwrap();
