@@ -39,6 +39,7 @@ use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
+use crate::conversation_tab::{self, ConversationTab};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
@@ -94,7 +95,7 @@ use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    PopoverMenuHandle, ProjectEmptyState, Tab, TabBar, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -345,6 +346,8 @@ struct SerializedAgentPanel {
     last_active_terminal_id: Option<String>,
     #[serde(default)]
     new_draft_thread_id: Option<ThreadId>,
+    #[serde(default)]
+    thread_tabs: Vec<ThreadId>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -368,7 +371,11 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| {
                             panel.new_thread_with_workspace(Some(workspace), window, cx)
                         });
-                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        if !conversation_tab::enabled(cx)
+                            || panel.read(cx).active_terminal_id().is_some()
+                        {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        }
                     }
                 })
                 .register_action(|workspace, _: &NewTerminalThread, window, cx| {
@@ -408,7 +415,9 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, action: &NewExternalAgentThread, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        if !conversation_tab::enabled(cx) {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        }
                         panel.update(cx, |panel, cx| {
                             panel.new_external_agent_thread(action, window, cx);
                         });
@@ -1126,6 +1135,7 @@ pub struct AgentPanel {
     context_server_registry: Entity<ContextServerRegistry>,
     focus_handle: FocusHandle,
     base_view: BaseView,
+    thread_tabs: Vec<ThreadId>,
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
@@ -1222,6 +1232,8 @@ impl AgentPanel {
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
 
+        let thread_tabs = self.thread_tabs.clone();
+
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(
@@ -1232,6 +1244,7 @@ impl AgentPanel {
                     last_active_thread,
                     last_active_terminal_id,
                     new_draft_thread_id,
+                    thread_tabs,
                 },
                 kvp,
             )
@@ -1389,6 +1402,9 @@ impl AgentPanel {
 
                     if let Some(serialized_panel) = &serialized_panel {
                         panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
+                        if conversation_tab::enabled(cx) {
+                            panel.thread_tabs = serialized_panel.thread_tabs.clone();
+                        }
                     } else if let Some(entry_kind) = global_last_created_entry_kind {
                         panel.last_created_entry_kind = entry_kind;
                     }
@@ -1520,6 +1536,12 @@ impl AgentPanel {
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
+                let before = this.thread_tabs.len();
+                this.thread_tabs.retain(|id| id != thread_id);
+                if this.thread_tabs.len() != before {
+                    this.serialize(cx);
+                    cx.notify();
+                }
                 if this.remove_retained_thread(thread_id).is_some() {
                     cx.notify();
                 }
@@ -1538,6 +1560,7 @@ impl AgentPanel {
         let panel = Self {
             workspace_id,
             base_view,
+            thread_tabs: Vec::new(),
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
             user_store,
@@ -1587,9 +1610,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if workspace
+        if let Some(panel) = workspace
             .panel::<Self>(cx)
-            .is_some_and(|panel| panel.read(cx).enabled(cx))
+            .filter(|panel| panel.read(cx).enabled(cx))
+            && !Self::open_editor_from_workspace(&panel, window, cx)
         {
             workspace.toggle_panel_focus::<Self>(window, cx);
         }
@@ -1601,9 +1625,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if workspace
+        if let Some(panel) = workspace
             .panel::<Self>(cx)
-            .is_some_and(|panel| panel.read(cx).enabled(cx))
+            .filter(|panel| panel.read(cx).enabled(cx))
+            && !Self::open_editor_from_workspace(&panel, window, cx)
         {
             workspace.focus_panel::<Self>(window, cx);
         }
@@ -1615,14 +1640,25 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if workspace
+        if let Some(panel) = workspace
             .panel::<Self>(cx)
-            .is_some_and(|panel| panel.read(cx).enabled(cx))
+            .filter(|panel| panel.read(cx).enabled(cx))
+            && !Self::open_editor_from_workspace(&panel, window, cx)
+            && !workspace.toggle_panel_focus::<Self>(window, cx)
         {
-            if !workspace.toggle_panel_focus::<Self>(window, cx) {
-                workspace.close_panel::<Self>(window, cx);
-            }
+            workspace.close_panel::<Self>(window, cx);
         }
+    }
+
+    fn open_editor_from_workspace(panel: &Entity<Self>, window: &mut Window, cx: &mut App) -> bool {
+        conversation_tab::enabled(cx)
+            && panel.update(cx, |panel, cx| {
+                if panel.active_terminal_id().is_some() || !panel.has_open_project(cx) {
+                    return false;
+                }
+                panel.ensure_thread_initialized(window, cx);
+                panel.present_active_conversation(window, cx)
+            })
     }
 
     pub fn thread_store(&self) -> &Entity<ThreadStore> {
@@ -1807,7 +1843,10 @@ impl AgentPanel {
         }
 
         if let Some(draft) = self.draft_thread.clone() {
-            if self.draft_has_content(&draft, cx) {
+            if self.draft_has_content(&draft, cx)
+                || (draft.read(cx).editor_tab().is_some()
+                    && *draft.read(cx).agent_key() != self.selected_agent)
+            {
                 let draft_id = draft.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
@@ -1931,8 +1970,35 @@ impl AgentPanel {
             return;
         }
 
-        self.selected_agent = action.agent.clone().into();
+        self.new_chat_for_agent(action.agent.clone().into(), window, cx);
+    }
+
+    pub(crate) fn new_chat_for_agent(
+        &mut self,
+        agent: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_agent = agent;
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+    }
+
+    pub(crate) fn chat_agents(&self, cx: &App) -> Vec<(Agent, SharedString)> {
+        let project = self.project.read(cx);
+        let mut agents = vec![(Agent::NativeAgent, Agent::NativeAgent.label())];
+        if !project.is_via_collab() {
+            let store = project.agent_server_store().read(cx);
+            agents.extend(
+                store
+                    .external_agents()
+                    .map(|id| {
+                        let label = store.agent_display_name(id).unwrap_or_else(|| id.0.clone());
+                        (Agent::from(id.clone()), label)
+                    })
+                    .sorted_by(|(_, left), (_, right)| left.cmp(right)),
+            );
+        }
+        agents
     }
 
     fn set_selected_agent_and_persist(&mut self, agent: Agent, cx: &mut Context<Self>) {
@@ -2985,7 +3051,7 @@ impl AgentPanel {
         let draft = self.ensure_draft(source, window, cx);
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             if conversation_view.entity_id() == draft.entity_id() {
-                if focus {
+                if focus && !self.present_active_conversation(window, cx) {
                     self.activation_focus_handle(cx).focus(window, cx);
                 }
                 return;
@@ -3034,6 +3100,7 @@ impl AgentPanel {
 
             if agent_matches
                 || has_editor_content
+                || draft.read(cx).editor_tab().is_some()
                 || draft.read(cx).has_pending_selections()
                 || !draft_is_active
             {
@@ -4050,6 +4117,25 @@ impl AgentPanel {
         }
     }
 
+    pub fn visible_thread_id(&self, workspace: &Workspace, cx: &App) -> Option<ThreadId> {
+        if let Some(tab) = workspace.active_item_as::<ConversationTab>(cx) {
+            return Some(tab.read(cx).thread_id(cx));
+        }
+        let agent_panel_id = workspace.panel::<AgentPanel>(cx)?.entity_id();
+        let panel_visible = workspace.all_docks().iter().any(|dock| {
+            dock.read(cx)
+                .visible_panel()
+                .is_some_and(|panel| panel.panel_id() == agent_panel_id)
+        });
+        if panel_visible
+            && let VisibleSurface::AgentThread(view) = self.visible_surface()
+            && view.read(cx).editor_tab().is_none()
+        {
+            return Some(view.read(cx).thread_id);
+        }
+        None
+    }
+
     pub(crate) fn visible_conversation_view(&self) -> Option<&Entity<ConversationView>> {
         match self.visible_surface() {
             VisibleSurface::AgentThread(conversation_view) => Some(conversation_view),
@@ -4308,7 +4394,10 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.has_pending_selections() || view.has_saved_input() {
+                if view.editor_tab().is_some()
+                    || view.has_pending_selections()
+                    || view.has_saved_input()
+                {
                     return false;
                 }
                 let Some(thread_view) = view.root_thread_view() else {
@@ -4354,6 +4443,11 @@ impl AgentPanel {
 
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let conversation_view = conversation_view.read(cx);
+            if conversation_tab::enabled(cx)
+                && !self.thread_tabs.contains(&conversation_view.thread_id)
+            {
+                self.thread_tabs.push(conversation_view.thread_id);
+            }
             let thread_agent = conversation_view.agent_key().clone();
             if self.selected_agent != thread_agent {
                 self.selected_agent = thread_agent;
@@ -4363,10 +4457,199 @@ impl AgentPanel {
 
         self.refresh_base_view_subscriptions(window, cx);
 
-        if focus {
+        if focus
+            && (self.focus_handle.contains_focused(window, cx)
+                || !self.present_active_conversation(window, cx))
+        {
             self.activation_focus_handle(cx).focus(window, cx);
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+    }
+
+    fn present_active_conversation(&self, window: &Window, cx: &mut Context<Self>) -> bool {
+        if !conversation_tab::enabled(cx) {
+            return false;
+        }
+        let Some(conversation) = self.active_conversation_view().cloned() else {
+            return false;
+        };
+        ConversationTab::open(
+            conversation,
+            self.workspace.clone(),
+            cx.weak_entity(),
+            window,
+            cx,
+        );
+        true
+    }
+
+    pub(crate) fn activate_conversation_tab(
+        &mut self,
+        conversation: Entity<ConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_conversation_view() == Some(&conversation) {
+            return;
+        }
+        self.remove_retained_thread(&conversation.read(cx).thread_id);
+        self.set_base_view(
+            BaseView::AgentThread {
+                conversation_view: conversation,
+            },
+            false,
+            window,
+            cx,
+        );
+    }
+
+    fn select_panel_thread(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conversation) = self
+            .conversation_views()
+            .into_iter()
+            .find(|view| view.read(cx).thread_id == thread_id)
+        {
+            self.activate_conversation_tab(conversation, window, cx);
+        } else if let Some(metadata) = ThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry(thread_id)
+                .filter(|thread| !thread.archived)
+                .cloned()
+        }) {
+            self.load_agent_thread(
+                Agent::from(metadata.agent_id.clone()),
+                thread_id,
+                Some(metadata.folder_paths().clone()),
+                metadata.title(),
+                false,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        } else {
+            return;
+        }
+
+        if let Some(tab) = self
+            .active_conversation_view()
+            .and_then(|view| view.read(cx).editor_tab())
+        {
+            let workspace = self.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.activate_item(&tab, true, true, window, cx);
+                    })
+                    .log_err();
+            });
+        } else {
+            self.activation_focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn close_panel_thread(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.thread_tabs.iter().position(|id| *id == thread_id) else {
+            return;
+        };
+        self.thread_tabs.remove(index);
+        if self
+            .active_conversation_view()
+            .is_some_and(|view| view.read(cx).thread_id == thread_id)
+        {
+            let next = self
+                .thread_tabs
+                .get(index)
+                .or_else(|| self.thread_tabs.last())
+                .copied();
+            if let Some(next) = next {
+                self.select_panel_thread(next, window, cx);
+            } else {
+                let old_view = std::mem::replace(&mut self.base_view, BaseView::Uninitialized);
+                self.retain_running_thread(old_view, cx);
+                self.refresh_base_view_subscriptions(window, cx);
+                cx.emit(AgentPanelEvent::ActiveViewChanged);
+            }
+        }
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    fn render_panel_thread_tabs(&self, cx: &Context<Self>) -> Option<TabBar> {
+        if !conversation_tab::enabled(cx) || self.thread_tabs.is_empty() {
+            return None;
+        }
+        let store = ThreadMetadataStore::try_global(cx);
+        let active_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
+        let views = self.conversation_views();
+        let tabs = self
+            .thread_tabs
+            .iter()
+            .filter_map(|&id| {
+                let metadata = store.as_ref().and_then(|store| store.read(cx).entry(id));
+                if metadata.is_some_and(|thread| thread.archived) {
+                    return None;
+                }
+                let conversation = views
+                    .iter()
+                    .find(|view| view.read(cx).thread_id == id)
+                    .map(|view| view.read(cx));
+                let title = metadata
+                    .and_then(|thread| thread.title())
+                    .or_else(|| conversation.map(|view| view.title(cx)))
+                    .or_else(|| metadata.map(|thread| thread.display_title()))?;
+                let active = active_id == Some(id);
+                let key = SharedString::from(id.to_key_string());
+                Some(
+                    Tab::new(key.clone())
+                        .toggle_state(active)
+                        .child(
+                            div().max_w(px(150.)).child(
+                                Label::new(title.clone())
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            ),
+                        )
+                        .tooltip(Tooltip::text(title))
+                        .end_slot(
+                            IconButton::new(key, IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Close thread tab"))
+                                .on_click(cx.listener(move |panel, _, window, cx| {
+                                    cx.stop_propagation();
+                                    panel.close_panel_thread(id, window, cx);
+                                })),
+                        )
+                        .on_click(cx.listener(move |panel, _, window, cx| {
+                            panel.select_panel_thread(id, window, cx)
+                        })),
+                )
+            })
+            .collect::<Vec<_>>();
+        (!tabs.is_empty()).then(|| {
+            TabBar::new("agent-thread-tabs").children(tabs).end_child(
+                IconButton::new("new-agent-panel-tab", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("New thread in panel"))
+                    .on_click(cx.listener(|panel, _, window, cx| {
+                        panel.activate_new_thread(false, AgentThreadSource::AgentPanel, window, cx);
+                        panel.activation_focus_handle(cx).focus(window, cx);
+                    })),
+            )
+        })
     }
 
     fn refresh_base_view_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4519,6 +4802,9 @@ impl AgentPanel {
         // Check if the active view already holds this thread.
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             if conversation_view.read(cx).thread_id == thread_id {
+                if focus {
+                    self.present_active_conversation(window, cx);
+                }
                 cx.emit(AgentPanelEvent::ActiveViewChanged);
                 return;
             }
@@ -6671,12 +6957,24 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
+            .children(self.render_panel_thread_tabs(cx))
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {
                 VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
                     parent.child(self.render_no_project_state(cx))
                 }
                 VisibleSurface::Uninitialized => parent,
+                VisibleSurface::AgentThread(conversation_view)
+                    if conversation_view.read(cx).editor_tab().is_some() =>
+                {
+                    parent.child(
+                        Button::new("focus-conversation-tab", "Show chat in editor").on_click(
+                            cx.listener(|panel, _, window, cx| {
+                                panel.present_active_conversation(window, cx);
+                            }),
+                        ),
+                    )
+                }
                 VisibleSurface::AgentThread(conversation_view) => parent
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
@@ -9845,6 +10143,117 @@ mod tests {
         });
 
         (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_agent_panel_tabs_switch_and_close_without_stopping_a_thread(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(conversation_tab::init);
+        let (panel, mut cx) = setup_panel(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        let first = active_thread_id(&panel, &cx);
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let second = active_thread_id(&panel, &cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert_eq!(panel.thread_tabs, vec![first, second]);
+            panel.select_panel_thread(first, window, cx);
+            assert_eq!(panel.active_thread_id(cx), Some(first));
+            panel.close_panel_thread(first, window, cx);
+            assert_eq!(panel.thread_tabs, vec![second]);
+            assert_eq!(panel.active_thread_id(cx), Some(second));
+            assert_eq!(
+                panel
+                    .retained_threads
+                    .get(&first)
+                    .unwrap()
+                    .read(cx)
+                    .root_thread(cx)
+                    .unwrap()
+                    .read(cx)
+                    .status(),
+                ThreadStatus::Generating
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_chat_tabs_can_be_closed_and_reopened(cx: &mut TestAppContext) {
+        cx.update(conversation_tab::init);
+        let (panel, mut cx) = setup_panel(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.upgrade().unwrap());
+        let file = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_abs_path("/project/file.txt".into(), Default::default(), window, cx)
+            })
+            .await
+            .unwrap();
+
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+        let conversation = panel.read_with(&cx, |panel, _| {
+            panel.active_conversation_view().unwrap().clone()
+        });
+        let first_tab = workspace.read_with(&cx, |workspace, cx| {
+            let tab = workspace.item_of_type::<ConversationTab>(cx).unwrap();
+            let pane = workspace.pane_for(&tab).unwrap();
+            assert!(
+                pane.read(cx)
+                    .items()
+                    .any(|item| item.item_id() == file.item_id())
+            );
+            assert_eq!(
+                pane.read(cx).active_item().unwrap().item_id(),
+                tab.entity_id()
+            );
+            tab
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(panel.present_active_conversation(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(&cx, |workspace, cx| workspace
+                .items_of_type::<ConversationTab>(cx)
+                .count()),
+            1
+        );
+
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                let pane = workspace.pane_for(&first_tab).unwrap();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        first_tab.entity_id(),
+                        workspace::SaveIntent::Close,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(workspace.read_with(&cx, |workspace, cx| {
+            workspace.item_of_type::<ConversationTab>(cx).is_none()
+        }));
+
+        cx.dispatch_action(zed_actions::agent::RecentChats);
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        let reopened = workspace.read_with(&cx, |workspace, cx| {
+            workspace.item_of_type::<ConversationTab>(cx).unwrap()
+        });
+        assert_ne!(reopened, first_tab);
+        assert_eq!(
+            conversation.read_with(&cx, |view, _| view.editor_tab()),
+            Some(reopened)
+        );
     }
 
     async fn setup_visible_panel(

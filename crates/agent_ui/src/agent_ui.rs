@@ -9,6 +9,7 @@ mod completion_provider;
 mod config_options;
 mod context;
 mod context_server_configuration;
+mod conversation_tab;
 pub(crate) mod conversation_view;
 mod diagnostics;
 pub mod draft_prompt_store;
@@ -84,6 +85,9 @@ pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
+pub use conversation_tab::{
+    close_all as close_conversation_tabs, init as enable_conversation_tabs,
+};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;

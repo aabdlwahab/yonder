@@ -517,8 +517,86 @@ mod tests {
     use remote_server::{HeadlessAppState, HeadlessProject};
     use rpc::proto;
     use serde_json::json;
+    use std::cell::RefCell;
     use util::path;
+    use workspace::dock::DockPosition;
+    use workspace::dock::test::TestPanel;
     use workspace::find_existing_workspace;
+
+    #[gpui::test]
+    async fn test_first_remote_open_keeps_current_workspace_until_panels_are_ready(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let (connection, _headless) = init_remote_server(cx, server_cx).await;
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let current = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                current.update(cx, |workspace, cx| {
+                    let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 0, cx));
+                    workspace.add_panel(panel, window, cx);
+                    workspace.left_dock().update(cx, |dock, cx| {
+                        dock.activate_panel(0, window, cx);
+                        dock.set_open(true, window, cx);
+                    });
+                });
+            })
+            .unwrap();
+
+        let (ready, panels_ready) = oneshot::channel();
+        let panels_ready = RefCell::new(Some(panels_ready));
+        let _panel_initializer = cx.update(|cx| {
+            cx.observe_new::<Workspace>(move |workspace, window, cx| {
+                let window = window.unwrap();
+                let panels_ready = panels_ready.borrow_mut().take().unwrap();
+                let task = cx.spawn_in(window, async move |workspace, cx| {
+                    panels_ready.await?;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 0, cx));
+                        workspace.add_panel(panel, window, cx);
+                        workspace.finish_dock_restoration(cx);
+                    })
+                });
+                workspace.set_panels_task(task);
+            })
+        });
+
+        let opening = cx.update(|cx| {
+            cx.spawn(async move |cx| {
+                open_remote_project(
+                    connection,
+                    vec![PathBuf::from(path!("/project"))],
+                    app_state,
+                    OpenOptions {
+                        requesting_window: Some(window),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .await
+            })
+        });
+        cx.run_until_parked();
+        window
+            .read_with(cx, |mw, _| assert_eq!(mw.workspace(), &current))
+            .unwrap();
+
+        ready.send(()).unwrap();
+        assert_eq!(opening.await.unwrap(), window);
+        window
+            .read_with(cx, |mw, cx| {
+                let workspace = mw.workspace().read(cx);
+                assert!(workspace.project().read(cx).is_via_remote_server());
+                assert!(workspace.left_dock().read(cx).is_open());
+                assert!(mw.workspaces().any(|workspace| workspace == &current));
+            })
+            .unwrap();
+    }
 
     // Each remote path style is set explicitly, so the client and remote styles differ on every
     // platform the tests run on.

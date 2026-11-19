@@ -588,6 +588,8 @@ pub mod agent {
             ResetOnboarding,
             /// Starts a chat conversation with the agent.
             Chat,
+            /// Finds and reopens recent agent chats in the current project.
+            RecentChats,
             /// Toggles the language model selector dropdown.
             #[action(deprecated_aliases = ["assistant::ToggleModelSelector", "assistant2::ToggleModelSelector"])]
             ToggleModelSelector,

@@ -8,8 +8,8 @@
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
     "mode": "system",
-    "light": "One Light",
-    "dark": "One Dark",
+    "light": "Precision Light",
+    "dark": "Precision Dark",
   },
   "icon_theme": "Zed (Default)",
   // The name of a base set of key bindings to use.
@@ -1202,7 +1202,7 @@
       // Default width of the Threads Sidebar.
       "default_width": 300,
       // Automatically open the Threads Sidebar when opening a folder in an existing window.
-      "auto_open": true,
+      "auto_open": false,
     },
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.
@@ -1515,16 +1515,16 @@
     // One of: ["right", "left"]
     "close_position": "right",
     // Whether to show the file icon for a tab.
-    "file_icons": false,
+    "file_icons": true,
     // Controls the appearance behavior of the tab's close button.
     //
-    // 1. Show it just upon hovering the tab. (default)
+    // 1. Show it just upon hovering the tab.
     //     "hover"
-    // 2. Show it persistently.
+    // 2. Show it persistently. (default)
     //     "always"
     // 3. Never show it, even if hovering it.
     //     "hidden"
-    "show_close_button": "hover",
+    "show_close_button": "always",
     // What to do after closing the current tab.
     //
     // 1. Activate the tab that was open previously (default)

@@ -1,6 +1,6 @@
 mod thread_switcher;
 
-use acp_thread::ThreadStatus;
+use acp_thread::{ForegroundActivity, ThreadStatus};
 use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::v2::schema as acp;
@@ -118,6 +118,8 @@ enum NewEntryTarget {
 
 #[derive(Default, Serialize, Deserialize)]
 struct SerializedSidebar {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unread_threads: Vec<ThreadId>,
     #[serde(default)]
     width: Option<f32>,
     /// Whether `width` came from the user dragging the divider.
@@ -825,6 +827,7 @@ pub struct Sidebar {
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
+    fleet_activity: HashMap<ThreadId, ThreadActivity>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -850,7 +853,48 @@ pub struct Sidebar {
     cross_channel_import_channels: Vec<SharedString>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThreadActivity {
+    Unread,
+    Running,
+    WaitingForApproval,
+}
+
+pub struct ThreadActivityChanged;
+
+impl gpui::EventEmitter<ThreadActivityChanged> for Sidebar {}
+
 impl Sidebar {
+    pub fn thread_activity(&self) -> &HashMap<ThreadId, ThreadActivity> {
+        &self.fleet_activity
+    }
+
+    pub fn open_known_thread(
+        &mut self,
+        thread: ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = self
+            .multi_workspace
+            .upgrade()
+            .and_then(|window| find_workspace_for_thread(window.read(cx), &thread, cx))
+            .or_else(|| {
+                self.find_open_workspace_for_thread(&thread, cx)
+                    .map(|(_, workspace)| workspace)
+            });
+        if let Some(workspace) = workspace {
+            self.activate_thread(thread, &workspace, false, window, cx);
+        } else {
+            let paths = thread.folder_paths().clone();
+            let group = ProjectGroupKey::new(
+                thread.remote_connection.clone(),
+                thread.main_worktree_paths().clone(),
+            );
+            self.open_workspace_and_activate_thread(thread, paths, &group, window, cx);
+        }
+    }
+
     pub fn new(
         multi_workspace: Entity<MultiWorkspace>,
         window: &mut Window,
@@ -979,6 +1023,7 @@ impl Sidebar {
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
+            fleet_activity: HashMap::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
@@ -1085,6 +1130,9 @@ impl Sidebar {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
                     }
+                }
+                if matches!(event, workspace::Event::ActiveItemChanged) {
+                    this.schedule_update_entries(false, cx);
                 }
             },
         )
@@ -2075,6 +2123,7 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        self.update_fleet_activity(&multi_workspace, cx);
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -2090,6 +2139,84 @@ impl Sidebar {
         }
 
         cx.notify();
+    }
+
+    fn update_fleet_activity(
+        &mut self,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let multi_workspace = multi_workspace.read(cx);
+        let visible_workspace = multi_workspace.workspace().read(cx);
+        let visible_thread = visible_workspace
+            .panel::<AgentPanel>(cx)
+            .and_then(|panel| panel.read(cx).visible_thread_id(visible_workspace, cx));
+        let previous_unread = self
+            .fleet_activity
+            .iter()
+            .filter_map(|(&id, &activity)| (activity == ThreadActivity::Unread).then_some(id))
+            .collect::<HashSet<_>>();
+        let mut activity = previous_unread
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != visible_thread)
+            .map(|id| (id, ThreadActivity::Unread))
+            .collect::<HashMap<_, _>>();
+
+        for workspace in multi_workspace.workspaces() {
+            let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+                continue;
+            };
+            for conversation in panel.read(cx).conversation_views() {
+                let conversation = conversation.read(cx);
+                let thread_id = conversation.parent_id();
+                let Some(view) = conversation.root_thread_view() else {
+                    continue;
+                };
+                let thread = view.read(cx).thread.read(cx);
+                if thread.is_draft_thread() {
+                    continue;
+                }
+                let current = if conversation.root_thread_is_waiting_for_input(cx) {
+                    Some(ThreadActivity::WaitingForApproval)
+                } else {
+                    match thread.foreground_activity() {
+                        ForegroundActivity::RequiresAction => {
+                            Some(ThreadActivity::WaitingForApproval)
+                        }
+                        ForegroundActivity::Running => Some(ThreadActivity::Running),
+                        ForegroundActivity::Idle
+                            if Some(thread_id) != visible_thread
+                                && self
+                                    .fleet_activity
+                                    .get(&thread_id)
+                                    .is_some_and(|status| *status != ThreadActivity::Unread) =>
+                        {
+                            Some(ThreadActivity::Unread)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(current) = current {
+                    activity
+                        .entry(thread_id)
+                        .and_modify(|status| *status = (*status).max(current))
+                        .or_insert(current);
+                }
+            }
+        }
+
+        if self.fleet_activity != activity {
+            let unread = activity
+                .iter()
+                .filter_map(|(&id, &status)| (status == ThreadActivity::Unread).then_some(id))
+                .collect::<HashSet<_>>();
+            self.fleet_activity = activity;
+            cx.emit(ThreadActivityChanged);
+            if previous_unread != unread {
+                self.serialize(cx);
+            }
+        }
     }
 
     /// Splices only the changed entry range, leaving unchanged item measurements intact.
@@ -3953,9 +4080,7 @@ impl Sidebar {
         };
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
-            workspace.update(cx, |workspace, cx| {
-                workspace.focus_panel::<AgentPanel>(window, cx);
-            });
+            Self::load_agent_thread_in_workspace(workspace, metadata, true, window, cx);
             return;
         }
 
@@ -7920,6 +8045,11 @@ impl WorkspaceSidebar for Sidebar {
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
+            unread_threads: self
+                .fleet_activity
+                .iter()
+                .filter_map(|(&id, &status)| (status == ThreadActivity::Unread).then_some(id))
+                .collect(),
             width: self.width_set_by_user.then(|| f32::from(self.width)),
             width_set_by_user: self.width_set_by_user,
             active_view: match self.view {
@@ -7937,6 +8067,16 @@ impl WorkspaceSidebar for Sidebar {
         cx: &mut Context<Self>,
     ) {
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
+            if !serialized.unread_threads.is_empty() {
+                self.fleet_activity.extend(
+                    serialized
+                        .unread_threads
+                        .into_iter()
+                        .map(|id| (id, ThreadActivity::Unread)),
+                );
+                cx.emit(ThreadActivityChanged);
+                self.schedule_update_entries(false, cx);
+            }
             // Legacy widths other than the old 300-pixel default imply a manual resize
             if let Some(width) = serialized
                 .width

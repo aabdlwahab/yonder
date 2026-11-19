@@ -6365,6 +6365,7 @@ dependencies = [
 name = "fleet_panel"
 version = "0.1.0"
 dependencies = [
+ "agent_ui",
  "anyhow",
  "askpass",
  "collections",
@@ -6372,11 +6373,13 @@ dependencies = [
  "gpui",
  "log",
  "picker",
+ "project",
  "recent_projects",
  "release_channel",
  "remote",
  "semver",
  "settings",
+ "sidebar",
  "ui",
  "util",
  "workspace",

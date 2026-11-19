@@ -1,0 +1,195 @@
+{
+  "$schema": "https://zed.dev/schema/themes/v0.2.0.json",
+  "name": "Precision",
+  "author": "Yonder",
+  "themes": [
+    {
+      "name": "Precision Dark",
+      "appearance": "dark",
+      "style": {
+        "border": "#363731",
+        "border.variant": "#363731",
+        "border.focused": "#f1b58c",
+        "border.selected": "#f1b58c",
+        "elevated_surface.background": "#292a26",
+        "surface.background": "#292a26",
+        "background": "#222320",
+        "element.background": "#292a26",
+        "element.hover": "#30312c",
+        "element.active": "#392d24",
+        "element.selected": "#392d24",
+        "ghost_element.hover": "#30312c",
+        "ghost_element.active": "#392d24",
+        "ghost_element.selected": "#392d24",
+        "text": "#edeee6",
+        "text.muted": "#b8bcb0",
+        "text.placeholder": "#a2a697",
+        "text.disabled": "#a2a697",
+        "text.accent": "#f1b58c",
+        "icon": "#edeee6",
+        "icon.muted": "#b8bcb0",
+        "icon.disabled": "#a2a697",
+        "icon.placeholder": "#a2a697",
+        "icon.accent": "#f1b58c",
+        "status_bar.background": "#222320",
+        "title_bar.background": "#222320",
+        "title_bar.inactive_background": "#222320",
+        "toolbar.background": "#1b1c1a",
+        "tab_bar.background": "#222320",
+        "tab.inactive_background": "#222320",
+        "tab.active_background": "#292a26",
+        "panel.background": "#222320",
+        "editor.background": "#1b1c1a",
+        "editor.foreground": "#e3e5db",
+        "editor.gutter.background": "#1b1c1a",
+        "editor.subheader.background": "#292a26",
+        "editor.active_line.background": "#292a26",
+        "editor.highlighted_line.background": "#292a26",
+        "editor.line_number": "#a2a697",
+        "editor.active_line_number": "#edeee6",
+        "editor.hover_line_number": "#edeee6",
+        "terminal.background": "#1b1c1a",
+        "terminal.foreground": "#e3e5db",
+        "terminal.bright_foreground": "#edeee6",
+        "link_text.hover": "#f1b58c",
+        "search.match_background": "#f1b58c40",
+        "search.active_match_background": "#f1b58c66",
+        "syntax": {
+          "comment": {
+            "color": "#9a9c90"
+          },
+          "constant": {
+            "color": "#f1b58c"
+          },
+          "constructor": {
+            "color": "#9eced1"
+          },
+          "function": {
+            "color": "#a9c5e5"
+          },
+          "keyword": {
+            "color": "#cfb7df"
+          },
+          "number": {
+            "color": "#f1b58c"
+          },
+          "operator": {
+            "color": "#b8bcb0"
+          },
+          "property": {
+            "color": "#a9c5e5"
+          },
+          "punctuation": {
+            "color": "#b8bcb0"
+          },
+          "string": {
+            "color": "#afc78d"
+          },
+          "type": {
+            "color": "#9eced1"
+          },
+          "variable": {
+            "color": "#e3e5db"
+          },
+          "variable.special": {
+            "color": "#e4a0a0"
+          }
+        }
+      }
+    },
+    {
+      "name": "Precision Light",
+      "appearance": "light",
+      "style": {
+        "border": "#dfdbd2",
+        "border.variant": "#dfdbd2",
+        "border.focused": "#814d2c",
+        "border.selected": "#814d2c",
+        "elevated_surface.background": "#f5f3ee",
+        "surface.background": "#f5f3ee",
+        "background": "#f1f0eb",
+        "element.background": "#f5f3ee",
+        "element.hover": "#e9e6df",
+        "element.active": "#f1e5d9",
+        "element.selected": "#f1e5d9",
+        "ghost_element.hover": "#e9e6df",
+        "ghost_element.active": "#f1e5d9",
+        "ghost_element.selected": "#f1e5d9",
+        "text": "#282a25",
+        "text.muted": "#55594f",
+        "text.placeholder": "#626559",
+        "text.disabled": "#626559",
+        "text.accent": "#814d2c",
+        "icon": "#282a25",
+        "icon.muted": "#55594f",
+        "icon.disabled": "#626559",
+        "icon.placeholder": "#626559",
+        "icon.accent": "#814d2c",
+        "status_bar.background": "#f1f0eb",
+        "title_bar.background": "#f1f0eb",
+        "title_bar.inactive_background": "#f1f0eb",
+        "toolbar.background": "#fcfbf8",
+        "tab_bar.background": "#f1f0eb",
+        "tab.inactive_background": "#f1f0eb",
+        "tab.active_background": "#f5f3ee",
+        "panel.background": "#f1f0eb",
+        "editor.background": "#fcfbf8",
+        "editor.foreground": "#30332d",
+        "editor.gutter.background": "#fcfbf8",
+        "editor.subheader.background": "#f5f3ee",
+        "editor.active_line.background": "#f5f3ee",
+        "editor.highlighted_line.background": "#f5f3ee",
+        "editor.line_number": "#626559",
+        "editor.active_line_number": "#282a25",
+        "editor.hover_line_number": "#282a25",
+        "terminal.background": "#fcfbf8",
+        "terminal.foreground": "#30332d",
+        "terminal.bright_foreground": "#282a25",
+        "link_text.hover": "#814d2c",
+        "search.match_background": "#814d2c40",
+        "search.active_match_background": "#814d2c66",
+        "syntax": {
+          "comment": {
+            "color": "#64685c"
+          },
+          "constant": {
+            "color": "#814d2c"
+          },
+          "constructor": {
+            "color": "#33666c"
+          },
+          "function": {
+            "color": "#2e5b90"
+          },
+          "keyword": {
+            "color": "#73518a"
+          },
+          "number": {
+            "color": "#814d2c"
+          },
+          "operator": {
+            "color": "#55594f"
+          },
+          "property": {
+            "color": "#2e5b90"
+          },
+          "punctuation": {
+            "color": "#55594f"
+          },
+          "string": {
+            "color": "#496133"
+          },
+          "type": {
+            "color": "#33666c"
+          },
+          "variable": {
+            "color": "#30332d"
+          },
+          "variable.special": {
+            "color": "#993e43"
+          }
+        }
+      }
+    }
+  ]
+}

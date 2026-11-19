@@ -2340,6 +2340,9 @@ impl Workspace {
                 OpenMode::NewWindow => None,
                 _ => requesting_window,
             };
+            let activate_after_restore =
+                window_to_replace.is_some() && open_mode == OpenMode::Activate;
+            let first_project_open = serialized_workspace.is_none() && !project_paths.is_empty();
 
             let (window, workspace): (WindowHandle<MultiWorkspace>, Entity<Workspace>) =
                 if let Some(window) = window_to_replace {
@@ -2369,7 +2372,7 @@ impl Workspace {
                         });
                         match open_mode {
                             OpenMode::Activate => {
-                                multi_workspace.activate(workspace.clone(), None, window, cx);
+                                multi_workspace.associate_workspace(&workspace, cx);
                             }
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
@@ -2512,8 +2515,26 @@ impl Workspace {
                 .log_err();
 
             if open_mode == OpenMode::NewWindow || open_mode == OpenMode::Activate {
+                if activate_after_restore
+                    && let Some(task) =
+                        workspace.update(cx, |workspace, _| workspace.take_panels_task())
+                {
+                    task.await.log_err();
+                }
                 window
-                    .update(cx, |_, window, _cx| {
+                    .update(cx, |multi_workspace, window, cx| {
+                        if activate_after_restore {
+                            if first_project_open {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.inherit_left_dock(
+                                        multi_workspace.workspace(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                            multi_workspace.activate(workspace.clone(), None, window, cx);
+                        }
                         window.activate_window();
                     })
                     .log_err();
@@ -2633,6 +2654,20 @@ impl Workspace {
                 dock.restore_serialized_state(data, window, cx);
             });
         }
+    }
+
+    fn inherit_left_dock(&self, source: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+        let source_dock = source.read(cx).left_dock.read(cx);
+        let dock_state = DockData {
+            visible: source_dock.is_open(),
+            active_panel: source_dock
+                .active_panel()
+                .map(|panel| panel.persistent_name().to_string()),
+            zoom: false,
+        };
+        self.left_dock.update(cx, |dock, cx| {
+            dock.restore_serialized_state(dock_state, window, cx);
+        });
     }
 
     pub fn finish_dock_restoration(&self, cx: &mut App) {
@@ -7007,7 +7042,7 @@ impl Workspace {
     /// workspace's id into the shared `active_workspace_id` cell, which we
     /// simply compare against our own id. A workspace with no shared cell (e.g.
     /// a plain test window) owns its window unconditionally.
-    fn owns_window_chrome(&self) -> bool {
+    pub fn owns_window_chrome(&self) -> bool {
         match &self.active_workspace_id {
             Some(active_workspace_id) => active_workspace_id.get() == self.weak_self.entity_id(),
             None => true,
@@ -8331,7 +8366,9 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
+                        if workspace.owns_window_chrome() {
+                            cx.focus_self(window);
+                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
@@ -8377,7 +8414,8 @@ impl Workspace {
                         }
                     }
                     if let Some(item) = kept_item_in_use {
-                        workspace.activate_item(item.as_ref(), true, true, window, cx);
+                        let focus_item = workspace.owns_window_chrome();
+                        workspace.activate_item(item.as_ref(), focus_item, true, window, cx);
                     }
                 }
 
@@ -9926,10 +9964,11 @@ fn open_items(
                                 ix,
                                 workspace
                                     .update_in(cx, |workspace, window, cx| {
+                                        let focus_item = workspace.owns_window_chrome();
                                         workspace.open_path(
                                             file_project_path,
                                             None,
-                                            true,
+                                            focus_item,
                                             window,
                                             cx,
                                         )
@@ -12235,6 +12274,7 @@ async fn open_remote_project_inner(
         return Err(project_path_errors.pop().context("no paths given")?);
     }
 
+    let first_project_open = serialized_workspace.is_none();
     let workspace = window.update(cx, |multi_workspace, window, cx| {
         let new_workspace = cx.new(|cx| {
             let mut workspace = Workspace::new(
@@ -12253,16 +12293,7 @@ async fn open_remote_project_inner(
             workspace
         });
 
-        if let Some(project_group_key) = provisional_project_group_key.clone() {
-            multi_workspace.activate_provisional_workspace(
-                new_workspace.clone(),
-                project_group_key,
-                window,
-                cx,
-            );
-        } else {
-            multi_workspace.activate(new_workspace.clone(), source_workspace, window, cx);
-        }
+        multi_workspace.associate_workspace(&new_workspace, cx);
         new_workspace
     })?;
 
@@ -12291,7 +12322,6 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            window.activate_window();
             workspace.update(cx, |workspace, cx| {
                 open_items(
                     workspace,
@@ -12312,6 +12342,30 @@ async fn open_remote_project_inner(
     {
         task.await;
     }
+
+    if let Some(task) = workspace.update(cx, |workspace, _| workspace.take_panels_task()) {
+        task.await.log_err();
+    }
+
+    window.update(cx, |multi_workspace, window, cx| {
+        if first_project_open {
+            workspace.update(cx, |workspace, cx| {
+                workspace.inherit_left_dock(multi_workspace.workspace(), window, cx);
+            });
+        }
+
+        if let Some(project_group_key) = provisional_project_group_key {
+            multi_workspace.activate_provisional_workspace(
+                workspace.clone(),
+                project_group_key,
+                window,
+                cx,
+            );
+        } else {
+            multi_workspace.activate(workspace.clone(), source_workspace, window, cx);
+        }
+        window.activate_window();
+    })?;
 
     workspace.update(cx, |workspace, cx| {
         for error in project_path_errors {

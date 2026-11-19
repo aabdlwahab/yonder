@@ -6,10 +6,10 @@ Yonder is a fork of [Zed](https://github.com/zed-industries/zed). It keeps Zed's
 
 ## What it adds to Zed
 
-- **Fleet panel.** A left-dock panel lists every SSH machine in your settings, with its project folders under it. Clicking a project opens it over SSH in the current window, and the open project is highlighted. With no machines configured, the panel offers to add one.
+- **Fleet panel.** The left sidebar groups open and recent projects under This Mac and each SSH machine. New projects appear when you open them, and the current project is highlighted. Clicking a project opens it in the same window.
 - **Fast switching.** Each window keeps up to four projects open, so switching back to one of them is instant. When you open a fifth, the least recently shown project is released and reopens from its server next time. Projects with unsaved changes are never released.
 - **Pre-warmed connections.** Resting the pointer on a project in the fleet panel for 250 ms opens its machine's SSH connection ahead of the click. Pre-warming never shows UI, never downloads a server, and skips machines that ask for a password.
-- **Fleet switcher.** `ctrl-cmd-k` on macOS opens a searchable list of every project on every machine. Highlighting a project pre-warms its connection. The fleet panel can also be toggled with the `fleet_panel::ToggleFocus` action.
+- **Fleet switcher.** `ctrl-cmd-k` on macOS searches the same open and recent projects shown in Fleet. Highlighting a project pre-warms its connection. The fleet panel can also be toggled with the `fleet_panel::ToggleFocus` action.
 - **Switch timing.** Each switch is logged with its duration and whether the connection was already warm. Search the Yonder log for `fleet:`.
 
 ## How it differs from Zed
@@ -22,7 +22,7 @@ To keep merges from upstream small, internal crate names, project-level `.zed/` 
 
 ## Adding machines and projects
 
-The fleet panel reads Zed's `ssh_connections` setting. Add a machine and its project folders in your settings file (**Yonder → Settings → Open Settings File**):
+Fleet reads machine names from `ssh_connections`. You can also save folders for the remote project picker in your settings file (**Yonder → Settings → Open Settings File**):
 
 ```json
 {
@@ -40,7 +40,7 @@ The fleet panel reads Zed's `ssh_connections` setting. Add a machine and its pro
 }
 ```
 
-Projects you open with Zed's own remote-project dialog are saved there too. See [Remote Development](./docs/src/remote-development.md) for the full connection options, such as ports, SSH arguments and port forwards.
+Open a folder over SSH to add it to Fleet. See [Remote Development](./docs/src/remote-development.md) for the full connection options, such as ports, SSH arguments and port forwards.
 
 ## Building
 

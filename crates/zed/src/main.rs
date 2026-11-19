@@ -730,6 +730,7 @@ fn main() {
             false,
             cx,
         );
+        agent_ui::enable_conversation_tabs(cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

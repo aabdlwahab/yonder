@@ -1,4 +1,5 @@
 mod acp;
+mod claude_session;
 mod custom;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -27,6 +28,7 @@ pub use acp::{
     AcpV2Connection, DecodedTerminalNotification, DecodedTerminalUpdate,
     GEMINI_TERMINAL_AUTH_METHOD_ID, v2_terminal_client_builder,
 };
+pub use claude_session::copy_claude_session;
 
 pub struct AgentServerDelegate {
     store: Entity<AgentServerStore>,
