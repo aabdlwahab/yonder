@@ -656,7 +656,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
 
-        if !workspace.has_active_modal(window, cx) {
+        if workspace.owns_window_chrome() && !workspace.has_active_modal(window, cx) {
             workspace.focus_handle(cx).focus(window, cx);
         }
     })
@@ -813,6 +813,12 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         );
 
         workspace_handle.update(cx, |workspace, cx| {
+            if let (Some(fleet), Some(files)) = (
+                workspace.panel::<fleet_panel::FleetPanel>(cx),
+                workspace.panel::<ProjectPanel>(cx),
+            ) {
+                fleet.update(cx, |fleet, cx| fleet.set_file_tree(Arc::new(files), cx));
+            }
             workspace.finish_dock_restoration(cx);
         })?;
 
@@ -862,6 +868,9 @@ fn ensure_agent_panel_for_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
+    if DisableAiSettings::get_global(cx).disable_ai {
+        agent_ui::close_conversation_tabs(workspace, window, cx);
+    }
     let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
         agent_ui::AgentPanel::load(workspace, cx)
     });

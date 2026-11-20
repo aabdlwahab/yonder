@@ -332,6 +332,10 @@ impl ThreadMetadata {
         self.session_id.is_none()
     }
 
+    pub fn has_saved_draft_prompt(&self, cx: &App) -> bool {
+        crate::draft_prompt_store::read(self.thread_id, cx).is_some()
+    }
+
     pub fn display_title(&self) -> SharedString {
         self.title()
             .unwrap_or_else(|| crate::DEFAULT_THREAD_TITLE.into())

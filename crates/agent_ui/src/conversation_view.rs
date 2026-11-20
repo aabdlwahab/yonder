@@ -82,7 +82,7 @@ use super::entry_view_state::EntryViewState;
 use crate::ModeSelector;
 use crate::ModelSelectorPopover;
 use crate::agent_connection_store::{
-    AgentConnectedState, AgentConnectionEntryEvent, AgentConnectionStore,
+    AgentConnectedState, AgentConnectionEntry, AgentConnectionEntryEvent, AgentConnectionStore,
 };
 use crate::agent_diff::AgentDiff;
 use crate::completion_provider::{AgentContextSelection, AvailableSkill};
@@ -814,6 +814,7 @@ pub struct ConversationView {
     project: Entity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
+    editor_tab: Option<WeakEntity<crate::conversation_tab::ConversationTab>>,
     pub(crate) root_session_id: Option<acp_v2::SessionId>,
     server_state: ServerState,
     recovery: Option<ThreadRecovery>,
@@ -823,6 +824,7 @@ pub struct ConversationView {
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
+    claude_resume_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
@@ -1133,6 +1135,7 @@ impl ConversationView {
             project: project.clone(),
             thread_store,
             thread_id,
+            editor_tab: None,
             root_session_id: resume_session_id.clone(),
             server_state: Self::initial_state(
                 agent.clone(),
@@ -1153,6 +1156,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
+            claude_resume_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
@@ -1343,20 +1347,7 @@ impl ConversationView {
         });
 
         let connection_entry_subscription =
-            cx.subscribe(&connection_entry, |this, _entry, event, cx| match event {
-                AgentConnectionEntryEvent::NewVersionAvailable(version) => {
-                    if let Some(thread) = this.root_thread_view() {
-                        thread.update(cx, |thread, cx| {
-                            thread.new_server_version_available = Some(version.clone());
-                            cx.notify();
-                        });
-                    }
-                }
-                AgentConnectionEntryEvent::LoadingStatusChanged(status) => {
-                    this.loading_status = status.clone();
-                    cx.notify();
-                }
-            });
+            Self::subscribe_to_connection_entry(&connection_entry, cx);
 
         let connect_result = connection_entry.read(cx).wait_for_connection();
 
@@ -1466,73 +1457,15 @@ impl ConversationView {
 
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(thread) => {
-                        if let Some(recovery) = &this.recovery {
-                            thread.update(cx, |thread, cx| {
-                                thread.set_draft_prompt(Some(recovery.draft.clone()), cx);
-                            });
-                        }
-                        this.clear_resolved_request_elicitations_for_connection(&connection, cx);
-                        let root_session_id = thread.read(cx).session_id().clone();
-
-                        let conversation = cx.new(|cx| {
-                            let mut conversation = Conversation::default();
-                            conversation.register_thread(thread.clone(), cx);
-                            conversation
-                        });
-
-                        let current = this.new_thread_view(
-                            thread,
-                            conversation.clone(),
-                            resumed_without_history,
-                            initial_content,
-                            window,
-                            cx,
-                        );
-
-                        if let Some(recovery) = &this.recovery {
-                            current.update(cx, |view, cx| {
-                                view.restore_recovery(recovery, window, cx);
-                            });
-                        }
-
-                        if this.has_pending_selections() {
-                            current.update(cx, |thread, cx| {
-                                thread.message_editor.update(cx, |editor, cx| {
-                                    for selection in std::mem::take(&mut this.pending_selections) {
-                                        editor.insert_selections(selection, window, cx);
-                                    }
-                                });
-                            });
-                        }
-
-                        if this.focus_handle.contains_focused(window, cx) {
-                            current
-                                .read(cx)
-                                .message_editor
-                                .focus_handle(cx)
-                                .focus(window, cx);
-                        }
-
-                        this.root_session_id = Some(root_session_id.clone());
-                        let request_elicitation_subscription =
-                            Self::request_elicitation_subscription(&connection, cx);
-                        this.set_server_state(
-                            ServerState::Connected(ConnectedServerState {
-                                connection,
-                                auth_state: AuthState::Ok,
-                                active_id: Some(root_session_id.clone()),
-                                threads: HashMap::from_iter([(root_session_id, current)]),
-                                conversation,
-                                _connection_entry_subscription: connection_entry_subscription,
-                                _request_elicitation_subscription: request_elicitation_subscription,
-                            }),
-                            cx,
-                        );
-                        if let Some(recovery) = this.recovery.take() {
-                            this.saved_submissions.extend(recovery.submissions);
-                        }
-                    }
+                    Ok(thread) => this.install_loaded_session(
+                        thread,
+                        connection,
+                        connection_entry_subscription,
+                        resumed_without_history,
+                        initial_content,
+                        window,
+                        cx,
+                    ),
                     Err(err) => {
                         this.handle_load_error(
                             LoadError::Other(err.to_string().into()),
@@ -1554,6 +1487,103 @@ impl ConversationView {
             connection: None,
             _request_elicitation_subscription: None,
         }
+    }
+
+    fn install_loaded_session(
+        &mut self,
+        thread: Entity<AcpThread>,
+        connection: Rc<dyn AgentConnection>,
+        connection_entry_subscription: Subscription,
+        resumed_without_history: bool,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(recovery) = &self.recovery {
+            thread.update(cx, |thread, cx| {
+                thread.set_draft_prompt(Some(recovery.draft.clone()), cx);
+            });
+        }
+        self.clear_resolved_request_elicitations_for_connection(&connection, cx);
+        let root_session_id = thread.read(cx).session_id().clone();
+
+        let conversation = cx.new(|cx| {
+            let mut conversation = Conversation::default();
+            conversation.register_thread(thread.clone(), cx);
+            conversation
+        });
+
+        let current = self.new_thread_view(
+            thread,
+            conversation.clone(),
+            resumed_without_history,
+            initial_content,
+            window,
+            cx,
+        );
+
+        if let Some(recovery) = &self.recovery {
+            current.update(cx, |view, cx| {
+                view.restore_recovery(recovery, window, cx);
+            });
+        }
+
+        if self.has_pending_selections() {
+            current.update(cx, |thread, cx| {
+                thread.message_editor.update(cx, |editor, cx| {
+                    for selection in std::mem::take(&mut self.pending_selections) {
+                        editor.insert_selections(selection, window, cx);
+                    }
+                });
+            });
+        }
+
+        if self.focus_handle.contains_focused(window, cx) {
+            current
+                .read(cx)
+                .message_editor
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
+
+        self.root_session_id = Some(root_session_id.clone());
+        let request_elicitation_subscription =
+            Self::request_elicitation_subscription(&connection, cx);
+        self.set_server_state(
+            ServerState::Connected(ConnectedServerState {
+                connection,
+                auth_state: AuthState::Ok,
+                active_id: Some(root_session_id.clone()),
+                threads: HashMap::from_iter([(root_session_id, current)]),
+                conversation,
+                _connection_entry_subscription: connection_entry_subscription,
+                _request_elicitation_subscription: request_elicitation_subscription,
+            }),
+            cx,
+        );
+        if let Some(recovery) = self.recovery.take() {
+            self.saved_submissions.extend(recovery.submissions);
+        }
+    }
+
+    fn subscribe_to_connection_entry(
+        entry: &Entity<AgentConnectionEntry>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(entry, |this, _, event, cx| match event {
+            AgentConnectionEntryEvent::NewVersionAvailable(version) => {
+                if let Some(thread) = this.root_thread_view() {
+                    thread.update(cx, |thread, cx| {
+                        thread.new_server_version_available = Some(version.clone());
+                        cx.notify();
+                    });
+                }
+            }
+            AgentConnectionEntryEvent::LoadingStatusChanged(status) => {
+                this.loading_status = status.clone();
+                cx.notify();
+            }
+        })
     }
 
     fn new_thread_view(
@@ -1863,8 +1893,174 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn editor_tab(&self) -> Option<Entity<crate::conversation_tab::ConversationTab>> {
+        self.editor_tab.as_ref().and_then(WeakEntity::upgrade)
+    }
+
+    pub(crate) fn set_editor_tab(
+        &mut self,
+        tab: WeakEntity<crate::conversation_tab::ConversationTab>,
+    ) {
+        self.editor_tab = Some(tab);
+    }
+
+    pub(crate) fn editor_agent_name(&self, cx: &App) -> SharedString {
+        self.agent_server_store
+            .read(cx)
+            .agent_display_name(&self.connection_key.id())
+            .unwrap_or_else(|| self.connection_key.label())
+    }
+
     pub fn agent_key(&self) -> &Agent {
         &self.connection_key
+    }
+
+    fn resume_claude_account(
+        &mut self,
+        target: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.claude_resume_task.is_none(),
+            "A Claude account switch is already in progress"
+        );
+        let view = self
+            .root_thread_view()
+            .context("Open the Claude session first")?;
+        let thread = view.read(cx).thread.clone();
+        let source = thread.read(cx);
+        anyhow::ensure!(
+            !source.is_draft_thread(),
+            "Send a message before resuming this Claude session on another account"
+        );
+        anyhow::ensure!(
+            source.is_idle_for_retention() && view.read(cx).message_queue.is_empty(),
+            "Wait for this Claude session to finish before switching accounts"
+        );
+        let source_id = source.connection().agent_id();
+        let session_id = source.session_id().clone();
+        let submission = source.latest_submission_id();
+        let entry_count = source.entries().len();
+        let work_dirs = source
+            .work_dirs()
+            .cloned()
+            .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+        let title = source.title();
+        let target_agent = Agent::from(target.clone());
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        let server = target_agent.server(project.read(cx).fs().clone(), ThreadStore::global(cx));
+        let entry = self.connection_store.update(cx, |store, cx| {
+            store.request_connection(target_agent.clone(), server.clone(), cx)
+        });
+        let connect = entry.read(cx).wait_for_connection();
+
+        self.claude_resume_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                let connection = connect
+                    .await
+                    .map_err(|error| anyhow!("{error}"))?
+                    .connection;
+                anyhow::ensure!(
+                    connection.supports_load_session(),
+                    "This Claude adapter cannot load saved sessions"
+                );
+                cx.update(|_, cx| {
+                    agent_servers::copy_claude_session(
+                        project.clone(),
+                        source_id,
+                        target,
+                        session_id.clone(),
+                        cx,
+                    )
+                })?
+                .await?;
+                let resumed = cx
+                    .update(|_, cx| {
+                        connection.clone().load_session(
+                            session_id.clone(),
+                            project,
+                            work_dirs,
+                            title,
+                            cx,
+                        )
+                    })?
+                    .await
+                    .context("The destination Claude account could not load this session")?;
+
+                let installed = this
+                    .update_in(cx, |this, window, cx| {
+                        anyhow::ensure!(
+                            resumed.read(cx).session_id() == &session_id,
+                            "Claude did not reopen the original session ID"
+                        );
+                        let current = this
+                            .root_thread_view()
+                            .context("The original Claude session is no longer open")?;
+                        let current_view = current.read(cx);
+                        let current_thread = current_view.thread.read(cx);
+                        anyhow::ensure!(
+                            current_view.thread == thread
+                                && current_thread.is_idle_for_retention()
+                                && current_thread.latest_submission_id() == submission
+                                && current_thread.entries().len() == entry_count
+                                && current_view.message_queue.is_empty(),
+                            "The original Claude session changed while switching accounts"
+                        );
+
+                        let draft = current_view
+                            .message_editor
+                            .read(cx)
+                            .draft_content_blocks_snapshot(cx);
+                        if !draft.is_empty() {
+                            resumed
+                                .update(cx, |thread, cx| thread.set_draft_prompt(Some(draft), cx));
+                        }
+                        this.agent = server;
+                        this.connection_key = target_agent;
+                        let subscription = Self::subscribe_to_connection_entry(&entry, cx);
+                        this.install_loaded_session(
+                            resumed.clone(),
+                            connection.clone(),
+                            subscription,
+                            false,
+                            None,
+                            window,
+                            cx,
+                        );
+                        Ok(())
+                    })
+                    .and_then(|result| result);
+
+                if installed.is_err() && connection.supports_close_session() {
+                    cx.update(|_, cx| {
+                        let resumed_id = resumed.read(cx).session_id().clone();
+                        connection.close_session(&resumed_id, cx)
+                    })?
+                    .await
+                    .log_err();
+                }
+                installed
+            }
+            .await;
+            this.update(cx, |this, _| {
+                if let Some(task) = this.claude_resume_task.take() {
+                    task.detach();
+                }
+            })
+            .log_err();
+            if let Err(error) = result {
+                log::error!("Could not resume Claude session on another account: {error:#}");
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace
+                            .show_error(format!("Could not resume Claude session: {error:#}"), cx)
+                    })
+                    .log_err();
+            }
+        }));
+        Ok(())
     }
 
     /// User renames are stored in ThreadMetadataStore.
@@ -3427,6 +3623,15 @@ impl ConversationView {
     }
 
     fn is_visible_in_agent_panel(&self, workspace: &Entity<Workspace>, cx: &Context<Self>) -> bool {
+        if let Some(tab) = self.editor_tab()
+            && let Some(pane) = workspace.read(cx).pane_for_item_id(tab.entity_id())
+            && pane
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.item_id() == tab.entity_id())
+        {
+            return true;
+        }
         AgentPanel::is_visible(workspace, cx)
             && workspace
                 .read(cx)
@@ -4028,7 +4233,11 @@ impl Render for ConversationView {
         v_flex()
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(cx.theme().colors().panel_background)
+            .bg(if self.editor_tab().is_some() {
+                cx.theme().colors().editor_background
+            } else {
+                cx.theme().colors().panel_background
+            })
             .child(v_flex().flex_1().min_h_0().child(content))
             .when(self.has_saved_input(), |this| {
                 this.child(

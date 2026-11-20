@@ -7049,9 +7049,9 @@ impl ThreadView {
         self.remote_control_on = turning_on;
         cx.notify();
 
-        let submission = self
-            .thread
-            .update(cx, |thread, cx| thread.send(vec![command.as_str().into()], cx));
+        let submission = self.thread.update(cx, |thread, cx| {
+            thread.send(vec![command.as_str().into()], cx)
+        });
         cx.spawn(async move |this, cx| {
             if let Err(error) = submission.await {
                 log::error!("Remote Control command failed: {error:#}");
@@ -7071,7 +7071,12 @@ impl ThreadView {
         let Some(workspace) = self.workspace.upgrade() else {
             return Vec::new();
         };
-        let store = workspace.read(cx).project().read(cx).agent_server_store().read(cx);
+        let store = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .agent_server_store()
+            .read(cx);
         let mut targets: Vec<(AgentId, SharedString)> = store
             .external_agents()
             .map(|agent_id| {
@@ -7083,6 +7088,28 @@ impl ThreadView {
             .collect();
         targets.sort_by(|left, right| left.1.cmp(&right.1));
         targets
+    }
+
+    fn is_other_claude_account(&self, agent_id: &AgentId) -> bool {
+        let registry_id = project::agent_server_store::registry_id_for_agent;
+        *agent_id != self.agent_id
+            && registry_id(self.agent_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
+            && registry_id(agent_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
+    }
+
+    fn resume_claude_account(&self, agent_id: AgentId, window: &Window, cx: &mut App) {
+        let conversation = self.server_view.clone();
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            let result = conversation.update(cx, |conversation, cx| {
+                conversation.resume_claude_account(agent_id, window, cx)
+            });
+            if let Err(error) = result.and_then(|result| result) {
+                workspace
+                    .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                    .log_err();
+            }
+        });
     }
 
     /// Starts a new thread on `agent_id` from this conversation up to and including
@@ -7148,7 +7175,11 @@ impl ThreadView {
         cx.spawn(async move |_, cx| {
             let created = cx
                 .update(|cx| {
-                    agent::SiblingThreadHost::create_sibling_thread(&host, request, &mut cx.to_async())
+                    agent::SiblingThreadHost::create_sibling_thread(
+                        &host,
+                        request,
+                        &mut cx.to_async(),
+                    )
                 })
                 .await;
             if let Err(error) = created {
@@ -7657,6 +7688,13 @@ impl ThreadView {
                 .is_none_or(|entry| !entry.is_indented());
 
         let mut assistant_message_is_blank = false;
+        let compact_chat = matches!(
+            cx.theme().name.as_ref(),
+            "Precision Light" | "Precision Dark"
+        ) && self
+            .server_view
+            .upgrade()
+            .is_some_and(|view| view.read(cx).editor_tab().is_some());
 
         let primary = match &entry {
             AgentThreadEntry::UserMessage(message) => {
@@ -7710,12 +7748,18 @@ impl ThreadView {
                     .px_2()
                     .gap_1p5()
                     .w_full()
+                    .when(compact_chat, |this| {
+                        this.px_5().pb_2().child(
+                            Label::new("You").size(LabelSize::Small).color(Color::Muted),
+                        )
+                    })
                     .child(
                         div()
                             .relative()
                             .child(
                                 div()
                                     .py_3()
+                                    .when(compact_chat, |this| this.py_1p5())
                                     .px_2()
                                     .rounded_md()
                                     .bg(cx.theme().colors().editor_background)
@@ -7881,7 +7925,22 @@ impl ThreadView {
                         .when(is_thread_bottom, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
-                        .child(message_body)
+                        .child(if compact_chat {
+                            v_flex()
+                                .pl_3()
+                                .gap_1()
+                                .border_l_2()
+                                .border_color(cx.theme().colors().text_accent)
+                                .child(
+                                    Label::new(self.agent_display_name.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(message_body)
+                                .into_any_element()
+                        } else {
+                            message_body
+                        })
                         .when_some(
                             self.entry_view_state
                                 .read(cx)
@@ -9199,7 +9258,8 @@ impl ThreadView {
                             }
                         });
 
-                    let menu = menu.when_some(focus, |menu, focus| menu.context(focus))
+                    let menu = menu
+                        .when_some(focus, |menu, focus| menu.context(focus))
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()));
@@ -9267,10 +9327,39 @@ impl ThreadView {
                             ))
                         },
                     );
-                    targets.iter().fold(
-                        menu.separator().header("Continue Whole Conversation As"),
+                    let menu = targets
+                        .iter()
+                        .filter(|(id, _)| !this.is_other_claude_account(id))
+                        .fold(
+                            menu.separator().header("Continue Whole Conversation As"),
+                            |menu, (agent_id, name)| {
+                                menu.item(fork_entry(
+                                    name.to_string(),
+                                    agent_id.clone(),
+                                    None,
+                                    false,
+                                ))
+                            },
+                        );
+                    let accounts = targets
+                        .iter()
+                        .filter(|(id, _)| this.is_other_claude_account(id))
+                        .collect::<Vec<_>>();
+                    if accounts.is_empty() || this.thread.read(cx).parent_session_id().is_some() {
+                        return menu;
+                    }
+                    accounts.into_iter().fold(
+                        menu.separator().header("Resume Claude Session As"),
                         |menu, (agent_id, name)| {
-                            menu.item(fork_entry(name.to_string(), agent_id.clone(), None, false))
+                            let entity = entity.clone();
+                            let agent_id = agent_id.clone();
+                            menu.item(ContextMenuEntry::new(name.clone()).handler(
+                                move |window, cx| {
+                                    entity.update(cx, |view, cx| {
+                                        view.resume_claude_account(agent_id.clone(), window, cx);
+                                    });
+                                },
+                            ))
                         },
                     )
                 })

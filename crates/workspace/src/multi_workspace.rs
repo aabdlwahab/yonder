@@ -820,11 +820,7 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) {
         Self::subscribe_to_workspace(workspace, window, cx);
-        let weak_self = cx.weak_entity();
-        let active_workspace_id = self.active_workspace_id.clone();
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_multi_workspace(weak_self, active_workspace_id, cx);
-        });
+        self.associate_workspace(workspace, cx);
 
         let entity = cx.entity();
         cx.defer({
@@ -834,6 +830,16 @@ impl MultiWorkspace {
                     this.sync_sidebar_to_workspace(&workspace, cx);
                 })
             }
+        });
+    }
+
+    // Associate a workspace before restoring it so its updates cannot take
+    // over the visible workspace's focus or window title during the load.
+    pub(crate) fn associate_workspace(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let weak_self = cx.weak_entity();
+        let active_workspace_id = self.active_workspace_id.clone();
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_multi_workspace(weak_self, active_workspace_id, cx);
         });
     }
 

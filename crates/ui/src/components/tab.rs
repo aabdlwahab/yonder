@@ -141,7 +141,10 @@ impl RenderOnce for Tab {
             }
         };
 
+        let theme = cx.theme();
+        let precision = matches!(theme.name.as_ref(), "Precision Light" | "Precision Dark");
         self.div
+            .relative()
             .h(Tab::container_height(cx))
             .bg(tab_bg)
             .border_color(cx.theme().colors().border)
@@ -165,6 +168,17 @@ impl RenderOnce for Tab {
                 TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
             })
             .cursor_pointer()
+            .when(self.selected && precision, |tab| {
+                tab.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(1.))
+                        .bg(cx.theme().colors().text_accent),
+                )
+            })
             .child(
                 h_flex()
                     .group("")

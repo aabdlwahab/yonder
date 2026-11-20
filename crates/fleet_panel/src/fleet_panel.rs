@@ -1,9 +1,13 @@
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use agent_ui::{
+    Agent, ThreadId,
+    thread_metadata_store::{ThreadMetadata, ThreadMetadataStore},
+};
 use anyhow::{Result, anyhow};
 use askpass::EncryptedPassword;
 use collections::{HashMap, HashSet};
@@ -11,20 +15,25 @@ use futures::channel::oneshot;
 use gpui::{
     Action, App, AsyncApp, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, Global, Pixels, Render, SharedString, Subscription, Task, WeakEntity,
-    Window, actions, px,
+    Window, actions, px, relative,
 };
 use picker::{Picker, PickerDelegate};
+use project::{Event as ProjectEvent, Project};
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::ReleaseChannel;
-use remote::{RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemotePlatform};
+use remote::{
+    RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemotePlatform,
+    SshConnectionOptions,
+};
 use semver::Version;
-use settings::{Settings, SettingsStore, SshConnection};
+use settings::{Settings, SettingsStore};
+use sidebar::{Sidebar, ThreadActivity, ThreadActivityChanged};
 use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    AppState, MultiWorkspace, OpenMode, OpenOptions, SerializedWorkspaceLocation, Workspace,
-    WorkspaceDb,
-    dock::{DockPosition, Panel, PanelEvent},
+    AppState, MultiWorkspace, MultiWorkspaceEvent, OpenMode, OpenOptions, PathList,
+    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb,
+    dock::{DockPosition, Panel, PanelEvent, PanelHandle},
     notifications::DetachAndPromptErr,
 };
 use zed_actions::OpenRemote;
@@ -34,7 +43,7 @@ actions!(
     [
         /// Toggles focus on the fleet panel, which lists your machines and their projects.
         ToggleFocus,
-        /// Opens a searchable list of every project on every machine.
+        /// Searches projects and threads across machines.
         OpenSwitcher
     ]
 );
@@ -47,31 +56,51 @@ const PREWARM_HOVER_DELAY: Duration = Duration::from_millis(250);
 /// The laptop itself, listed above the SSH machines.
 const LOCAL_MACHINE_KEY: &str = "local";
 const LOCAL_MACHINE_LABEL: &str = "This Mac";
-/// How many recent local projects the panel lists.
-const LOCAL_PROJECT_LIMIT: usize = 8;
+const RECENT_PROJECTS_PER_MACHINE: usize = 8;
+
+struct FleetActivity;
+impl Global for FleetActivity {}
 
 pub fn init(cx: &mut App) {
+    cx.set_global(FleetActivity);
+    cx.on_window_closed(|cx, _| cx.update_global::<FleetActivity, _>(|_, _| {}))
+        .detach();
+    cx.observe_new::<Sidebar>(|_, _, cx| {
+        cx.subscribe(&cx.entity(), |_, _, _: &ThreadActivityChanged, cx| {
+            cx.update_global::<FleetActivity, _>(|_, _| {});
+        })
+        .detach();
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<FleetPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &OpenSwitcher, window, cx| {
             let workspace_handle = cx.weak_entity();
-            let local_projects = workspace
+            let projects = workspace
                 .panel::<FleetPanel>(cx)
-                .map(|panel| panel.read(cx).local_projects.clone())
-                .unwrap_or_default();
-            let projects = local_projects
-                .into_iter()
-                .chain(
-                    fleet_machines(cx)
+                .map(|panel| {
+                    panel
+                        .read(cx)
+                        .machines(workspace, cx)
                         .into_iter()
-                        .flat_map(|machine| machine.projects),
-                )
-                .collect();
+                        .flat_map(|machine| machine.projects)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let threads = if window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .is_some_and(|workspace| workspace.read(cx).multi_workspace_enabled(cx))
+            {
+                fleet_threads(false, window, cx)
+            } else {
+                Vec::new()
+            };
             workspace.toggle_modal(window, cx, |window, cx| {
                 Picker::uniform_list(
-                    FleetSwitcherDelegate::new(workspace_handle, projects),
+                    FleetSwitcherDelegate::new(workspace_handle, projects, threads),
                     window,
                     cx,
                 )
@@ -79,6 +108,98 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+#[derive(Clone)]
+struct FleetThread {
+    metadata: ThreadMetadata,
+    location: SharedString,
+    activity: Option<ThreadActivity>,
+}
+
+fn fleet_threads(active_only: bool, window: &Window, cx: &App) -> Vec<FleetThread> {
+    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+        return Vec::new();
+    };
+    let mut activity = HashMap::<ThreadId, ThreadActivity>::default();
+    let current_sidebar = window
+        .root::<MultiWorkspace>()
+        .flatten()
+        .and_then(|workspace| sidebar_for_window(workspace.read(cx)));
+    let other_sidebars = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .filter_map(|window| sidebar_for_window(window.read(cx).ok()?));
+    for sidebar in current_sidebar.into_iter().chain(other_sidebars) {
+        for (&id, &status) in sidebar.read(cx).thread_activity() {
+            activity
+                .entry(id)
+                .and_modify(|current| *current = (*current).max(status))
+                .or_insert(status);
+        }
+    }
+    let mut threads = store
+        .read(cx)
+        .entries()
+        .filter(|thread| {
+            !thread.archived
+                && (!thread.is_draft() || !active_only && thread.has_saved_draft_prompt(cx))
+        })
+        .filter(|thread| !active_only || activity.contains_key(&thread.thread_id))
+        .map(|thread| {
+            let machine = match &thread.remote_connection {
+                Some(RemoteConnectionOptions::Ssh(options)) => ssh_machine_label(options),
+                Some(options) => options.display_name().into(),
+                None => LOCAL_MACHINE_LABEL.into(),
+            };
+            let project = thread
+                .folder_paths()
+                .ordered_paths()
+                .next()
+                .and_then(|path| path.file_name());
+            let location = project.map_or_else(
+                || machine.clone(),
+                |name| format!("{} · {machine}", name.to_string_lossy()).into(),
+            );
+            FleetThread {
+                metadata: thread.clone(),
+                location,
+                activity: activity.get(&thread.thread_id).copied(),
+            }
+        })
+        .collect::<Vec<_>>();
+    threads.sort_by_key(|thread| std::cmp::Reverse((thread.activity, thread.metadata.updated_at)));
+    threads
+}
+
+fn sidebar_for_window(workspace: &MultiWorkspace) -> Option<Entity<Sidebar>> {
+    workspace.sidebar()?.to_any().downcast::<Sidebar>().ok()
+}
+
+fn open_fleet_thread(thread: FleetThread, window: &Window, cx: &mut App) {
+    window.defer(cx, move |window, cx| {
+        let Some(sidebar) = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .and_then(|workspace| sidebar_for_window(workspace.read(cx)))
+        else {
+            return;
+        };
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.open_known_thread(thread.metadata, window, cx)
+        });
+    });
+}
+
+fn thread_activity_style(activity: ThreadActivity) -> (IconName, Color, &'static str) {
+    match activity {
+        ThreadActivity::WaitingForApproval => {
+            (IconName::Warning, Color::Warning, "Waiting for approval")
+        }
+        ThreadActivity::Running => (IconName::PlayFilled, Color::Success, "Running"),
+        ThreadActivity::Unread => (IconName::Circle, Color::Accent, "Unread"),
+    }
 }
 
 #[derive(Clone)]
@@ -94,7 +215,7 @@ enum ProjectLocation {
     /// On this laptop, opened directly.
     Local,
     /// On an SSH machine, opened through the Yonder server there.
-    Ssh(SshConnection),
+    Ssh(SshConnectionOptions),
 }
 
 #[derive(Clone)]
@@ -103,82 +224,149 @@ struct FleetProject {
     machine_key: String,
     machine_label: SharedString,
     name: SharedString,
-    paths: Vec<PathBuf>,
+    paths: PathList,
 }
 
 impl FleetProject {
+    fn new(location: ProjectLocation, paths: PathList) -> Option<Self> {
+        let first = paths.ordered_paths().next()?;
+        let name = first
+            .file_name()
+            .unwrap_or(first.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let (machine_key, machine_label) = match &location {
+            ProjectLocation::Local => (LOCAL_MACHINE_KEY.to_string(), LOCAL_MACHINE_LABEL.into()),
+            ProjectLocation::Ssh(options) => (ssh_machine_key(options), ssh_machine_label(options)),
+        };
+        Some(Self {
+            location,
+            machine_key,
+            machine_label,
+            name: name.into(),
+            paths,
+        })
+    }
+
+    fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
+        let project = workspace.project().read(cx);
+        let location = match project.remote_connection_options(cx) {
+            None if project.is_local() => ProjectLocation::Local,
+            Some(RemoteConnectionOptions::Ssh(options)) => ProjectLocation::Ssh(options.clone()),
+            _ => return None,
+        };
+        let paths = project
+            .visible_worktrees(cx)
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                worktree
+                    .root_entry()
+                    .is_none_or(|entry| entry.is_dir())
+                    .then(|| worktree.abs_path().to_path_buf())
+            })
+            .collect::<Vec<_>>();
+        Self::new(location, PathList::new(&paths))
+    }
+
+    fn from_recent(recent: RecentWorkspace) -> Option<Self> {
+        let location = match recent.location {
+            SerializedWorkspaceLocation::Local => ProjectLocation::Local,
+            SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(options)) => {
+                ProjectLocation::Ssh(options)
+            }
+            _ => return None,
+        };
+        Self::new(location, recent.paths)
+    }
+
     fn description(&self) -> String {
         self.paths
-            .iter()
+            .ordered_paths()
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(", ")
     }
 }
 
-fn fleet_machines(cx: &App) -> Vec<FleetMachine> {
-    RemoteSettings::get_global(cx)
-        .ssh_connections()
-        .map(|connection| {
-            let key = machine_key(
-                connection.username.as_deref(),
-                &connection.host,
-                connection.port,
-            );
-            let label: SharedString = connection
-                .nickname
-                .clone()
-                .unwrap_or_else(|| connection.host.clone())
-                .into();
-            let projects = connection
-                .projects
-                .iter()
-                .map(|project| {
-                    let paths: Vec<PathBuf> = project.paths.iter().map(PathBuf::from).collect();
-                    let name = paths
-                        .first()
-                        .and_then(|path| path.file_name())
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| project.paths.join(", "));
-                    FleetProject {
-                        location: ProjectLocation::Ssh(connection.clone()),
-                        machine_key: key.clone(),
-                        machine_label: label.clone(),
-                        name: name.into(),
-                        paths,
-                    }
-                })
-                .collect();
-            FleetMachine {
+fn ssh_machine_key(options: &SshConnectionOptions) -> String {
+    machine_key(
+        options.username.as_deref(),
+        &options.host.to_string(),
+        options.port,
+    )
+}
+
+fn ssh_machine_label(options: &SshConnectionOptions) -> SharedString {
+    options
+        .nickname
+        .clone()
+        .unwrap_or_else(|| options.host.to_string())
+        .into()
+}
+
+fn group_projects(
+    configured_hosts: impl IntoIterator<Item = SshConnectionOptions>,
+    open_projects: impl IntoIterator<Item = FleetProject>,
+    recent_projects: impl IntoIterator<Item = FleetProject>,
+) -> Vec<FleetMachine> {
+    let mut machines = vec![FleetMachine {
+        key: LOCAL_MACHINE_KEY.to_string(),
+        label: LOCAL_MACHINE_LABEL.into(),
+        projects: Vec::new(),
+    }];
+    for options in configured_hosts {
+        let key = ssh_machine_key(&options);
+        if !machines.iter().any(|machine| machine.key == key) {
+            machines.push(FleetMachine {
                 key,
-                label,
-                projects,
-            }
-        })
-        .collect()
-}
-
-fn local_fleet_project(paths: Vec<PathBuf>) -> FleetProject {
-    let name = paths
-        .first()
-        .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Untitled".to_string());
-    FleetProject {
-        location: ProjectLocation::Local,
-        machine_key: LOCAL_MACHINE_KEY.to_string(),
-        machine_label: LOCAL_MACHINE_LABEL.into(),
-        name: name.into(),
-        paths,
+                label: ssh_machine_label(&options),
+                projects: Vec::new(),
+            });
+        }
     }
+
+    let open_projects = open_projects.into_iter().map(|project| (true, project));
+    let recent_projects = recent_projects.into_iter().map(|project| (false, project));
+    let mut recent_counts = HashMap::default();
+    for (is_open, mut project) in open_projects.chain(recent_projects) {
+        let index = machines
+            .iter()
+            .position(|machine| machine.key == project.machine_key)
+            .unwrap_or_else(|| {
+                let index = machines.len();
+                machines.push(FleetMachine {
+                    key: project.machine_key.clone(),
+                    label: project.machine_label.clone(),
+                    projects: Vec::new(),
+                });
+                index
+            });
+        let machine = &mut machines[index];
+        if machine
+            .projects
+            .iter()
+            .any(|listed| listed.paths == project.paths)
+        {
+            continue;
+        }
+        if !is_open {
+            let count = recent_counts.entry(index).or_insert(0);
+            if *count >= RECENT_PROJECTS_PER_MACHINE {
+                continue;
+            }
+            *count += 1;
+        }
+        project.machine_label = machine.label.clone();
+        machine.projects.push(project);
+    }
+
+    machines
 }
 
-fn connection_options(connection: &SshConnection, cx: &App) -> RemoteConnectionOptions {
-    RemoteConnectionOptions::Ssh(RemoteSettings::get_global(cx).connection_options_for(
-        connection.host.clone(),
-        connection.port,
-        connection.username.clone(),
-    ))
+fn connection_options(connection: &SshConnectionOptions, cx: &App) -> RemoteConnectionOptions {
+    let mut options = connection.clone();
+    RemoteSettings::get_global(cx).fill_connection_options_from_settings(&mut options);
+    RemoteConnectionOptions::Ssh(options)
 }
 
 fn machine_key(username: Option<&str>, host: &str, port: Option<u16>) -> String {
@@ -192,15 +380,6 @@ fn machine_key(username: Option<&str>, host: &str, port: Option<u16>) -> String 
         key.push_str(&format!(":{port}"));
     }
     key
-}
-
-/// Settings may name a project relative to the home directory (`~/code/app`),
-/// while an open project reports its resolved path (`/home/me/code/app`).
-fn same_remote_path(settings_path: &Path, open_path: &Path) -> bool {
-    match settings_path.strip_prefix("~") {
-        Ok(relative) if !relative.as_os_str().is_empty() => open_path.ends_with(relative),
-        _ => settings_path == open_path,
-    }
 }
 
 /// Opens `project` in the window that holds `workspace`, logging how long the switch took.
@@ -227,7 +406,7 @@ fn open_fleet_project(
         requesting_window: window.window_handle().downcast::<MultiWorkspace>(),
         ..Default::default()
     };
-    let paths = project.paths.clone();
+    let paths = project.paths.ordered_paths().cloned().collect();
     let label = format!("{}/{}", project.machine_label, project.name);
     let started = Instant::now();
     cx.spawn_in(window, async move |_, cx| {
@@ -247,7 +426,7 @@ fn open_local_project(project: &FleetProject, window: &mut Window, cx: &mut Cont
     let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
         return;
     };
-    let paths = project.paths.clone();
+    let paths = project.paths.ordered_paths().cloned().collect();
     let label = format!("{}/{}", project.machine_label, project.name);
     cx.defer(move |cx| {
         let started = Instant::now();
@@ -361,19 +540,24 @@ impl RemoteClientDelegate for PrewarmDelegate {
     fn set_status(&self, _status: Option<&str>, _cx: &mut AsyncApp) {}
 }
 
-/// Lists every SSH machine from settings with its projects, and opens a project
-/// in the current window so switching between machines stays in one place.
+/// Lists open and recent projects by machine and opens them in the current window.
 pub struct FleetPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     position: DockPosition,
+    file_tree: Option<Arc<dyn PanelHandle>>,
     collapsed_machines: HashSet<String>,
     hover_prewarm: Option<Task<()>>,
     app_state: Arc<AppState>,
-    /// Recent projects on this laptop, newest first, from Yonder's own history.
-    local_projects: Vec<FleetProject>,
-    load_local_projects: Option<Task<()>>,
+    recent_projects: Vec<FleetProject>,
+    load_recent_projects: Option<Task<()>>,
+    multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    _workspace_subscription: Option<Subscription>,
+    _project_subscription: Subscription,
+    _activation_subscription: Subscription,
     _settings_subscription: Subscription,
+    _activity_subscription: Subscription,
+    _thread_subscription: Option<Subscription>,
 }
 
 impl FleetPanel {
@@ -382,45 +566,76 @@ impl FleetPanel {
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
         let workspace_handle = workspace.clone();
-        workspace.update_in(&mut cx, |workspace, _, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             let app_state = workspace.app_state().clone();
-            cx.new(|cx| Self::new(workspace_handle, app_state, cx))
+            cx.new(|cx| Self::new(workspace_handle, app_state, workspace.project(), window, cx))
         })
     }
 
-    fn new(workspace: WeakEntity<Workspace>, app_state: Arc<AppState>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        app_state: Arc<AppState>,
+        project: &Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut panel = Self {
             workspace,
             app_state,
             focus_handle: cx.focus_handle(),
             position: DockPosition::Left,
+            file_tree: None,
             collapsed_machines: HashSet::default(),
             hover_prewarm: None,
-            local_projects: Vec::new(),
-            load_local_projects: None,
+            recent_projects: Vec::new(),
+            load_recent_projects: None,
+            multi_workspace: None,
+            _workspace_subscription: None,
+            _project_subscription: cx.subscribe(project, |_, _, event, cx| {
+                if matches!(
+                    event,
+                    ProjectEvent::WorktreeAdded(_)
+                        | ProjectEvent::WorktreeRemoved(_)
+                        | ProjectEvent::WorktreeOrderChanged
+                        | ProjectEvent::WorktreePathsChanged { .. }
+                ) {
+                    cx.notify();
+                }
+            }),
+            _activation_subscription: cx.observe_window_activation(window, |panel, window, cx| {
+                if window.is_window_active() {
+                    panel.refresh_recent_projects(cx);
+                }
+            }),
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+            _activity_subscription: cx.observe_global::<FleetActivity>(|_, cx| cx.notify()),
+            _thread_subscription: ThreadMetadataStore::try_global(cx)
+                .map(|store| cx.observe(&store, |_, _, cx| cx.notify())),
         };
-        panel.refresh_local_projects(cx);
+        panel.refresh_recent_projects(cx);
         panel
+    }
+
+    pub fn set_file_tree(&mut self, file_tree: Arc<dyn PanelHandle>, cx: &mut Context<Self>) {
+        self.file_tree = Some(file_tree);
+        cx.notify();
     }
 
     /// Runs while the workspace may still be mid-update (the panel is created
     /// inside it), so it must not read the workspace entity.
-    fn refresh_local_projects(&mut self, cx: &mut Context<Self>) {
+    fn refresh_recent_projects(&mut self, cx: &mut Context<Self>) {
         let fs = self.app_state.fs.clone();
         let db = WorkspaceDb::global(cx);
-        self.load_local_projects = Some(cx.spawn(async move |this, cx| {
+        self.load_recent_projects = Some(cx.spawn(async move |this, cx| {
             let recent = db
                 .recent_project_workspaces(fs.as_ref())
                 .await
                 .log_err()
                 .unwrap_or_default();
             this.update(cx, |this, cx| {
-                this.local_projects = recent
+                this.recent_projects = recent
                     .into_iter()
-                    .filter(|recent| matches!(recent.location, SerializedWorkspaceLocation::Local))
-                    .map(|recent| local_fleet_project(recent.paths.paths().to_vec()))
-                    .take(LOCAL_PROJECT_LIMIT)
+                    .filter_map(FleetProject::from_recent)
                     .collect();
                 cx.notify();
             })
@@ -447,27 +662,55 @@ impl FleetPanel {
         }));
     }
 
-    /// The machine and folders of the project shown in this workspace.
-    fn active_location(&self, cx: &App) -> Option<(String, Vec<PathBuf>)> {
-        let workspace = self.workspace.upgrade()?;
-        let project = workspace.read(cx).project().read(cx);
-        let key = match project.remote_connection_options(cx) {
-            None => LOCAL_MACHINE_KEY.to_string(),
-            Some(RemoteConnectionOptions::Ssh(options)) => machine_key(
-                options.username.as_deref(),
-                &options.host.to_string(),
-                options.port,
-            ),
-            Some(_) => return None,
-        };
-        let paths = project
-            .visible_worktrees(cx)
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-            .collect();
-        Some((key, paths))
+    fn observe_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        let multi = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(WeakEntity::upgrade);
+        let handle = multi.as_ref().map(Entity::downgrade);
+        if handle == self.multi_workspace {
+            return;
+        }
+        self.multi_workspace = handle;
+        // A Fleet repaint already notifies the window through the dock and sidebar.
+        // Listen for project events only, so a repaint cannot trigger itself again.
+        self._workspace_subscription = multi.as_ref().map(|multi| {
+            cx.subscribe(multi, |panel, _, event, cx| {
+                if matches!(
+                    event,
+                    MultiWorkspaceEvent::ActiveWorkspaceChanged { .. }
+                        | MultiWorkspaceEvent::WorkspaceRemoved(_)
+                ) {
+                    panel.refresh_recent_projects(cx);
+                }
+                cx.notify();
+            })
+        });
     }
 
-    fn open_project(&mut self, project: &FleetProject, window: &mut Window, cx: &mut Context<Self>) {
+    fn machines(&self, workspace: &Workspace, cx: &App) -> Vec<FleetMachine> {
+        let current = FleetProject::from_workspace(workspace, cx);
+        let multi = workspace.multi_workspace().and_then(WeakEntity::upgrade);
+        let others = multi
+            .iter()
+            .flat_map(|multi| multi.read(cx).workspaces())
+            .filter(|other| other.entity_id() != self.workspace.entity_id())
+            .filter_map(|other| FleetProject::from_workspace(other.read(cx), cx));
+        group_projects(
+            RemoteSettings::get_global(cx)
+                .ssh_connections()
+                .map(SshConnectionOptions::from),
+            current.into_iter().chain(others),
+            self.recent_projects.iter().cloned(),
+        )
+    }
+
+    fn open_project(
+        &mut self,
+        project: &FleetProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.hover_prewarm = None;
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -494,27 +737,92 @@ impl FleetPanel {
             )
             .into_any_element()
     }
+
+    fn render_active_threads(&self, window: &Window, cx: &App) -> impl IntoElement {
+        let threads = fleet_threads(true, window, cx);
+        v_flex()
+            .pb_2()
+            .mb_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                div().px_3().py_1().child(
+                    Label::new("Active")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
+            .when(threads.is_empty(), |this| {
+                this.child(
+                    div().px_3().py_1().child(
+                        Label::new("No active threads")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .children(threads.into_iter().filter_map(|thread| {
+                let (icon, color, status) = thread_activity_style(thread.activity?);
+                let description = format!(
+                    "{} · {} · {status}",
+                    thread.metadata.display_title(),
+                    thread.location
+                );
+                Some(
+                    ListItem::new(SharedString::from(
+                        thread.metadata.thread_id.to_key_string(),
+                    ))
+                    .spacing(ListItemSpacing::Sparse)
+                    .start_slot(Icon::new(icon).color(color))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(Label::new(thread.metadata.display_title()).single_line())
+                            .child(
+                                Label::new(format!("{} · {status}", thread.location))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                    )
+                    .tooltip(Tooltip::text(description))
+                    .on_click(move |_, window, cx| open_fleet_thread(thread.clone(), window, cx)),
+                )
+            }))
+    }
 }
 
 impl Render for FleetPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let remote_machines = fleet_machines(cx);
-        let has_remote_machines = !remote_machines.is_empty();
-        let machines = std::iter::once(FleetMachine {
-            key: LOCAL_MACHINE_KEY.to_string(),
-            label: LOCAL_MACHINE_LABEL.into(),
-            projects: self.local_projects.clone(),
-        })
-        .chain(remote_machines);
-        let active = self.active_location(cx);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.workspace.upgrade();
+        let (machines, active) = if let Some(workspace) = &workspace {
+            let workspace = workspace.read(cx);
+            let active = FleetProject::from_workspace(workspace, cx);
+            (self.machines(workspace, cx), active)
+        } else {
+            (Vec::new(), None)
+        };
+        if let Some(workspace) = workspace {
+            self.observe_workspace(&workspace, cx);
+        }
+        let has_remote_machines = machines
+            .iter()
+            .any(|machine| machine.key != LOCAL_MACHINE_KEY);
 
         let mut list = v_flex()
             .id("fleet-panel-list")
             .size_full()
             .overflow_y_scroll()
-            .py_1();
+            .py_1()
+            .when(
+                window
+                    .root::<MultiWorkspace>()
+                    .flatten()
+                    .is_some_and(|workspace| workspace.read(cx).multi_workspace_enabled(cx)),
+                |list| list.child(self.render_active_threads(window, cx)),
+            );
 
-        for (machine_index, machine) in machines.enumerate() {
+        for (machine_index, machine) in machines.into_iter().enumerate() {
             let is_local = machine.key == LOCAL_MACHINE_KEY;
             let expanded = !self.collapsed_machines.contains(&machine.key);
 
@@ -565,13 +873,8 @@ impl Render for FleetPanel {
             }
 
             for (project_index, project) in machine.projects.iter().enumerate() {
-                let is_active = active.as_ref().is_some_and(|(active_key, open_paths)| {
-                    *active_key == machine.key
-                        && project.paths.iter().all(|path| {
-                            open_paths
-                                .iter()
-                                .any(|open_path| same_remote_path(path, open_path))
-                        })
+                let is_active = active.as_ref().is_some_and(|current| {
+                    current.machine_key == machine.key && current.paths == project.paths
                 });
 
                 list = list.child(
@@ -602,11 +905,52 @@ impl Render for FleetPanel {
             list = list.child(self.render_empty_state());
         }
 
+        let content = if let Some(files) = self
+            .file_tree
+            .as_ref()
+            .filter(|files| files.position(window, cx) == self.position)
+        {
+            let section_title = |text| {
+                h_flex()
+                    .flex_none()
+                    .px_3()
+                    .py_1p5()
+                    .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+            };
+            v_flex()
+                .size_full()
+                .child(
+                    v_flex()
+                        .h(relative(0.44))
+                        .flex_none()
+                        .min_h_0()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(section_title("Fleet"))
+                        .child(list.flex_1().min_h_0()),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(section_title("Files"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(files.to_any()),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            list.into_any_element()
+        };
         v_flex()
             .key_context("FleetPanel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(list)
+            .child(content)
     }
 }
 
@@ -635,7 +979,12 @@ impl Panel for FleetPanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
-    fn set_position(&mut self, position: DockPosition, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_position(
+        &mut self,
+        position: DockPosition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.position = position;
         cx.notify();
     }
@@ -662,7 +1011,7 @@ impl Panel for FleetPanel {
 
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         if active {
-            self.refresh_local_projects(cx);
+            self.refresh_recent_projects(cx);
         }
     }
 
@@ -675,25 +1024,65 @@ impl Panel for FleetPanel {
 /// connects to its machine in advance, so confirming it opens faster.
 struct FleetSwitcherDelegate {
     workspace: WeakEntity<Workspace>,
-    projects: Vec<FleetProject>,
+    entries: Vec<SwitcherEntry>,
     matches: Vec<usize>,
     selected_index: usize,
 }
 
+#[derive(Clone)]
+enum SwitcherEntry {
+    Project(FleetProject),
+    Thread(FleetThread),
+}
+
+impl SwitcherEntry {
+    fn matches(&self, query: &str) -> bool {
+        let text = match self {
+            Self::Project(project) => format!(
+                "{} {} {}",
+                project.name,
+                project.machine_label,
+                project.description()
+            ),
+            Self::Thread(thread) => format!(
+                "{} {} {} {}",
+                thread.metadata.display_title(),
+                thread.location,
+                thread.metadata.agent_id.0,
+                thread
+                    .activity
+                    .map(|activity| thread_activity_style(activity).2)
+                    .unwrap_or_default()
+            ),
+        };
+        query
+            .split_whitespace()
+            .all(|word| matches_in_order(word, &text))
+    }
+}
+
 impl FleetSwitcherDelegate {
-    fn new(workspace: WeakEntity<Workspace>, projects: Vec<FleetProject>) -> Self {
-        let matches = (0..projects.len()).collect();
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        projects: Vec<FleetProject>,
+        threads: Vec<FleetThread>,
+    ) -> Self {
+        let entries = projects
+            .into_iter()
+            .map(SwitcherEntry::Project)
+            .chain(threads.into_iter().map(SwitcherEntry::Thread))
+            .collect::<Vec<_>>();
+        let matches = (0..entries.len()).collect();
         Self {
             workspace,
-            projects,
+            entries,
             matches,
             selected_index: 0,
         }
     }
 
-    fn selected_project(&self) -> Option<&FleetProject> {
-        let project_index = *self.matches.get(self.selected_index)?;
-        self.projects.get(project_index)
+    fn selected_entry(&self) -> Option<&SwitcherEntry> {
+        self.entries.get(*self.matches.get(self.selected_index)?)
     }
 }
 
@@ -729,17 +1118,17 @@ impl PickerDelegate for FleetSwitcherDelegate {
         cx: &mut Context<Picker<Self>>,
     ) {
         self.selected_index = index;
-        if let Some(project) = self.selected_project().cloned() {
-            prewarm(&project, cx);
+        if let Some(SwitcherEntry::Project(project)) = self.selected_entry() {
+            prewarm(project, cx);
         }
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Switch to a project on any machine…".into()
+        "Search projects and threads…".into()
     }
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
-        Some("No matching projects. Add machines and projects under ssh_connections in settings.".into())
+        Some("No matching projects or threads.".into())
     }
 
     fn update_matches(
@@ -749,18 +1138,10 @@ impl PickerDelegate for FleetSwitcherDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         self.matches = self
-            .projects
+            .entries
             .iter()
             .enumerate()
-            .filter(|(_, project)| {
-                let haystack = format!(
-                    "{} {} {}",
-                    project.name,
-                    project.machine_label,
-                    project.description()
-                );
-                matches_in_order(&query, &haystack)
-            })
+            .filter(|(_, entry)| entry.matches(&query))
             .map(|(index, _)| index)
             .collect();
         self.selected_index = self
@@ -770,15 +1151,20 @@ impl PickerDelegate for FleetSwitcherDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(project) = self.selected_project().cloned() else {
+        let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                open_fleet_project(&project, workspace.app_state().clone(), window, cx)
-            });
-        }
         cx.emit(DismissEvent);
+        match entry {
+            SwitcherEntry::Project(project) => {
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        open_fleet_project(&project, workspace.app_state().clone(), window, cx)
+                    });
+                }
+            }
+            SwitcherEntry::Thread(thread) => open_fleet_thread(thread, window, cx),
+        }
     }
 
     fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
@@ -792,24 +1178,47 @@ impl PickerDelegate for FleetSwitcherDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let project = self.projects.get(*self.matches.get(index)?)?;
+        let (title, location, icon, color, description) =
+            match self.entries.get(*self.matches.get(index)?)? {
+                SwitcherEntry::Project(project) => (
+                    project.name.clone(),
+                    project.machine_label.clone(),
+                    IconName::Folder,
+                    Color::Muted,
+                    project.description(),
+                ),
+                SwitcherEntry::Thread(thread) => {
+                    let agent = Agent::from(thread.metadata.agent_id.clone());
+                    let (icon, color) = thread
+                        .activity
+                        .map(|status| {
+                            let (icon, color, _) = thread_activity_style(status);
+                            (icon, color)
+                        })
+                        .unwrap_or((agent.icon().unwrap_or(IconName::Sparkle), Color::Muted));
+                    let title = thread.metadata.display_title();
+                    let description = format!("{title} · {} · {}", thread.location, agent.label());
+                    (title, thread.location.clone(), icon, color, description)
+                }
+            };
         Some(
             ListItem::new(index)
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
-                .start_slot(Icon::new(IconName::Folder).color(Color::Muted))
+                .start_slot(Icon::new(icon).color(color))
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Label::new(project.name.clone()))
+                        .child(Label::new(title).single_line())
                         .child(
-                            Label::new(project.machine_label.clone())
+                            Label::new(location)
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Muted)
+                                .single_line(),
                         ),
                 )
-                .tooltip(Tooltip::text(project.description())),
+                .tooltip(Tooltip::text(description)),
         )
     }
 }
@@ -828,25 +1237,80 @@ mod tests {
     }
 
     #[test]
-    fn home_relative_settings_paths_match_resolved_paths() {
-        assert!(same_remote_path(
-            Path::new("~/projects/app"),
-            Path::new("/home/me/projects/app")
-        ));
-        assert!(same_remote_path(Path::new("/srv/app"), Path::new("/srv/app")));
-        assert!(!same_remote_path(
-            Path::new("~/projects/app"),
-            Path::new("/home/me/projects/other")
-        ));
-        assert!(!same_remote_path(Path::new("~"), Path::new("/home/me/anything")));
+    fn switcher_matches_thread_title_account_machine_and_activity() {
+        let thread = SwitcherEntry::Thread(FleetThread {
+            metadata: ThreadMetadata {
+                thread_id: ThreadId::new(),
+                session_id: None,
+                agent_id: project::AgentId::new("claude-acp@work"),
+                title: Some("Fix indexing".into()),
+                title_override: None,
+                updated_at: Default::default(),
+                created_at: None,
+                interacted_at: None,
+                worktree_paths: Default::default(),
+                remote_connection: None,
+                archived: false,
+            },
+            location: "search · GPU 06".into(),
+            activity: Some(ThreadActivity::WaitingForApproval),
+        });
+        assert!(thread.matches("approval gpu indexing work"));
+        assert!(!thread.matches("unread"));
+        assert!(!thread.matches("gpu 07"));
     }
 
     #[test]
-    fn local_projects_are_named_after_their_first_folder() {
-        let project = local_fleet_project(vec![PathBuf::from("/Users/me/Projects/remote-code")]);
-        assert_eq!(project.name.as_ref(), "remote-code");
-        assert_eq!(project.machine_key, LOCAL_MACHINE_KEY);
-        assert!(matches!(project.location, ProjectLocation::Local));
+    fn fleet_uses_open_projects_and_history_instead_of_saved_folders() {
+        let configured = SshConnectionOptions {
+            host: "build-box".into(),
+            nickname: Some("Build Box".to_string()),
+            ..Default::default()
+        };
+        let connection = SshConnectionOptions {
+            host: configured.host.clone(),
+            ..Default::default()
+        };
+        let remote = |path: &str| {
+            FleetProject::new(
+                ProjectLocation::Ssh(connection.clone()),
+                PathList::new(&[path]),
+            )
+            .unwrap()
+        };
+        let local =
+            FleetProject::new(ProjectLocation::Local, PathList::new(&["/local/editor"])).unwrap();
+        let machines = group_projects(
+            [configured],
+            [remote("/remote/just-opened"), local],
+            [remote("/remote/previous"), remote("/remote/just-opened")],
+        );
+        assert_eq!(machines[0].projects[0].name.as_ref(), "editor");
+        let machine = &machines[1];
+        assert_eq!(machine.label.as_ref(), "Build Box");
+        assert_eq!(
+            machine
+                .projects
+                .iter()
+                .map(|project| project.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["just-opened", "previous"]
+        );
+    }
+
+    #[test]
+    fn unconfigured_ssh_machines_appear_when_a_project_is_opened() {
+        let project = FleetProject::new(
+            ProjectLocation::Ssh(SshConnectionOptions {
+                host: "other-box".into(),
+                ..Default::default()
+            }),
+            PathList::new(&["/remote/project"]),
+        )
+        .unwrap();
+        let machines = group_projects([], [project], []);
+        assert_eq!(machines[1].label.as_ref(), "other-box");
+        assert_eq!(machines[1].projects[0].name.as_ref(), "project");
     }
 
     #[test]

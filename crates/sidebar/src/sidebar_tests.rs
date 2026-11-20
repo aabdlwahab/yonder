@@ -1252,6 +1252,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     });
 
     let serialized = serde_json::to_string(&SerializedSidebar {
+        unread_threads: Vec::new(),
         width: Some(400.0),
         width_set_by_user: true,
         active_view: SerializedSidebarView::History,
@@ -4995,6 +4996,7 @@ async fn test_elicitation_marks_sidebar_thread_waiting_until_responded(cx: &mut 
     let session_id = active_session_id(&panel, cx);
     save_test_thread_metadata(&session_id, &project, cx).await;
     let thread = cx.update(|_, cx| panel.read(cx).active_agent_thread(cx).unwrap());
+    let thread_id = panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
     let thread_status = |cx: &mut VisualTestContext| {
         sidebar.read_with(cx, |sidebar, _cx| {
             sidebar
@@ -5053,6 +5055,12 @@ async fn test_elicitation_marks_sidebar_thread_waiting_until_responded(cx: &mut 
         });
         cx.run_until_parked();
         assert_eq!(thread_status(cx), AgentThreadStatus::WaitingForConfirmation);
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar.thread_activity().get(&thread_id),
+                Some(&ThreadActivity::WaitingForApproval)
+            );
+        });
 
         thread.update(cx, |thread, cx| {
             thread.respond_to_elicitation(
@@ -5072,7 +5080,10 @@ async fn test_background_thread_completion_triggers_notification(cx: &mut TestAp
     let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
-    let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let sidebar = setup_sidebar_closed(&multi_workspace, cx);
+    let workspace_a =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let panel_a = add_agent_panel(&workspace_a, cx);
 
     // Open thread on workspace A and keep it generating.
     let connection_a = StubAgentConnection::new();
@@ -5090,6 +5101,13 @@ async fn test_background_thread_completion_triggers_notification(cx: &mut TestAp
         );
     });
     cx.run_until_parked();
+    let thread_id_a = panel_a.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(
+            sidebar.thread_activity().get(&thread_id_a),
+            Some(&ThreadActivity::Running)
+        );
+    });
 
     // Add a second workspace and activate it (making workspace A the background).
     let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx));
@@ -5122,6 +5140,29 @@ async fn test_background_thread_completion_triggers_notification(cx: &mut TestAp
             "  Hello * (!)",
         ]
     );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_eq!(
+            sidebar.thread_activity().get(&thread_id_a),
+            Some(&ThreadActivity::Unread)
+        );
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id_a)
+            .unwrap()
+            .clone();
+        sidebar.open_known_thread(metadata, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone()),
+        workspace_a
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(!sidebar.thread_activity().contains_key(&thread_id_a))
+    });
 }
 
 fn type_in_search(sidebar: &Entity<Sidebar>, query: &str, cx: &mut gpui::VisualTestContext) {

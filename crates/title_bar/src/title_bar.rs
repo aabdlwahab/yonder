@@ -394,6 +394,18 @@ impl Render for TitleBar {
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
+                .when(AgentSettings::get_global(cx).enabled(cx), |this| {
+                    this.child(
+                        Button::new("recent-agent-chats", "Recent chats")
+                            .label_size(LabelSize::Small)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    zed_actions::agent::RecentChats.boxed_clone(),
+                                    cx,
+                                );
+                            }),
+                    )
+                })
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
