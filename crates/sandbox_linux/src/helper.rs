@@ -62,7 +62,7 @@ fn run_helper() -> Result<i32> {
         )
     };
     let (setup, _) = receive_message::<HelperSetup>(setup_socket.as_fd())?
-        .context("Zed closed the setup channel")?;
+        .context("Yonder closed the setup channel")?;
     drop(setup_socket);
 
     // SAFETY: getuid/getgid can't fail.
