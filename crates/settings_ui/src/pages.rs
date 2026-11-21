@@ -4,6 +4,7 @@ mod edit_prediction_provider_setup;
 mod external_agents_page;
 mod feature_flags;
 mod llm_providers_page;
+mod machines_page;
 mod mcp_servers_page;
 mod sandbox_settings;
 mod skill_creator;
@@ -22,6 +23,7 @@ pub(crate) use feature_flags::render_feature_flags_page;
 pub(crate) use llm_providers_page::{
     LlmProviderForm, render_add_llm_provider_popover, render_llm_providers_page,
 };
+pub(crate) use machines_page::{MachinesPage, render_machines_page};
 pub(crate) use mcp_servers_page::{
     McpServerForm, render_add_server_popover, render_mcp_servers_page,
 };

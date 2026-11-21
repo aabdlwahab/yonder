@@ -1010,6 +1010,8 @@ pub struct SettingsWindow {
     /// focus ring when the page auto-focuses it on open (which happens via mouse,
     /// where `focus_visible` styling would otherwise be suppressed).
     pub(crate) mcp_add_server_focus_handle: FocusHandle,
+    /// The Machines page, which keeps its own editing state.
+    pub(crate) machines_page: Option<Entity<pages::MachinesPage>>,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
     pub(crate) custom_agent_form: Option<CustomAgentForm>,
     /// Stable focus handle for the external agents "Add Agent" button, so it can
@@ -1094,6 +1096,8 @@ enum SettingsPageItem {
     SubPageLink(SubPageLink),
     DynamicItem(DynamicItem),
     ActionLink(ActionLink),
+    /// A whole section drawn by the page itself, such as the machine list.
+    Custom(CustomItem),
 }
 
 impl std::fmt::Debug for SettingsPageItem {
@@ -1112,6 +1116,7 @@ impl std::fmt::Debug for SettingsPageItem {
             SettingsPageItem::ActionLink(action_link) => {
                 write!(f, "ActionLink({})", action_link.title)
             }
+            SettingsPageItem::Custom(custom) => write!(f, "Custom({})", custom.title),
         }
     }
 }
@@ -1403,6 +1408,7 @@ impl SettingsPageItem {
                 )
                 .when(bottom_border, |this| this.child(Divider::horizontal()))
                 .into_any_element(),
+            SettingsPageItem::Custom(custom) => (custom.render)(settings_window, window, cx),
         }
     }
 }
@@ -1696,6 +1702,20 @@ struct SubPageLink {
 }
 
 impl PartialEq for SubPageLink {
+    fn eq(&self, other: &Self) -> bool {
+        self.title == other.title
+    }
+}
+
+#[derive(Clone)]
+struct CustomItem {
+    title: &'static str,
+    search_aliases: &'static [&'static str],
+    files: FileMask,
+    render: fn(&SettingsWindow, &mut Window, &mut Context<SettingsWindow>) -> AnyElement,
+}
+
+impl PartialEq for CustomItem {
     fn eq(&self, other: &Self) -> bool {
         self.title == other.title
     }
@@ -2039,6 +2059,9 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            machines_page: Some(
+                cx.new(|cx| pages::MachinesPage::new(<dyn fs::Fs>::global(cx), cx)),
+            ),
         };
 
         this.fetch_files(window, cx);
@@ -2241,7 +2264,8 @@ impl SettingsWindow {
                             any_found_since_last_header = true;
                         }
                     }
-                    SettingsPageItem::ActionLink(ActionLink { files, .. }) => {
+                    SettingsPageItem::ActionLink(ActionLink { files, .. })
+                    | SettingsPageItem::Custom(CustomItem { files, .. }) => {
                         if !files.contains(current_file) {
                             page_filter[index] = false;
                         } else {
@@ -2496,6 +2520,18 @@ impl SettingsWindow {
                             key_index,
                             action_link.title.as_ref(),
                         );
+                    }
+                    SettingsPageItem::Custom(custom) => {
+                        let mut parts = vec![page.title, header_str, custom.title];
+                        parts.extend(custom.search_aliases);
+                        documents.push(SearchDocument {
+                            id: key_index,
+                            words: split_into_words(&parts),
+                        });
+                        push_candidates(&mut fuzzy_match_candidates, key_index, custom.title);
+                        for alias in custom.search_aliases {
+                            push_candidates(&mut fuzzy_match_candidates, key_index, alias);
+                        }
                     }
                 }
                 push_candidates(&mut fuzzy_match_candidates, key_index, page.title);
@@ -5511,6 +5547,7 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                machines_page: None,
             }
         }
     }
@@ -5651,6 +5688,7 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            machines_page: None,
         };
 
         settings_window.build_filter_table();
@@ -7416,6 +7454,100 @@ pub mod test {
             assert!(
                 settings_window.skill_creator_page().is_some(),
                 "skill creator page state should exist"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_clicking_machines_opens_the_machines_page(cx: &mut gpui::TestAppContext) {
+        use project::Project;
+
+        cx.update(|cx| {
+            register_settings(cx);
+        });
+        let app_state = cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state.clone(), cx);
+            app_state
+        });
+        let project = cx.update(|cx| {
+            Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                project::LocalProjectFlags::default(),
+                cx,
+            )
+        });
+        let (_multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| {
+                Workspace::new(
+                    Default::default(),
+                    project.clone(),
+                    app_state.clone(),
+                    window,
+                    cx,
+                )
+            });
+            MultiWorkspace::new(workspace, window, cx)
+        });
+        let workspace_handle = cx.window_handle().downcast::<MultiWorkspace>().unwrap();
+        cx.run_until_parked();
+
+        let (settings_window, cx) = cx
+            .add_window_view(|window, cx| SettingsWindow::new(Some(workspace_handle), window, cx));
+        cx.run_until_parked();
+
+        settings_window.update_in(cx, |settings_window, window, cx| {
+            let machines = settings_window
+                .navbar_entries
+                .iter()
+                .position(|entry| entry.is_root && entry.title == "Machines")
+                .expect("Machines should be in the navigation");
+            assert!(
+                settings_window.is_nav_entry_visible(machines),
+                "Machines should be visible in the navigation"
+            );
+            settings_window.open_and_scroll_to_navbar_entry(machines, None, true, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        settings_window.read_with(cx, |settings_window, _| {
+            assert_eq!(settings_window.current_page().title, "Machines");
+        });
+
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(
+                        r#"{ "ssh_connections": [{ "host": "10.0.0.6", "nickname": "gpu-06" }] }"#,
+                        cx,
+                    )
+                    .ok();
+            });
+        });
+        cx.run_until_parked();
+        let machines_page = settings_window.read_with(cx, |settings_window, _| {
+            settings_window
+                .machines_page
+                .clone()
+                .expect("the settings window should have a Machines page")
+        });
+        machines_page.update_in(cx, |page, window, cx| page.toggle_machine(0, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+
+        settings_window.read_with(cx, |settings_window, _| {
+            assert_eq!(
+                settings_window.current_page().title,
+                "Machines",
+                "opening a machine should stay on the Machines page"
             );
         });
     }
