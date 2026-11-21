@@ -46,7 +46,7 @@ const SERVER_BINARY_CHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 mod address;
 
-pub use address::{ConnectionRoute, SshRoutes, route_names};
+pub use address::{ConnectionRoute, SshRoutes, primary_answers, route_names};
 
 /// The user canceled the SSH password or passphrase prompt.
 #[derive(Debug)]

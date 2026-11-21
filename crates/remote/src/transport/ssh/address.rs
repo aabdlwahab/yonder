@@ -254,6 +254,17 @@ pub(super) async fn order_addresses(
     order
 }
 
+/// Whether the machine's primary address answers on its SSH port. A primary
+/// behind a jump host or proxy can't be checked and counts as not answering.
+pub async fn primary_answers(
+    options: &SshConnectionOptions,
+    executor: &BackgroundExecutor,
+) -> bool {
+    let mut primary = options.clone();
+    primary.secondary_hosts = Vec::new();
+    check(&primary, executor).await == Reach::Answered
+}
+
 async fn check(options: &SshConnectionOptions, executor: &BackgroundExecutor) -> Reach {
     let Some((hostname, port)) = resolve(options).await.flatten() else {
         return Reach::Unchecked;

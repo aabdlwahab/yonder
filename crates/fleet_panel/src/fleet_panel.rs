@@ -27,7 +27,7 @@ use release_channel::ReleaseChannel;
 use remote::{
     ConnectionRoute, ConnectionState, RemoteClient, RemoteClientDelegate, RemoteClientEvent,
     RemoteConnection, RemoteConnectionOptions, RemotePlatform, SshConnectionOptions, SshRoutes,
-    route_names,
+    primary_answers, route_names,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,7 @@ impl Global for FleetActivity {}
 pub fn init(cx: &mut App) {
     cx.set_global(FleetActivity);
     load_routes(cx);
+    watch_primaries(cx);
     cx.on_window_closed(|cx, _| cx.update_global::<FleetActivity, _>(|_, _| {}))
         .detach();
     cx.observe_new::<Sidebar>(|_, _, cx| {
@@ -781,6 +782,141 @@ fn apply_routes(cx: &mut App) {
         cx.spawn(async move |_| connection.kill().await.log_err())
             .detach();
     }
+
+    revive_disconnected(cx);
+}
+
+/// Reopens projects on machines that gave up reconnecting, so changing the
+/// network brings them back. Once a client gives up, its project has dropped
+/// its files and language servers, so this reopens the project the way the
+/// Disconnected overlay's Reconnect button does.
+fn revive_disconnected(cx: &mut App) {
+    let mut reopen = Vec::new();
+    for window in cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+    {
+        let Ok(multi) = window.read(cx) else {
+            continue;
+        };
+        for workspace in multi.workspaces() {
+            let workspace = workspace.read(cx);
+            let Some(client) = workspace.project().read(cx).remote_client() else {
+                continue;
+            };
+            let client = client.read(cx);
+            if client.connection_state() != ConnectionState::Disconnected {
+                continue;
+            }
+            let Some(options) =
+                ssh_options(client).filter(|options| !options.secondary_hosts.is_empty())
+            else {
+                continue;
+            };
+            let paths = workspace
+                .root_paths(cx)
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>();
+            reopen.push((
+                window,
+                options.clone(),
+                paths,
+                workspace.app_state().clone(),
+            ));
+        }
+    }
+    for (window, options, paths, app_state) in reopen {
+        log::info!(
+            "fleet: reopening {:?} on {} after a network change",
+            paths,
+            options.connection_string()
+        );
+        cx.spawn(async move |cx| {
+            open_remote_project(
+                RemoteConnectionOptions::Ssh(options),
+                paths,
+                app_state,
+                OpenOptions {
+                    requesting_window: Some(window),
+                    ..Default::default()
+                },
+                cx,
+            )
+            .await
+            .log_err();
+        })
+        .detach();
+    }
+}
+
+/// How often to check whether machines that fell back can reach their
+/// primary address again.
+const PRIMARY_RECHECK: Duration = Duration::from_secs(30);
+
+/// Machines on Auto that fell back to a secondary address and whose primary
+/// answers again, by machine key.
+#[derive(Default)]
+struct PrimaryWatch {
+    available: HashSet<String>,
+}
+
+impl Global for PrimaryWatch {}
+
+fn watch_primaries(cx: &mut App) {
+    cx.set_global(PrimaryWatch::default());
+    cx.spawn(async move |cx| {
+        let executor = cx.background_executor().clone();
+        loop {
+            executor.timer(PRIMARY_RECHECK).await;
+            let candidates = cx.update(|cx| fallback_machines(cx));
+            let mut available = HashSet::default();
+            for (key, options) in candidates {
+                if primary_answers(&options, &executor).await {
+                    available.insert(key);
+                }
+            }
+            cx.update(|cx| {
+                if cx.global::<PrimaryWatch>().available != available {
+                    cx.update_global::<PrimaryWatch, _>(|watch, _| watch.available = available);
+                }
+            });
+        }
+    })
+    .detach();
+}
+
+/// Connected machines on Auto that use a secondary address.
+fn fallback_machines(cx: &App) -> Vec<(String, SshConnectionOptions)> {
+    let routes = cx.try_global::<SshRoutes>().cloned().unwrap_or_default();
+    let mut machines = Vec::<(String, SshConnectionOptions)>::new();
+    for client in remote_clients(None, cx) {
+        let client = client.read(cx);
+        let (Some(options), Some(route)) = (ssh_options(client), client.route()) else {
+            continue;
+        };
+        if route.is_primary || chosen_route(options, &routes).is_some() {
+            continue;
+        }
+        let key = ssh_machine_key(options);
+        if !machines.iter().any(|(existing, _)| *existing == key) {
+            machines.push((key, options.clone()));
+        }
+    }
+    machines
+}
+
+/// Reconnects a machine's clients so Auto picks its address again.
+fn reconnect_machine(key: &str, cx: &mut App) {
+    for client in remote_clients(None, cx) {
+        let matches =
+            ssh_options(client.read(cx)).is_some_and(|options| ssh_machine_key(options) == key);
+        if matches {
+            log::info!("fleet: reconnecting {key} to move back to its primary address");
+            client.update(cx, |client, cx| client.reconnect_now(cx).log_err());
+        }
+    }
 }
 
 struct RouteToast;
@@ -944,6 +1080,7 @@ pub struct FleetPanel {
     _project_subscription: Subscription,
     _activation_subscription: Subscription,
     _settings_subscription: Subscription,
+    _primary_watch_subscription: Subscription,
     _activity_subscription: Subscription,
     _thread_subscription: Option<Subscription>,
     /// Remote clients the panel re-renders for, so route badges stay current.
@@ -1000,6 +1137,7 @@ impl FleetPanel {
                 }
             }),
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+            _primary_watch_subscription: cx.observe_global::<PrimaryWatch>(|_, cx| cx.notify()),
             _activity_subscription: cx.observe_global::<FleetActivity>(|_, cx| cx.notify()),
             _thread_subscription: ThreadMetadataStore::try_global(cx)
                 .map(|store| cx.observe(&store, |_, _, cx| cx.notify())),
@@ -1211,8 +1349,18 @@ impl FleetPanel {
                 format!("Not connected. Next connection uses {}", setting()),
             ),
         };
+        let key = ssh_machine_key(options);
+        let primary_is_back = chosen.is_none()
+            && matches!(status, Some((Some(route), ConnectionState::Connected)) if !route.is_primary)
+            && cx
+                .try_global::<PrimaryWatch>()
+                .is_some_and(|watch| watch.available.contains(&key));
+        let primary_name = options
+            .host_label
+            .clone()
+            .unwrap_or_else(|| options.host.to_string());
         let options = options.clone();
-        PopoverMenu::new(SharedString::from(format!("fleet-route-{machine_index}")))
+        let badge = PopoverMenu::new(SharedString::from(format!("fleet-route-{machine_index}")))
             .trigger(
                 ButtonLike::new(SharedString::from(format!(
                     "fleet-route-button-{machine_index}"
@@ -1233,7 +1381,29 @@ impl FleetPanel {
                 .tooltip(Tooltip::text(tooltip)),
             )
             .anchor(gpui::Anchor::TopRight)
-            .menu(move |window, cx| Some(route_menu(&options, window, cx)))
+            .menu(move |window, cx| Some(route_menu(&options, window, cx)));
+        h_flex()
+            .gap_1()
+            .when(primary_is_back, |row| {
+                row.child(
+                    Button::new(
+                        SharedString::from(format!("fleet-primary-back-{machine_index}")),
+                        format!("{primary_name} available"),
+                    )
+                    .label_size(LabelSize::Small)
+                    .color(Color::Accent)
+                    .tooltip(Tooltip::text(format!("Reconnect over {primary_name}")))
+                    .on_click(move |_, _, cx| {
+                        cx.update_global::<PrimaryWatch, _>(|watch, _| {
+                            watch.available.remove(&key);
+                        });
+                        let key = key.clone();
+                        // Deferred so this window is back in the app.
+                        cx.defer(move |cx| reconnect_machine(&key, cx));
+                    }),
+                )
+            })
+            .child(badge)
             .into_any_element()
     }
 
