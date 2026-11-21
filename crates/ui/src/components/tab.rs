@@ -142,7 +142,10 @@ impl RenderOnce for Tab {
         };
 
         let theme = cx.theme();
-        let precision = matches!(theme.name.as_ref(), "Precision Light" | "Precision Dark");
+        let precision = matches!(
+            theme.name.as_ref(),
+            "Precision Light" | "Precision Dark" | "Precision Black"
+        );
         self.div
             .relative()
             .h(Tab::container_height(cx))

@@ -7694,7 +7694,7 @@ impl ThreadView {
         let mut assistant_message_is_blank = false;
         let compact_chat = matches!(
             cx.theme().name.as_ref(),
-            "Precision Light" | "Precision Dark"
+            "Precision Light" | "Precision Dark" | "Precision Black"
         ) && self
             .server_view
             .upgrade()

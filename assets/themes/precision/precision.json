@@ -98,6 +98,100 @@
       }
     },
     {
+      "name": "Precision Black",
+      "appearance": "dark",
+      "style": {
+        "border": "#262626",
+        "border.variant": "#262626",
+        "border.focused": "#f1b58c",
+        "border.selected": "#f1b58c",
+        "elevated_surface.background": "#121212",
+        "surface.background": "#121212",
+        "background": "#000000",
+        "element.background": "#121212",
+        "element.hover": "#1c1c1c",
+        "element.active": "#392d24",
+        "element.selected": "#392d24",
+        "ghost_element.hover": "#1c1c1c",
+        "ghost_element.active": "#392d24",
+        "ghost_element.selected": "#392d24",
+        "text": "#edeee6",
+        "text.muted": "#b8bcb0",
+        "text.placeholder": "#a2a697",
+        "text.disabled": "#a2a697",
+        "text.accent": "#f1b58c",
+        "icon": "#edeee6",
+        "icon.muted": "#b8bcb0",
+        "icon.disabled": "#a2a697",
+        "icon.placeholder": "#a2a697",
+        "icon.accent": "#f1b58c",
+        "status_bar.background": "#000000",
+        "title_bar.background": "#000000",
+        "title_bar.inactive_background": "#000000",
+        "toolbar.background": "#000000",
+        "tab_bar.background": "#000000",
+        "tab.inactive_background": "#000000",
+        "tab.active_background": "#121212",
+        "panel.background": "#000000",
+        "editor.background": "#000000",
+        "editor.foreground": "#e3e5db",
+        "editor.gutter.background": "#000000",
+        "editor.subheader.background": "#121212",
+        "editor.active_line.background": "#121212",
+        "editor.highlighted_line.background": "#121212",
+        "editor.line_number": "#a2a697",
+        "editor.active_line_number": "#edeee6",
+        "editor.hover_line_number": "#edeee6",
+        "terminal.background": "#000000",
+        "terminal.foreground": "#e3e5db",
+        "terminal.bright_foreground": "#edeee6",
+        "link_text.hover": "#f1b58c",
+        "search.match_background": "#f1b58c40",
+        "search.active_match_background": "#f1b58c66",
+        "syntax": {
+          "comment": {
+            "color": "#9a9c90"
+          },
+          "constant": {
+            "color": "#f1b58c"
+          },
+          "constructor": {
+            "color": "#9eced1"
+          },
+          "function": {
+            "color": "#a9c5e5"
+          },
+          "keyword": {
+            "color": "#cfb7df"
+          },
+          "number": {
+            "color": "#f1b58c"
+          },
+          "operator": {
+            "color": "#b8bcb0"
+          },
+          "property": {
+            "color": "#a9c5e5"
+          },
+          "punctuation": {
+            "color": "#b8bcb0"
+          },
+          "string": {
+            "color": "#afc78d"
+          },
+          "type": {
+            "color": "#9eced1"
+          },
+          "variable": {
+            "color": "#e3e5db"
+          },
+          "variable.special": {
+            "color": "#e4a0a0"
+          }
+        }
+      }
+    },
+    {
       "name": "Precision Light",
       "appearance": "light",
       "style": {
