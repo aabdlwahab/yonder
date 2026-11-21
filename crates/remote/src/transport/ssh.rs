@@ -18,7 +18,7 @@ use paths::remote_server_dir_relative;
 use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
-pub use settings_content::SshPortForwardOption;
+pub use settings_content::{SshPortForwardOption, SshSecondaryHost};
 use smol::fs;
 use std::{
     borrow::Cow,
@@ -44,8 +44,26 @@ const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);
 const SERVER_BINARY_CHECK_ATTEMPTS: u32 = 3;
 const SERVER_BINARY_CHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+mod address;
+
+/// The user canceled the SSH password or passphrase prompt.
+#[derive(Debug)]
+struct ConnectionCanceled;
+
+impl std::fmt::Display for ConnectionCanceled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SSH connection canceled")
+    }
+}
+
+impl std::error::Error for ConnectionCanceled {}
+
 pub(crate) struct SshRemoteConnection {
+    /// Talks to the address the connection was made on.
     socket: SshSocket,
+    /// The machine as configured, primary address first. Reconnects start
+    /// from here, so they check every address again.
+    identity_options: SshConnectionOptions,
     master_process: Mutex<Option<MasterProcess>>,
     /// Whether `kill()` has been called. Separate from `master_process` because
     /// reused ControlMaster sessions start with `master_process` as `None`.
@@ -155,6 +173,14 @@ pub struct SshConnectionOptions {
 
     pub nickname: Option<String>,
     pub upload_binary_over_ssh: bool,
+
+    /// Name of the network `host` is reached over, such as "Office".
+    #[serde(default)]
+    pub host_label: Option<String>,
+    /// Other addresses of this machine, tried in order when `host` doesn't
+    /// answer. `host`, `username` and `port` still identify the machine.
+    #[serde(default)]
+    pub secondary_hosts: Vec<SshSecondaryHost>,
 }
 
 impl From<settings_content::SshConnection> for SshConnectionOptions {
@@ -169,6 +195,8 @@ impl From<settings_content::SshConnection> for SshConnectionOptions {
             upload_binary_over_ssh: val.upload_binary_over_ssh.unwrap_or_default(),
             port_forwards: val.port_forwards,
             connection_timeout: val.connection_timeout,
+            host_label: val.host_label,
+            secondary_hosts: val.secondary_hosts,
         }
     }
 }
@@ -443,7 +471,7 @@ impl RemoteConnection for SshRemoteConnection {
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
-        RemoteConnectionOptions::Ssh(self.socket.connection_options.clone())
+        RemoteConnectionOptions::Ssh(self.identity_options.clone())
     }
 
     fn shell(&self) -> String {
@@ -809,19 +837,129 @@ impl SshRemoteConnection {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
-        use askpass::AskPassResult;
-
         let temp_dir = tempfile::Builder::new()
             .prefix("zed-ssh-session")
             .tempdir()?;
 
-        // On non-Windows, check if the user already has an active ControlMaster
-        // session for this host. If so, reuse it instead of prompting for auth.
-        #[cfg(not(windows))]
-        let reused_socket = find_existing_control_master(&connection_options).await;
+        // A machine with secondary addresses checks them all first, then
+        // connects to the first that works. `identity_options` stays the
+        // primary, so the connection is saved and matched under one name.
+        let identity_options = connection_options.clone();
+        let addresses = address::addresses(&connection_options);
+        let order = if addresses.len() > 1 {
+            delegate.set_status(Some("Checking addresses"), cx);
+            address::order_addresses(&addresses, cx.background_executor()).await
+        } else {
+            vec![0]
+        };
+        let mut failures = Vec::new();
+        let mut opened = None;
+        for (attempt, index) in order.iter().enumerate() {
+            let address = &addresses[*index];
+            let socket_path = if attempt == 0 {
+                temp_dir.path().join("ssh.sock")
+            } else {
+                temp_dir.path().join(format!("ssh-{attempt}.sock"))
+            };
+            match Self::open_socket(address.options.clone(), socket_path, &delegate, cx).await {
+                Ok(socket) => {
+                    if addresses.len() > 1 {
+                        log::info!("connected via {}", address.describe());
+                    }
+                    opened = Some(socket);
+                    break;
+                }
+                Err(error) => {
+                    if order.len() == 1 || error.is::<ConnectionCanceled>() {
+                        return Err(error);
+                    }
+                    log::warn!("failed to connect via {}: {error:#}", address.describe());
+                    failures.push(format!("{}: {error:#}", address.describe()));
+                }
+            }
+        }
+        let Some((socket, master_process_option)) = opened else {
+            anyhow::bail!(
+                "Failed to connect on every address. {}",
+                failures.join("; ")
+            );
+        };
 
-        #[cfg(not(windows))]
-        let (socket, master_process_option) = if let Some(reused_path) = reused_socket {
+        let is_windows = match known_os {
+            Some(os) => os.is_windows(),
+            None => socket.probe_is_windows().await,
+        };
+        log::info!("Remote is windows: {}", is_windows);
+
+        let RemoteEnvironment {
+            shell: ssh_shell,
+            platform: ssh_platform,
+            os_version: ssh_os_version,
+        } = if is_windows {
+            socket.environment_windows().await?
+        } else {
+            socket.environment_posix().await?
+        };
+        log::info!("Remote shell discovered: {}", ssh_shell);
+
+        let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
+        log::info!("Remote platform discovered: {:?}", ssh_platform);
+
+        log::info!("Remote OS version discovered: {:?}", ssh_os_version);
+
+        let ssh_home_dir = if is_windows {
+            None
+        } else {
+            socket.home_dir(ssh_shell_kind).await
+        };
+        log::info!("Remote home directory discovered: {:?}", ssh_home_dir);
+
+        let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
+            RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
+            _ => (PathStyle::Unix, String::from("/bin/sh")),
+        };
+
+        let mut this = Self {
+            socket,
+            identity_options,
+            master_process: Mutex::new(master_process_option),
+            killed: AtomicBool::new(false),
+            _temp_dir: temp_dir,
+            remote_binary_path: None,
+            ssh_path_style,
+            ssh_platform,
+            ssh_os_version,
+            ssh_shell,
+            ssh_shell_kind,
+            ssh_default_system_shell,
+            ssh_home_dir,
+        };
+
+        let (release_channel, version) =
+            cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
+        this.remote_binary_path = Some(
+            this.ensure_server_binary(&delegate, release_channel, version, cx)
+                .await?,
+        );
+
+        Ok(this)
+    }
+
+    /// Starts the master SSH process for one address, or reuses the user's
+    /// own ControlMaster session for it.
+    #[cfg(not(windows))]
+    async fn open_socket(
+        connection_options: SshConnectionOptions,
+        socket_path: PathBuf,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<(SshSocket, Option<MasterProcess>)> {
+        use askpass::AskPassResult;
+
+        // Check if the user already has an active ControlMaster session for
+        // this host. If so, reuse it instead of prompting for auth.
+        let reused_socket = find_existing_control_master(&connection_options).await;
+        Ok(if let Some(reused_path) = reused_socket {
             delegate.set_status(Some("Connecting (reusing session)"), cx);
             log::info!("reusing existing ControlMaster, skipping authentication");
             let socket = SshSocket::new(connection_options, reused_path).await?;
@@ -843,7 +981,6 @@ impl SshRemoteConnection {
             // Start the master SSH process, which does not do anything except
             // for establish the connection and keep it open, allowing other ssh
             // commands to reuse it via a control socket.
-            let socket_path = temp_dir.path().join("ssh.sock");
             let mut master_process = MasterProcess::new(
                 askpass.script_path().as_ref(),
                 connection_options.additional_args(),
@@ -856,7 +993,7 @@ impl SshRemoteConnection {
                     match result {
                         AskPassResult::CancelledByUser => {
                             master_process.as_mut().kill().ok();
-                            anyhow::bail!("SSH connection canceled")
+                            return Err(anyhow::Error::new(ConnectionCanceled))
                         }
                         AskPassResult::Timedout => {
                             anyhow::bail!("connecting to host timed out")
@@ -887,10 +1024,20 @@ impl SshRemoteConnection {
             let socket = SshSocket::new(connection_options, socket_path).await?;
             drop(askpass);
             (socket, Some(master_process))
-        };
+        })
+    }
 
-        #[cfg(windows)]
-        let (socket, master_process_option) = {
+    /// Starts the master SSH process for one address.
+    #[cfg(windows)]
+    async fn open_socket(
+        connection_options: SshConnectionOptions,
+        _socket_path: PathBuf,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<(SshSocket, Option<MasterProcess>)> {
+        use askpass::AskPassResult;
+
+        Ok({
             let askpass_delegate = askpass::AskPassDelegate::new_with_cancellation(cx, {
                 let delegate = delegate.clone();
                 move |prompt, tx, cancellation, cx| {
@@ -916,7 +1063,7 @@ impl SshRemoteConnection {
                     match result {
                         AskPassResult::CancelledByUser => {
                             master_process.as_mut().kill().ok();
-                            anyhow::bail!("SSH connection canceled")
+                            return Err(anyhow::Error::new(ConnectionCanceled))
                         }
                         AskPassResult::Timedout => {
                             anyhow::bail!("connecting to host timed out")
@@ -956,65 +1103,7 @@ impl SshRemoteConnection {
             drop(askpass);
 
             (socket, Some(master_process))
-        };
-
-        let is_windows = match known_os {
-            Some(os) => os.is_windows(),
-            None => socket.probe_is_windows().await,
-        };
-        log::info!("Remote is windows: {}", is_windows);
-
-        let RemoteEnvironment {
-            shell: ssh_shell,
-            platform: ssh_platform,
-            os_version: ssh_os_version,
-        } = if is_windows {
-            socket.environment_windows().await?
-        } else {
-            socket.environment_posix().await?
-        };
-        log::info!("Remote shell discovered: {}", ssh_shell);
-
-        let ssh_shell_kind = ShellKind::new(&ssh_shell, is_windows);
-        log::info!("Remote platform discovered: {:?}", ssh_platform);
-
-        log::info!("Remote OS version discovered: {:?}", ssh_os_version);
-
-        let ssh_home_dir = if is_windows {
-            None
-        } else {
-            socket.home_dir(ssh_shell_kind).await
-        };
-        log::info!("Remote home directory discovered: {:?}", ssh_home_dir);
-
-        let (ssh_path_style, ssh_default_system_shell) = match ssh_platform.os {
-            RemoteOs::Windows => (PathStyle::Windows, ssh_shell.clone()),
-            _ => (PathStyle::Unix, String::from("/bin/sh")),
-        };
-
-        let mut this = Self {
-            socket,
-            master_process: Mutex::new(master_process_option),
-            killed: AtomicBool::new(false),
-            _temp_dir: temp_dir,
-            remote_binary_path: None,
-            ssh_path_style,
-            ssh_platform,
-            ssh_os_version,
-            ssh_shell,
-            ssh_shell_kind,
-            ssh_default_system_shell,
-            ssh_home_dir,
-        };
-
-        let (release_channel, version) =
-            cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
-        this.remote_binary_path = Some(
-            this.ensure_server_binary(&delegate, release_channel, version, cx)
-                .await?,
-        );
-
-        Ok(this)
+        })
     }
 
     async fn ensure_server_binary(
@@ -2058,6 +2147,8 @@ impl SshConnectionOptions {
             nickname: None,
             upload_binary_over_ssh: false,
             connection_timeout: None,
+            host_label: None,
+            secondary_hosts: Vec::new(),
         })
     }
 
@@ -2402,6 +2493,7 @@ mod tests {
                     String::from("force"),
                 )]),
             },
+            identity_options: SshConnectionOptions::default(),
             master_process: Mutex::new(None),
             killed: AtomicBool::new(false),
             remote_binary_path: None,

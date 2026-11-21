@@ -335,11 +335,53 @@ fn ssh_machine_label(options: &SshConnectionOptions) -> SharedString {
         .into()
 }
 
+/// Machines from the `ssh_connections` setting.
+fn configured_machines(cx: &App) -> Vec<SshConnectionOptions> {
+    RemoteSettings::get_global(cx)
+        .ssh_connections()
+        .map(SshConnectionOptions::from)
+        .collect()
+}
+
+/// Maps the key of each secondary address of a configured machine to that
+/// machine, so a project opened over any of its addresses lists under it.
+fn primary_addresses(configured: &[SshConnectionOptions]) -> HashMap<String, SshConnectionOptions> {
+    let mut primaries = HashMap::default();
+    for options in configured {
+        for secondary in &options.secondary_hosts {
+            let key = machine_key(
+                options.username.as_deref(),
+                &secondary.host,
+                secondary.port.or(options.port),
+            );
+            primaries.entry(key).or_insert_with(|| options.clone());
+        }
+    }
+    primaries
+}
+
+impl FleetProject {
+    /// Moves a project saved under a secondary address to its machine's primary.
+    fn on_primary(mut self, primaries: &HashMap<String, SshConnectionOptions>) -> Self {
+        if let Some(primary) = primaries.get(&self.machine_key) {
+            self.machine_key = ssh_machine_key(primary);
+            self.machine_label = ssh_machine_label(primary);
+            if let ProjectLocation::Ssh(options) = &mut self.location {
+                options.host = primary.host.clone();
+                options.port = primary.port;
+            }
+        }
+        self
+    }
+}
+
 fn group_projects(
     configured_hosts: impl IntoIterator<Item = SshConnectionOptions>,
     open_projects: impl IntoIterator<Item = FleetProject>,
     recent_projects: impl IntoIterator<Item = FleetProject>,
 ) -> Vec<FleetMachine> {
+    let configured_hosts = configured_hosts.into_iter().collect::<Vec<_>>();
+    let primaries = primary_addresses(&configured_hosts);
     let mut machines = vec![FleetMachine {
         key: LOCAL_MACHINE_KEY.to_string(),
         label: LOCAL_MACHINE_LABEL.into(),
@@ -356,8 +398,12 @@ fn group_projects(
         }
     }
 
-    let open_projects = open_projects.into_iter().map(|project| (true, project));
-    let recent_projects = recent_projects.into_iter().map(|project| (false, project));
+    let open_projects = open_projects
+        .into_iter()
+        .map(|project| (true, project.on_primary(&primaries)));
+    let recent_projects = recent_projects
+        .into_iter()
+        .map(|project| (false, project.on_primary(&primaries)));
     let mut recent_counts = HashMap::default();
     for (is_open, mut project) in open_projects.chain(recent_projects) {
         let index = machines
@@ -728,9 +774,7 @@ impl FleetPanel {
             .filter(|other| other.entity_id() != self.workspace.entity_id())
             .filter_map(|other| FleetProject::from_workspace(other.read(cx), cx));
         group_projects(
-            RemoteSettings::get_global(cx)
-                .ssh_connections()
-                .map(SshConnectionOptions::from),
+            configured_machines(cx),
             current.into_iter().chain(others),
             self.recent_projects.iter().cloned(),
         )
@@ -847,9 +891,7 @@ impl FleetPanel {
                         {
                             Some(svg) => Icon::from_external_svg(svg),
                             None => Icon::new(
-                                Agent::from(agent_id)
-                                    .icon()
-                                    .unwrap_or(IconName::ZedAgent),
+                                Agent::from(agent_id).icon().unwrap_or(IconName::ZedAgent),
                             ),
                         };
                         let title = thread.metadata.display_title();
@@ -945,7 +987,9 @@ impl Render for FleetPanel {
         let workspace = self.workspace.upgrade();
         let (machines, active) = if let Some(workspace) = &workspace {
             let workspace = workspace.read(cx);
-            let active = FleetProject::from_workspace(workspace, cx);
+            let primaries = primary_addresses(&configured_machines(cx));
+            let active = FleetProject::from_workspace(workspace, cx)
+                .map(|project| project.on_primary(&primaries));
             (self.machines(workspace, cx), active)
         } else {
             (Vec::new(), None)
@@ -1521,6 +1565,57 @@ mod tests {
         let machines = group_projects([], [project], []);
         assert_eq!(machines[1].label.as_ref(), "other-box");
         assert_eq!(machines[1].projects[0].name.as_ref(), "project");
+    }
+
+    #[test]
+    fn projects_saved_under_a_secondary_address_list_under_the_machine() {
+        let configured = SshConnectionOptions {
+            host: "172.17.21.106".into(),
+            username: Some("ayasser".to_string()),
+            nickname: Some("gpu-06".to_string()),
+            secondary_hosts: vec![remote::SshSecondaryHost {
+                host: "gpu-06.example.ts.net".to_string(),
+                port: None,
+                label: Some("Tailscale".to_string()),
+            }],
+            ..Default::default()
+        };
+        let project = |host: &str, path: &str| {
+            FleetProject::new(
+                ProjectLocation::Ssh(SshConnectionOptions {
+                    host: host.into(),
+                    username: Some("ayasser".to_string()),
+                    ..Default::default()
+                }),
+                PathList::new(&[path]),
+            )
+            .unwrap()
+        };
+        let machines = group_projects(
+            [configured],
+            [project("gpu-06.example.ts.net", "/home/ayasser/a")],
+            [
+                project("172.17.21.106", "/home/ayasser/a"),
+                project("gpu-06.example.ts.net", "/home/ayasser/b"),
+            ],
+        );
+        assert_eq!(machines.len(), 2);
+        let machine = &machines[1];
+        assert_eq!(machine.label.as_ref(), "gpu-06");
+        assert_eq!(
+            machine
+                .projects
+                .iter()
+                .map(|project| project.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        for project in &machine.projects {
+            let ProjectLocation::Ssh(options) = &project.location else {
+                panic!("expected an SSH project");
+            };
+            assert_eq!(options.host.to_string(), "172.17.21.106");
+        }
     }
 
     #[test]
