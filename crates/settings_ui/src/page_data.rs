@@ -10,12 +10,12 @@ use theme::SystemAppearance;
 use ui::IntoElement;
 
 use crate::{
-    ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
+    ActionLink, CustomItem, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
     SettingsPage, SettingsPageItem, SubPageLink, USER, active_language, all_language_names,
     pages::{
         open_audio_test_window, render_edit_prediction_setup_page, render_external_agents_page,
-        render_llm_providers_page, render_mcp_servers_page, render_sandbox_settings_page,
-        render_skills_setup_page, render_tool_permissions_setup_page,
+        render_llm_providers_page, render_machines_page, render_mcp_servers_page,
+        render_sandbox_settings_page, render_skills_setup_page, render_tool_permissions_setup_page,
     },
 };
 
@@ -68,6 +68,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         appearance_page(),
         keymap_page(),
         editor_page(),
+        machines_page(),
         languages_and_tools_page(cx),
         search_and_files_page(),
         window_and_layout_page(),
@@ -132,6 +133,26 @@ fn developer_page(cx: &App) -> SettingsPage {
     SettingsPage {
         title: "Developer",
         items: items.into_boxed_slice(),
+    }
+}
+
+fn machines_page() -> SettingsPage {
+    SettingsPage {
+        title: "Machines",
+        items: Box::new([SettingsPageItem::Custom(CustomItem {
+            title: "Machines",
+            search_aliases: &[
+                "address",
+                "host",
+                "remote",
+                "server",
+                "ssh",
+                "ssh connections",
+                "tailscale",
+            ],
+            files: USER,
+            render: render_machines_page,
+        })]),
     }
 }
 

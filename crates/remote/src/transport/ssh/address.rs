@@ -260,9 +260,35 @@ pub async fn primary_answers(
     options: &SshConnectionOptions,
     executor: &BackgroundExecutor,
 ) -> bool {
-    let mut primary = options.clone();
-    primary.secondary_hosts = Vec::new();
-    check(&primary, executor).await == Reach::Answered
+    matches!(
+        check_address(options, executor).await,
+        AddressCheck::Answered(_)
+    )
+}
+
+/// The result of opening one address's SSH port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressCheck {
+    Answered(Duration),
+    NoAnswer,
+    /// Reached through a jump host or proxy, or `ssh -G` failed, so the port
+    /// can't be checked directly.
+    Unchecked,
+}
+
+/// Opens the SSH port of `options.host`; its secondary hosts are ignored.
+pub async fn check_address(
+    options: &SshConnectionOptions,
+    executor: &BackgroundExecutor,
+) -> AddressCheck {
+    let mut address = options.clone();
+    address.secondary_hosts = Vec::new();
+    let started = Instant::now();
+    match check(&address, executor).await {
+        Reach::Answered => AddressCheck::Answered(started.elapsed()),
+        Reach::Unchecked => AddressCheck::Unchecked,
+        Reach::Pending | Reach::NoAnswer => AddressCheck::NoAnswer,
+    }
 }
 
 async fn check(options: &SshConnectionOptions, executor: &BackgroundExecutor) -> Reach {
