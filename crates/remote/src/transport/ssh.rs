@@ -46,6 +46,8 @@ const SERVER_BINARY_CHECK_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 mod address;
 
+pub use address::{ConnectionRoute, SshRoutes, route_names};
+
 /// The user canceled the SSH password or passphrase prompt.
 #[derive(Debug)]
 struct ConnectionCanceled;
@@ -64,6 +66,7 @@ pub(crate) struct SshRemoteConnection {
     /// The machine as configured, primary address first. Reconnects start
     /// from here, so they check every address again.
     identity_options: SshConnectionOptions,
+    route: ConnectionRoute,
     master_process: Mutex<Option<MasterProcess>>,
     /// Whether `kill()` has been called. Separate from `master_process` because
     /// reused ControlMaster sessions start with `master_process` as `None`.
@@ -474,6 +477,10 @@ impl RemoteConnection for SshRemoteConnection {
         RemoteConnectionOptions::Ssh(self.identity_options.clone())
     }
 
+    fn route(&self) -> Option<ConnectionRoute> {
+        Some(self.route.clone())
+    }
+
     fn shell(&self) -> String {
         self.ssh_shell.clone()
     }
@@ -846,7 +853,22 @@ impl SshRemoteConnection {
         // primary, so the connection is saved and matched under one name.
         let identity_options = connection_options.clone();
         let addresses = address::addresses(&connection_options);
-        let order = if addresses.len() > 1 {
+        let chosen_route = cx.update(|cx| {
+            cx.try_global::<SshRoutes>()
+                .and_then(|routes| routes.route_for(&connection_options))
+                .map(str::to_owned)
+        });
+        let route_order = chosen_route
+            .as_deref()
+            .and_then(|route| address::route_order(&addresses, route));
+        let order = if let Some(order) = route_order {
+            log::info!(
+                "connecting to {} on the chosen route {}",
+                connection_options.connection_string(),
+                chosen_route.as_deref().unwrap_or_default()
+            );
+            order
+        } else if addresses.len() > 1 {
             delegate.set_status(Some("Checking addresses"), cx);
             address::order_addresses(&addresses, cx.background_executor()).await
         } else {
@@ -866,7 +888,7 @@ impl SshRemoteConnection {
                     if addresses.len() > 1 {
                         log::info!("connected via {}", address.describe());
                     }
-                    opened = Some(socket);
+                    opened = Some((socket, address.route(*index == 0)));
                     break;
                 }
                 Err(error) => {
@@ -878,7 +900,7 @@ impl SshRemoteConnection {
                 }
             }
         }
-        let Some((socket, master_process_option)) = opened else {
+        let Some(((socket, master_process_option), route)) = opened else {
             anyhow::bail!(
                 "Failed to connect on every address. {}",
                 failures.join("; ")
@@ -922,6 +944,7 @@ impl SshRemoteConnection {
         let mut this = Self {
             socket,
             identity_options,
+            route,
             master_process: Mutex::new(master_process_option),
             killed: AtomicBool::new(false),
             _temp_dir: temp_dir,
@@ -2494,6 +2517,11 @@ mod tests {
                 )]),
             },
             identity_options: SshConnectionOptions::default(),
+            route: ConnectionRoute {
+                label: None,
+                host: String::from("host"),
+                is_primary: true,
+            },
             master_process: Mutex::new(None),
             killed: AtomicBool::new(false),
             remote_binary_path: None,

@@ -1047,6 +1047,17 @@ impl RemoteClient {
         }
     }
 
+    /// Which of the machine's addresses the live connection uses.
+    pub fn route(&self) -> Option<crate::transport::ssh::ConnectionRoute> {
+        self.connection()?.route()
+    }
+
+    /// Drops the connection and connects again, picking the machine's address
+    /// afresh. The remote server keeps running, so project state carries over.
+    pub fn reconnect_now(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        self.reconnect(cx)
+    }
+
     pub fn connection_state(&self) -> ConnectionState {
         self.state
             .as_ref()
@@ -1524,6 +1535,10 @@ pub trait RemoteConnection: Send + Sync {
     fn shell(&self) -> String;
     fn default_system_shell(&self) -> String;
     fn has_wsl_interop(&self) -> bool;
+    /// Which of the machine's addresses this connection uses, for SSH.
+    fn route(&self) -> Option<crate::transport::ssh::ConnectionRoute> {
+        None
+    }
 
     #[cfg(any(test, feature = "test-support"))]
     fn simulate_disconnect(&self, _: &AsyncApp) {}

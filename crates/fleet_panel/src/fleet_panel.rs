@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -12,30 +13,35 @@ use anyhow::{Result, anyhow};
 use askpass::EncryptedPassword;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use futures::channel::oneshot;
 use gpui::{
-    Action, App, AsyncApp, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Global, Pixels, Render, SharedString, Subscription, Task, WeakEntity,
-    Window, actions, px, relative,
+    Action, App, AsyncApp, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Global, Pixels, Render, SharedString, Subscription, Task,
+    WeakEntity, Window, actions, px, relative,
 };
 use picker::{Picker, PickerDelegate};
 use project::{Event as ProjectEvent, Project};
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::ReleaseChannel;
 use remote::{
-    RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemotePlatform,
-    SshConnectionOptions,
+    ConnectionRoute, ConnectionState, RemoteClient, RemoteClientDelegate, RemoteClientEvent,
+    RemoteConnection, RemoteConnectionOptions, RemotePlatform, SshConnectionOptions, SshRoutes,
+    route_names,
 };
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use sidebar::{Sidebar, ThreadActivity, ThreadActivityChanged};
-use ui::{ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    ButtonLike, ContextMenu, Indicator, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{
     AppState, MultiWorkspace, MultiWorkspaceEvent, OpenMode, OpenOptions, PathList,
-    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb,
+    RecentWorkspace, SerializedWorkspaceLocation, Toast, Workspace, WorkspaceDb,
     dock::{DockPosition, Panel, PanelEvent, PanelHandle},
-    notifications::DetachAndPromptErr,
+    notifications::{DetachAndPromptErr, NotificationId},
 };
 use zed_actions::OpenRemote;
 
@@ -45,7 +51,12 @@ actions!(
         /// Toggles focus on the fleet panel, which lists your machines and their projects.
         ToggleFocus,
         /// Searches projects and threads across machines.
-        OpenSwitcher
+        OpenSwitcher,
+        /// Moves every machine with several addresses to the next network:
+        /// Auto, then each network label in turn.
+        CycleNetwork,
+        /// Lets every machine pick its address automatically again.
+        UseAutomaticNetwork
     ]
 );
 
@@ -64,6 +75,7 @@ impl Global for FleetActivity {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(FleetActivity);
+    load_routes(cx);
     cx.on_window_closed(|cx, _| cx.update_global::<FleetActivity, _>(|_, _| {}))
         .detach();
     cx.observe_new::<Sidebar>(|_, _, cx| {
@@ -76,6 +88,16 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<FleetPanel>(window, cx);
+        });
+        workspace.register_action(|_, _: &CycleNetwork, _, cx| {
+            let names = network_names(&configured_machines(cx));
+            let current = cx
+                .try_global::<SshRoutes>()
+                .and_then(|routes| routes.fleet.clone());
+            set_fleet_route(next_route(current.as_deref(), &names), cx);
+        });
+        workspace.register_action(|_, _: &UseAutomaticNetwork, _, cx| {
+            set_fleet_route(None, cx);
         });
         workspace.register_action(|workspace, _: &OpenSwitcher, window, cx| {
             let workspace_handle = cx.weak_entity();
@@ -527,6 +549,295 @@ fn open_local_project(project: &FleetProject, window: &mut Window, cx: &mut Cont
     });
 }
 
+const ROUTES_KEY: &str = "fleet_panel_ssh_routes";
+
+#[derive(Default, Serialize, Deserialize)]
+struct SavedRoutes {
+    fleet: Option<String>,
+    #[serde(default)]
+    pins: BTreeMap<String, String>,
+}
+
+fn load_routes(cx: &mut App) {
+    let saved = KeyValueStore::global(cx)
+        .read_kvp(ROUTES_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<SavedRoutes>(&json).log_err())
+        .unwrap_or_default();
+    cx.set_global(SshRoutes {
+        fleet: saved.fleet,
+        pins: saved.pins.into_iter().collect(),
+    });
+}
+
+fn save_routes(cx: &App) {
+    let Some(routes) = cx.try_global::<SshRoutes>() else {
+        return;
+    };
+    let saved = SavedRoutes {
+        fleet: routes.fleet.clone(),
+        pins: routes
+            .pins
+            .iter()
+            .map(|(machine, route)| (machine.clone(), route.clone()))
+            .collect(),
+    };
+    let Some(json) = serde_json::to_string(&saved).log_err() else {
+        return;
+    };
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        kvp.write_kvp(ROUTES_KEY.to_string(), json).await.log_err();
+    })
+    .detach();
+}
+
+/// Network labels of machines that have several addresses, in the order they
+/// first appear in settings.
+fn network_names(configured: &[SshConnectionOptions]) -> Vec<String> {
+    let mut names = Vec::new();
+    for options in configured
+        .iter()
+        .filter(|options| !options.secondary_hosts.is_empty())
+    {
+        let labels = std::iter::once(options.host_label.clone()).chain(
+            options
+                .secondary_hosts
+                .iter()
+                .map(|secondary| secondary.label.clone()),
+        );
+        for label in labels.flatten() {
+            if !names.contains(&label) {
+                names.push(label);
+            }
+        }
+    }
+    names
+}
+
+/// The route after `current` when cycling: Auto, then each name, then Auto.
+fn next_route(current: Option<&str>, names: &[String]) -> Option<String> {
+    match current {
+        None => names.first().cloned(),
+        Some(current) => names
+            .iter()
+            .position(|name| name == current)
+            .and_then(|index| names.get(index + 1))
+            .cloned(),
+    }
+}
+
+/// A machine's addresses as (label, host, is_primary), primary first.
+fn machine_addresses(options: &SshConnectionOptions) -> Vec<(Option<String>, String, bool)> {
+    std::iter::once((options.host_label.clone(), options.host.to_string(), true))
+        .chain(
+            options
+                .secondary_hosts
+                .iter()
+                .map(|secondary| (secondary.label.clone(), secondary.host.clone(), false)),
+        )
+        .collect()
+}
+
+fn machine_has_route(options: &SshConnectionOptions, route: &str) -> bool {
+    machine_addresses(options)
+        .iter()
+        .any(|(label, host, _)| route_names(route, label.as_deref(), host))
+}
+
+/// The route the user chose for this machine, if it has an address on it.
+fn chosen_route<'a>(options: &SshConnectionOptions, routes: &'a SshRoutes) -> Option<&'a str> {
+    routes
+        .route_for(options)
+        .filter(|route| machine_has_route(options, route))
+}
+
+/// Whether the connection already uses the route the user chose, or the
+/// primary when the machine is on Auto.
+fn route_satisfied(
+    options: &SshConnectionOptions,
+    routes: &SshRoutes,
+    current: &ConnectionRoute,
+) -> bool {
+    match chosen_route(options, routes) {
+        Some(route) => route_names(route, current.label.as_deref(), &current.host),
+        None => current.is_primary,
+    }
+}
+
+fn set_fleet_route(route: Option<String>, cx: &mut App) {
+    let routes = cx.default_global::<SshRoutes>();
+    if routes.fleet == route {
+        return;
+    }
+    routes.fleet = route;
+    save_routes(cx);
+    // Deferred so every window is back in the app: the one handling this
+    // click is checked out while its handlers run.
+    cx.defer(apply_routes);
+}
+
+fn set_machine_pin(machine: &SshConnectionOptions, route: Option<String>, cx: &mut App) {
+    let key = machine.connection_string();
+    let routes = cx.default_global::<SshRoutes>();
+    if routes.pins.get(&key) == route.as_ref() {
+        return;
+    }
+    match route {
+        Some(route) => {
+            routes.pins.insert(key, route);
+        }
+        None => {
+            routes.pins.remove(&key);
+        }
+    }
+    save_routes(cx);
+    // Deferred so every window is back in the app: the one handling this
+    // click is checked out while its handlers run.
+    cx.defer(apply_routes);
+}
+
+/// Every remote client in every window, once each. While a window is being
+/// drawn or handles an event it can't be read through the app, so the caller
+/// passes it as `current`.
+fn remote_clients(current: Option<&Window>, cx: &App) -> Vec<Entity<RemoteClient>> {
+    let current = current.and_then(|window| window.root::<MultiWorkspace>().flatten());
+    let others = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+        .filter_map(|window| window.read(cx).ok());
+    let mut seen = HashSet::default();
+    let mut clients = Vec::new();
+    for multi in current
+        .as_ref()
+        .map(|multi| multi.read(cx))
+        .into_iter()
+        .chain(others)
+    {
+        for workspace in multi.workspaces() {
+            if let Some(client) = workspace.read(cx).project().read(cx).remote_client()
+                && seen.insert(client.entity_id())
+            {
+                clients.push(client);
+            }
+        }
+    }
+    clients
+}
+
+fn ssh_options(client: &RemoteClient) -> Option<&SshConnectionOptions> {
+    match client.connection_options() {
+        RemoteConnectionOptions::Ssh(options) => Some(options),
+        _ => None,
+    }
+}
+
+/// Reconnects every machine whose connection doesn't match the chosen route.
+/// The remote server keeps running, so open projects carry on.
+fn apply_routes(cx: &mut App) {
+    let routes = cx.try_global::<SshRoutes>().cloned().unwrap_or_default();
+    for client in remote_clients(None, cx) {
+        let stale = {
+            let client = client.read(cx);
+            match (ssh_options(client), client.route()) {
+                (Some(options), Some(current)) => !route_satisfied(options, &routes, &current),
+                _ => false,
+            }
+        };
+        if stale {
+            client.update(cx, |client, cx| {
+                if let Some(options) = ssh_options(client) {
+                    log::info!(
+                        "fleet: reconnecting {} for its network choice",
+                        options.connection_string()
+                    );
+                }
+                client.reconnect_now(cx).log_err();
+            });
+        }
+    }
+
+    let warm = cx.default_global::<WarmConnections>();
+    let stale_keys = warm
+        .connections
+        .iter()
+        .filter(
+            |(_, connection)| match (connection.connection_options(), connection.route()) {
+                (RemoteConnectionOptions::Ssh(options), Some(current)) => {
+                    !route_satisfied(&options, &routes, &current)
+                }
+                _ => false,
+            },
+        )
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let stale = stale_keys
+        .iter()
+        .filter_map(|key| warm.connections.remove(key))
+        .collect::<Vec<_>>();
+    for connection in stale {
+        cx.spawn(async move |_| connection.kill().await.log_err())
+            .detach();
+    }
+}
+
+struct RouteToast;
+
+fn route_menu(
+    options: &SshConnectionOptions,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let routes = cx.try_global::<SshRoutes>().cloned().unwrap_or_default();
+    let pin = routes.pins.get(&options.connection_string()).cloned();
+    let fleet = routes
+        .fleet
+        .filter(|route| machine_has_route(options, route));
+    let machine = ssh_machine_label(options);
+    let options = options.clone();
+    ContextMenu::build(window, cx, move |mut menu, _, _| {
+        menu = menu
+            .header(format!("Connect {machine} via"))
+            .toggleable_entry(
+                format!("Fleet setting ({})", fleet.as_deref().unwrap_or("Auto")),
+                pin.is_none(),
+                IconPosition::Start,
+                None,
+                {
+                    let options = options.clone();
+                    move |_, cx| set_machine_pin(&options, None, cx)
+                },
+            );
+        for (label, host, is_primary) in machine_addresses(&options) {
+            let route = label.clone().unwrap_or_else(|| host.clone());
+            let mut text = match &label {
+                Some(label) => format!("{label} · {host}"),
+                None => host,
+            };
+            if is_primary {
+                text.push_str(" (primary)");
+            }
+            menu = menu.toggleable_entry(
+                text,
+                pin.as_deref() == Some(route.as_str()),
+                IconPosition::Start,
+                None,
+                {
+                    let options = options.clone();
+                    move |_, cx| set_machine_pin(&options, Some(route.clone()), cx)
+                },
+            );
+        }
+        menu.separator().entry(
+            "Edit Addresses…",
+            Some(zed_actions::OpenSettingsFile.boxed_clone()),
+            |window, cx| window.dispatch_action(zed_actions::OpenSettingsFile.boxed_clone(), cx),
+        )
+    })
+}
+
 /// Connections opened ahead of a click. The global connection pool only keeps
 /// connections that something still holds, so they are held here.
 #[derive(Default)]
@@ -635,6 +946,10 @@ pub struct FleetPanel {
     _settings_subscription: Subscription,
     _activity_subscription: Subscription,
     _thread_subscription: Option<Subscription>,
+    /// Remote clients the panel re-renders for, so route badges stay current.
+    observed_clients: HashMap<EntityId, [Subscription; 2]>,
+    /// The route each machine was last seen on, to tell when it moves.
+    last_routes: HashMap<String, ConnectionRoute>,
 }
 
 impl FleetPanel {
@@ -688,6 +1003,8 @@ impl FleetPanel {
             _activity_subscription: cx.observe_global::<FleetActivity>(|_, cx| cx.notify()),
             _thread_subscription: ThreadMetadataStore::try_global(cx)
                 .map(|store| cx.observe(&store, |_, _, cx| cx.notify())),
+            observed_clients: HashMap::default(),
+            last_routes: HashMap::default(),
         };
         panel.refresh_recent_projects(cx);
         panel
@@ -763,6 +1080,161 @@ impl FleetPanel {
                 cx.notify();
             })
         });
+    }
+
+    fn observe_clients(&mut self, clients: &[Entity<RemoteClient>], cx: &mut Context<Self>) {
+        self.observed_clients
+            .retain(|id, _| clients.iter().any(|client| client.entity_id() == *id));
+        for client in clients {
+            if self.observed_clients.contains_key(&client.entity_id()) {
+                continue;
+            }
+            let remote = client.read(cx);
+            if let Some(options) = ssh_options(remote)
+                && let Some(route) = remote.route()
+            {
+                self.last_routes
+                    .entry(options.connection_string())
+                    .or_insert(route);
+            }
+            let observe = cx.observe(client, |_, _, cx| cx.notify());
+            let subscribe = cx.subscribe(client, |panel, client, event, cx| {
+                if matches!(event, RemoteClientEvent::Reconnected) {
+                    panel.route_changed(&client, cx);
+                }
+            });
+            self.observed_clients
+                .insert(client.entity_id(), [observe, subscribe]);
+        }
+    }
+
+    fn route_changed(&mut self, client: &Entity<RemoteClient>, cx: &mut Context<Self>) {
+        let remote = client.read(cx);
+        let (Some(options), Some(route)) = (ssh_options(remote), remote.route()) else {
+            return;
+        };
+        let key = options.connection_string();
+        let machine = ssh_machine_label(options);
+        let previous = self.last_routes.insert(key.clone(), route.clone());
+        if previous.is_some_and(|previous| previous != route)
+            && let Some(workspace) = self.workspace.upgrade()
+        {
+            let message = format!("{machine} is now connected over {}", route.name());
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::composite::<RouteToast>(key), message).autohide(),
+                    cx,
+                );
+            });
+        }
+        cx.notify();
+    }
+
+    fn render_network_switch(&self, names: &[String], cx: &App) -> impl IntoElement {
+        let current = cx
+            .try_global::<SshRoutes>()
+            .and_then(|routes| routes.fleet.clone());
+        let button = |id: SharedString, label: SharedString, route: Option<String>| {
+            let selected = current == route;
+            Button::new(id, label)
+                .label_size(LabelSize::Small)
+                .style(ButtonStyle::Subtle)
+                .toggle_state(selected)
+                .selected_style(ButtonStyle::Filled)
+                .on_click(move |_, _, cx| set_fleet_route(route.clone(), cx))
+        };
+        h_flex()
+            .px_2()
+            .pb_1()
+            .gap_1()
+            .flex_wrap()
+            .child(
+                Label::new("Network")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .mr_1(),
+            )
+            .child(button("fleet-network-auto".into(), "Auto".into(), None))
+            .children(names.iter().enumerate().map(|(index, name)| {
+                button(
+                    SharedString::from(format!("fleet-network-{index}")),
+                    SharedString::from(name.clone()),
+                    Some(name.clone()),
+                )
+            }))
+    }
+
+    fn render_route_badge(
+        &self,
+        machine_index: usize,
+        options: &SshConnectionOptions,
+        status: Option<&(Option<ConnectionRoute>, ConnectionState)>,
+        cx: &App,
+    ) -> AnyElement {
+        let routes = cx.try_global::<SshRoutes>().cloned().unwrap_or_default();
+        let chosen = chosen_route(options, &routes).map(str::to_owned);
+        let pinned = routes.pins.contains_key(&options.connection_string());
+        let setting = || chosen.clone().unwrap_or_else(|| "Auto".to_string());
+        let (color, text, tooltip) = match status {
+            Some((Some(route), ConnectionState::Connected)) => {
+                let color = match &chosen {
+                    Some(chosen) if route_names(chosen, route.label.as_deref(), &route.host) => {
+                        Color::Success
+                    }
+                    Some(_) => Color::Muted,
+                    None if route.is_primary => Color::Success,
+                    None => Color::Warning,
+                };
+                let tooltip = if color == Color::Warning {
+                    format!(
+                        "Connected over {}: the primary address didn't answer",
+                        route.name()
+                    )
+                } else {
+                    format!("Connected over {} ({})", route.name(), route.host)
+                };
+                (color, route.name().to_string(), tooltip)
+            }
+            Some((_, ConnectionState::Disconnected)) => (
+                Color::Error,
+                setting(),
+                format!("Can't reach this machine over {}", setting()),
+            ),
+            Some(_) => (
+                Color::Muted,
+                "Connecting".to_string(),
+                format!("Connecting over {}", setting()),
+            ),
+            None => (
+                Color::Muted,
+                setting(),
+                format!("Not connected. Next connection uses {}", setting()),
+            ),
+        };
+        let options = options.clone();
+        PopoverMenu::new(SharedString::from(format!("fleet-route-{machine_index}")))
+            .trigger(
+                ButtonLike::new(SharedString::from(format!(
+                    "fleet-route-button-{machine_index}"
+                )))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Indicator::dot().color(color))
+                        .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+                        .when(pinned, |row| {
+                            row.child(
+                                Icon::new(IconName::Pin)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        }),
+                )
+                .tooltip(Tooltip::text(tooltip)),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| Some(route_menu(&options, window, cx)))
+            .into_any_element()
     }
 
     fn machines(&self, workspace: &Workspace, cx: &App) -> Vec<FleetMachine> {
@@ -1000,12 +1472,40 @@ impl Render for FleetPanel {
         let has_remote_machines = machines
             .iter()
             .any(|machine| machine.key != LOCAL_MACHINE_KEY);
+        let configured = configured_machines(cx);
+        let network_names = network_names(&configured);
+        let configured = configured
+            .into_iter()
+            .map(|options| (ssh_machine_key(&options), options))
+            .collect::<HashMap<_, _>>();
+        let clients = remote_clients(Some(window), cx);
+        self.observe_clients(&clients, cx);
+        let mut machine_status =
+            HashMap::<String, (Option<ConnectionRoute>, ConnectionState)>::default();
+        for client in &clients {
+            let client = client.read(cx);
+            let Some(options) = ssh_options(client) else {
+                continue;
+            };
+            let status = (client.route(), client.connection_state());
+            machine_status
+                .entry(ssh_machine_key(options))
+                .and_modify(|current| {
+                    if current.1 != ConnectionState::Connected {
+                        *current = status.clone();
+                    }
+                })
+                .or_insert(status);
+        }
 
         let mut list = v_flex()
             .id("fleet-panel-list")
             .size_full()
             .overflow_y_scroll()
             .py_1()
+            .when(!network_names.is_empty(), |list| {
+                list.child(self.render_network_switch(&network_names, cx))
+            })
             .when(
                 window
                     .root::<MultiWorkspace>()
@@ -1040,9 +1540,26 @@ impl Render for FleetPanel {
                     )
                     .child(Label::new(machine.label.clone()))
                     .end_slot(
-                        Label::new(machine.projects.len().to_string())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_1()
+                            .when_some(
+                                configured
+                                    .get(&machine.key)
+                                    .filter(|options| !options.secondary_hosts.is_empty()),
+                                |row, options| {
+                                    row.child(self.render_route_badge(
+                                        machine_index,
+                                        options,
+                                        machine_status.get(&machine.key),
+                                        cx,
+                                    ))
+                                },
+                            )
+                            .child(
+                                Label::new(machine.projects.len().to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     )
                     .tooltip(Tooltip::text(machine.key.clone())),
             );
@@ -1616,6 +2133,74 @@ mod tests {
             };
             assert_eq!(options.host.to_string(), "172.17.21.106");
         }
+    }
+
+    fn two_network_machine(host: &str, tailscale: &str) -> SshConnectionOptions {
+        SshConnectionOptions {
+            host: host.into(),
+            username: Some("ayasser".to_string()),
+            host_label: Some("Office".to_string()),
+            secondary_hosts: vec![remote::SshSecondaryHost {
+                host: tailscale.to_string(),
+                port: None,
+                label: Some("Tailscale".to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn network_switch_lists_labels_of_machines_with_several_addresses() {
+        let single = SshConnectionOptions {
+            host: "box".into(),
+            host_label: Some("Lab".to_string()),
+            ..Default::default()
+        };
+        let names = network_names(&[
+            single,
+            two_network_machine("10.0.0.6", "gpu-06.ts.net"),
+            two_network_machine("10.0.0.7", "gpu-07.ts.net"),
+        ]);
+        assert_eq!(names, ["Office", "Tailscale"]);
+        assert_eq!(next_route(None, &names).as_deref(), Some("Office"));
+        assert_eq!(
+            next_route(Some("Office"), &names).as_deref(),
+            Some("Tailscale")
+        );
+        assert_eq!(next_route(Some("Tailscale"), &names), None);
+        assert_eq!(next_route(Some("Gone"), &names), None);
+    }
+
+    #[test]
+    fn a_connection_matches_the_chosen_route_or_the_primary_on_auto() {
+        let machine = two_network_machine("10.0.0.6", "gpu-06.ts.net");
+        let office = ConnectionRoute {
+            label: Some("Office".to_string()),
+            host: "10.0.0.6".to_string(),
+            is_primary: true,
+        };
+        let tailscale = ConnectionRoute {
+            label: Some("Tailscale".to_string()),
+            host: "gpu-06.ts.net".to_string(),
+            is_primary: false,
+        };
+        let mut routes = SshRoutes::default();
+        assert!(route_satisfied(&machine, &routes, &office));
+        assert!(!route_satisfied(&machine, &routes, &tailscale));
+
+        routes.fleet = Some("Tailscale".to_string());
+        assert!(route_satisfied(&machine, &routes, &tailscale));
+        assert!(!route_satisfied(&machine, &routes, &office));
+
+        routes
+            .pins
+            .insert(machine.connection_string(), "Office".to_string());
+        assert!(route_satisfied(&machine, &routes, &office));
+
+        routes.pins.clear();
+        routes.fleet = Some("Home".to_string());
+        assert!(route_satisfied(&machine, &routes, &office));
+        assert_eq!(chosen_route(&machine, &routes), None);
     }
 
     #[test]
