@@ -7018,6 +7018,10 @@ impl ThreadView {
             == agent_servers::CLAUDE_AGENT_ID
     }
 
+    pub fn remote_control_on(&self) -> bool {
+        self.remote_control_on
+    }
+
     fn remote_control_session_name(&self, cx: &App) -> String {
         let project_name = self.workspace.upgrade().and_then(|workspace| {
             workspace

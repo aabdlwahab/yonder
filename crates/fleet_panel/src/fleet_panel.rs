@@ -5,11 +5,12 @@ use std::{
 };
 
 use agent_ui::{
-    Agent, ThreadId,
+    Agent, AgentPanel, ThreadId,
     thread_metadata_store::{ThreadMetadata, ThreadMetadataStore},
 };
 use anyhow::{Result, anyhow};
 use askpass::EncryptedPassword;
+use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
 use futures::channel::oneshot;
 use gpui::{
@@ -115,6 +116,7 @@ struct FleetThread {
     metadata: ThreadMetadata,
     location: SharedString,
     activity: Option<ThreadActivity>,
+    remote_control: bool,
 }
 
 fn fleet_threads(active_only: bool, window: &Window, cx: &App) -> Vec<FleetThread> {
@@ -122,6 +124,7 @@ fn fleet_threads(active_only: bool, window: &Window, cx: &App) -> Vec<FleetThrea
         return Vec::new();
     };
     let mut activity = HashMap::<ThreadId, ThreadActivity>::default();
+    let mut remote_control = HashSet::<ThreadId>::default();
     let current_sidebar = window
         .root::<MultiWorkspace>()
         .flatten()
@@ -132,12 +135,14 @@ fn fleet_threads(active_only: bool, window: &Window, cx: &App) -> Vec<FleetThrea
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter_map(|window| sidebar_for_window(window.read(cx).ok()?));
     for sidebar in current_sidebar.into_iter().chain(other_sidebars) {
-        for (&id, &status) in sidebar.read(cx).thread_activity() {
+        let sidebar = sidebar.read(cx);
+        for (&id, &status) in sidebar.thread_activity() {
             activity
                 .entry(id)
                 .and_modify(|current| *current = (*current).max(status))
                 .or_insert(status);
         }
+        remote_control.extend(sidebar.thread_remote_control().iter().copied());
     }
     let mut threads = store
         .read(cx)
@@ -166,11 +171,17 @@ fn fleet_threads(active_only: bool, window: &Window, cx: &App) -> Vec<FleetThrea
                 metadata: thread.clone(),
                 location,
                 activity: activity.get(&thread.thread_id).copied(),
+                remote_control: remote_control.contains(&thread.thread_id),
             }
         })
         .collect::<Vec<_>>();
-    threads.sort_by_key(|thread| std::cmp::Reverse((thread.activity, thread.metadata.updated_at)));
+    sort_by_attention(&mut threads);
     threads
+}
+
+/// Approvals first, then running, then unread; newest first within each.
+fn sort_by_attention(threads: &mut [FleetThread]) {
+    threads.sort_by_key(|thread| std::cmp::Reverse((thread.activity, thread.metadata.updated_at)));
 }
 
 fn sidebar_for_window(workspace: &MultiWorkspace) -> Option<Entity<Sidebar>> {
@@ -199,6 +210,26 @@ fn thread_activity_style(activity: ThreadActivity) -> (IconName, Color, &'static
         }
         ThreadActivity::Running => (IconName::PlayFilled, Color::Success, "Running"),
         ThreadActivity::Unread => (IconName::Circle, Color::Accent, "Unread"),
+    }
+}
+
+/// The status pill on an inbox card. An unread thread is one that finished
+/// while you were looking elsewhere.
+fn inbox_status(activity: ThreadActivity) -> (&'static str, Color) {
+    match activity {
+        ThreadActivity::WaitingForApproval => ("Needs approval", Color::Error),
+        ThreadActivity::Running => ("Running", Color::Warning),
+        ThreadActivity::Unread => ("Done", Color::Success),
+    }
+}
+
+fn short_age(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = (now - updated_at).num_seconds().max(0);
+    match seconds {
+        0..60 => "now".to_string(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
     }
 }
 
@@ -738,19 +769,56 @@ impl FleetPanel {
             .into_any_element()
     }
 
+    /// Threads that are running, need approval, or finished unread, as cards
+    /// across every machine. Approvals sort first (see `fleet_threads`).
     fn render_active_threads(&self, window: &Window, cx: &App) -> impl IntoElement {
         let threads = fleet_threads(true, window, cx);
+        let workspace = self.workspace.upgrade();
+        let visible_thread = workspace.as_ref().and_then(|workspace| {
+            let workspace = workspace.read(cx);
+            workspace
+                .panel::<AgentPanel>(cx)
+                .and_then(|panel| panel.read(cx).visible_thread_id(workspace, cx))
+        });
+        let agent_store = workspace.as_ref().map(|workspace| {
+            workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .agent_server_store()
+                .clone()
+        });
+        let colors = cx.theme().colors();
+        let (idle_border, focused_border, card_background) = (
+            colors.border_variant,
+            colors.border_focused,
+            colors.editor_background,
+        );
+        let now = Utc::now();
+        let count = threads.len();
+
         v_flex()
             .pb_2()
             .mb_1()
             .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
+            .border_color(colors.border_variant)
             .child(
-                div().px_3().py_1().child(
-                    Label::new("Active")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
+                h_flex()
+                    .px_3()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Label::new("Active")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when(count > 0, |this| {
+                        this.child(
+                            Label::new(format!("· {count}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
             )
             .when(threads.is_empty(), |this| {
                 this.child(
@@ -761,34 +829,114 @@ impl FleetPanel {
                     ),
                 )
             })
-            .children(threads.into_iter().filter_map(|thread| {
-                let (icon, color, status) = thread_activity_style(thread.activity?);
-                let description = format!(
-                    "{} · {} · {status}",
-                    thread.metadata.display_title(),
-                    thread.location
-                );
-                Some(
-                    ListItem::new(SharedString::from(
-                        thread.metadata.thread_id.to_key_string(),
-                    ))
-                    .spacing(ListItemSpacing::Sparse)
-                    .start_slot(Icon::new(icon).color(color))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(Label::new(thread.metadata.display_title()).single_line())
-                            .child(
-                                Label::new(format!("{} · {status}", thread.location))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
+            .child(
+                v_flex()
+                    .px_2()
+                    .gap_1p5()
+                    .children(threads.into_iter().filter_map(|thread| {
+                        let activity = thread.activity?;
+                        let (status, status_color) = inbox_status(activity);
+                        let agent_id = thread.metadata.agent_id.clone();
+                        let agent_name = agent_store
+                            .as_ref()
+                            .and_then(|store| store.read(cx).agent_display_name(&agent_id))
+                            .unwrap_or_else(|| agent_id.0.clone());
+                        let agent_icon = match agent_store
+                            .as_ref()
+                            .and_then(|store| store.read(cx).agent_icon(&agent_id))
+                        {
+                            Some(svg) => Icon::from_external_svg(svg),
+                            None => Icon::new(
+                                Agent::from(agent_id)
+                                    .icon()
+                                    .unwrap_or(IconName::ZedAgent),
                             ),
-                    )
-                    .tooltip(Tooltip::text(description))
-                    .on_click(move |_, window, cx| open_fleet_thread(thread.clone(), window, cx)),
-                )
-            }))
+                        };
+                        let title = thread.metadata.display_title();
+                        let selected = visible_thread == Some(thread.metadata.thread_id);
+                        let description =
+                            format!("{title} · {agent_name} · {} · {status}", thread.location);
+                        Some(
+                            v_flex()
+                                .id(SharedString::from(format!(
+                                    "fleet-inbox-{}",
+                                    thread.metadata.thread_id.to_key_string()
+                                )))
+                                .w_full()
+                                .gap_0p5()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(if selected {
+                                    focused_border
+                                } else {
+                                    idle_border
+                                })
+                                .bg(card_background)
+                                .cursor_pointer()
+                                .hover(move |style| style.border_color(focused_border))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(agent_icon.size(IconSize::Small).color(Color::Muted))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(Label::new(title).truncate()),
+                                        )
+                                        .child(
+                                            Label::new(short_age(thread.metadata.updated_at, now))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .px_1p5()
+                                                .rounded_full()
+                                                .bg(status_color.color(cx).opacity(0.14))
+                                                .child(
+                                                    Label::new(status)
+                                                        .size(LabelSize::XSmall)
+                                                        .color(status_color),
+                                                ),
+                                        )
+                                        .child(
+                                            Label::new(agent_name)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .single_line(),
+                                        )
+                                        .when(thread.remote_control, |this| {
+                                            this.child(
+                                                Icon::new(IconName::Share)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Accent),
+                                            )
+                                        })
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Label::new(thread.location.clone())
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted)
+                                                    .truncate(),
+                                            ),
+                                        ),
+                                )
+                                .tooltip(Tooltip::text(description))
+                                .on_click(move |_, window, cx| {
+                                    open_fleet_thread(thread.clone(), window, cx)
+                                }),
+                        )
+                    })),
+            )
     }
 }
 
@@ -1254,10 +1402,72 @@ mod tests {
             },
             location: "search · GPU 06".into(),
             activity: Some(ThreadActivity::WaitingForApproval),
+            remote_control: false,
         });
         assert!(thread.matches("approval gpu indexing work"));
         assert!(!thread.matches("unread"));
         assert!(!thread.matches("gpu 07"));
+    }
+
+    fn inbox_thread(
+        title: &str,
+        activity: ThreadActivity,
+        updated_at: DateTime<Utc>,
+    ) -> FleetThread {
+        FleetThread {
+            metadata: ThreadMetadata {
+                thread_id: ThreadId::new(),
+                session_id: None,
+                agent_id: project::AgentId::new("claude-acp"),
+                title: Some(title.to_string().into()),
+                title_override: None,
+                updated_at,
+                created_at: None,
+                interacted_at: None,
+                worktree_paths: Default::default(),
+                remote_connection: None,
+                archived: false,
+            },
+            location: "search · GPU 06".into(),
+            activity: Some(activity),
+            remote_control: false,
+        }
+    }
+
+    #[test]
+    fn inbox_puts_approvals_first_then_running_then_unread_newest_first() {
+        let now = Utc::now();
+        let minutes_ago = |minutes| now - chrono::Duration::minutes(minutes);
+        let mut threads = vec![
+            inbox_thread("old unread", ThreadActivity::Unread, minutes_ago(30)),
+            inbox_thread("running", ThreadActivity::Running, minutes_ago(20)),
+            inbox_thread("new unread", ThreadActivity::Unread, minutes_ago(1)),
+            inbox_thread(
+                "approval",
+                ThreadActivity::WaitingForApproval,
+                minutes_ago(60),
+            ),
+        ];
+        sort_by_attention(&mut threads);
+        let titles = threads
+            .iter()
+            .map(|thread| thread.metadata.display_title().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["approval", "running", "new unread", "old unread"]);
+    }
+
+    #[test]
+    fn inbox_ages_are_short() {
+        let now = Utc::now();
+        let ago = |seconds| now - chrono::Duration::seconds(seconds);
+        assert_eq!(short_age(ago(0), now), "now");
+        assert_eq!(short_age(ago(59), now), "now");
+        assert_eq!(short_age(ago(60), now), "1m");
+        assert_eq!(short_age(ago(3_599), now), "59m");
+        assert_eq!(short_age(ago(3_600), now), "1h");
+        assert_eq!(short_age(ago(86_399), now), "23h");
+        assert_eq!(short_age(ago(86_400), now), "1d");
+        assert_eq!(short_age(now + chrono::Duration::seconds(30), now), "now");
     }
 
     #[test]

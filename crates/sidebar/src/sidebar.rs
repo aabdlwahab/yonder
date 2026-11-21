@@ -828,6 +828,7 @@ pub struct Sidebar {
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
     fleet_activity: HashMap<ThreadId, ThreadActivity>,
+    fleet_remote_control: HashSet<ThreadId>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -867,6 +868,11 @@ impl gpui::EventEmitter<ThreadActivityChanged> for Sidebar {}
 impl Sidebar {
     pub fn thread_activity(&self) -> &HashMap<ThreadId, ThreadActivity> {
         &self.fleet_activity
+    }
+
+    /// Threads in this window whose Claude session is shared through Remote Control.
+    pub fn thread_remote_control(&self) -> &HashSet<ThreadId> {
+        &self.fleet_remote_control
     }
 
     pub fn open_known_thread(
@@ -1024,6 +1030,7 @@ impl Sidebar {
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
             fleet_activity: HashMap::new(),
+            fleet_remote_control: HashSet::default(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
@@ -2162,6 +2169,7 @@ impl Sidebar {
             .filter(|id| Some(*id) != visible_thread)
             .map(|id| (id, ThreadActivity::Unread))
             .collect::<HashMap<_, _>>();
+        let mut remote_control = HashSet::default();
 
         for workspace in multi_workspace.workspaces() {
             let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
@@ -2176,6 +2184,9 @@ impl Sidebar {
                 let thread = view.read(cx).thread.read(cx);
                 if thread.is_draft_thread() {
                     continue;
+                }
+                if view.read(cx).remote_control_on() {
+                    remote_control.insert(thread_id);
                 }
                 let current = if conversation.root_thread_is_waiting_for_input(cx) {
                     Some(ThreadActivity::WaitingForApproval)
@@ -2206,6 +2217,10 @@ impl Sidebar {
             }
         }
 
+        if self.fleet_remote_control != remote_control {
+            self.fleet_remote_control = remote_control;
+            cx.emit(ThreadActivityChanged);
+        }
         if self.fleet_activity != activity {
             let unread = activity
                 .iter()
