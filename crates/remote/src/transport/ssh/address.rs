@@ -5,10 +5,16 @@
 //! a short head start; after that the first address in order that answered
 //! wins. A check never decides alone: if the chosen address fails to connect,
 //! the others are tried in order.
+//!
+//! The user can instead choose a network by label, for the whole fleet or
+//! pinned per machine ([`SshRoutes`]). Then only that network's addresses are
+//! tried, so a machine that can't be reached that way fails rather than
+//! quietly using another network.
 
 use super::SshConnectionOptions;
+use collections::HashMap;
 use futures::{FutureExt as _, StreamExt as _, select_biased, stream::FuturesUnordered};
-use gpui::BackgroundExecutor;
+use gpui::{BackgroundExecutor, Global};
 use std::time::{Duration, Instant};
 use util::command::Stdio;
 
@@ -27,12 +33,80 @@ pub(super) struct Address {
 }
 
 impl Address {
+    pub fn route(&self, is_primary: bool) -> ConnectionRoute {
+        ConnectionRoute {
+            label: self.label.clone(),
+            host: self.options.host.to_string(),
+            is_primary,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match &self.label {
             Some(label) => format!("{label} ({})", self.options.connection_string()),
             None => self.options.connection_string(),
         }
     }
+}
+
+/// The network the user chose for SSH machines that have several addresses.
+/// A route names an address by its label, or by its host when it has none.
+#[derive(Clone, Debug, Default)]
+pub struct SshRoutes {
+    /// Route for every machine that has an address on it. `None` is Auto.
+    pub fleet: Option<String>,
+    /// Routes for single machines, keyed by the primary's connection string.
+    /// These win over `fleet`.
+    pub pins: HashMap<String, String>,
+}
+
+impl Global for SshRoutes {}
+
+impl SshRoutes {
+    pub fn route_for(&self, options: &SshConnectionOptions) -> Option<&str> {
+        self.pins
+            .get(&options.connection_string())
+            .or(self.fleet.as_ref())
+            .map(String::as_str)
+    }
+}
+
+/// Which of a machine's addresses a connection was made on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionRoute {
+    pub label: Option<String>,
+    pub host: String,
+    pub is_primary: bool,
+}
+
+impl ConnectionRoute {
+    /// The label, or the host when the address has none.
+    pub fn name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.host)
+    }
+}
+
+/// Whether `route` names this address.
+pub fn route_names(route: &str, label: Option<&str>, host: &str) -> bool {
+    label == Some(route) || (label.is_none() && host == route)
+}
+
+/// The addresses on `route`, in order. `None` when the machine has no address
+/// on it, so it stays on Auto.
+pub(super) fn route_order(addresses: &[Address], route: &str) -> Option<Vec<usize>> {
+    let order = addresses
+        .iter()
+        .enumerate()
+        .filter(|(_, address)| {
+            route_names(
+                route,
+                address.label.as_deref(),
+                &address.options.host.to_string(),
+            )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    (!order.is_empty()).then_some(order)
 }
 
 /// The machine's addresses, primary first. Secondary addresses check the host
@@ -348,6 +422,55 @@ mod tests {
                 .unwrap(),
             "HostKeyAlias=[example.com]:2222"
         );
+    }
+
+    #[test]
+    fn a_chosen_route_keeps_only_its_addresses() {
+        let options = SshConnectionOptions {
+            host: "10.0.0.6".into(),
+            host_label: Some("Office".into()),
+            secondary_hosts: vec![
+                SshSecondaryHost {
+                    host: "gpu-06.example.ts.net".into(),
+                    port: None,
+                    label: Some("Tailscale".into()),
+                },
+                SshSecondaryHost {
+                    host: "gpu-06.vpn".into(),
+                    port: None,
+                    label: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let addresses = addresses(&options);
+        assert_eq!(route_order(&addresses, "Tailscale"), Some(vec![1]));
+        assert_eq!(route_order(&addresses, "Office"), Some(vec![0]));
+        assert_eq!(route_order(&addresses, "gpu-06.vpn"), Some(vec![2]));
+        assert_eq!(route_order(&addresses, "10.0.0.6"), None);
+        assert_eq!(route_order(&addresses, "Home"), None);
+    }
+
+    #[test]
+    fn pins_win_over_the_fleet_route() {
+        let gpu06 = SshConnectionOptions {
+            host: "10.0.0.6".into(),
+            username: Some("ayasser".into()),
+            ..Default::default()
+        };
+        let gpu07 = SshConnectionOptions {
+            host: "10.0.0.7".into(),
+            username: Some("ayasser".into()),
+            ..Default::default()
+        };
+        let mut routes = SshRoutes::default();
+        assert_eq!(routes.route_for(&gpu06), None);
+        routes.fleet = Some("Office".into());
+        routes
+            .pins
+            .insert("ayasser@10.0.0.6".into(), "Tailscale".into());
+        assert_eq!(routes.route_for(&gpu06), Some("Tailscale"));
+        assert_eq!(routes.route_for(&gpu07), Some("Office"));
     }
 
     #[test]

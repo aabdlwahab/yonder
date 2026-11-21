@@ -15,7 +15,10 @@ pub use remote_client::{
 };
 pub use remote_identity::RemoteConnectionIdentity;
 pub use transport::docker::DockerConnectionOptions;
-pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption, SshSecondaryHost};
+pub use transport::ssh::{
+    ConnectionRoute, SshConnectionOptions, SshPortForwardOption, SshRoutes, SshSecondaryHost,
+    route_names,
+};
 pub use transport::wsl::WslConnectionOptions;
 #[cfg(target_os = "windows")]
 pub use transport::wsl::wsl_path_to_windows_path;
