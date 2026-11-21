@@ -2140,6 +2140,8 @@ impl RemoteServerProjects {
                     upload_binary_over_ssh: None,
                     port_forwards: connection_options.port_forwards,
                     connection_timeout: connection_options.connection_timeout,
+                    host_label: connection_options.host_label,
+                    secondary_hosts: connection_options.secondary_hosts,
                 })
         });
     }

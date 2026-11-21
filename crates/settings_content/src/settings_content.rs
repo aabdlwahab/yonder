@@ -1471,6 +1471,26 @@ pub struct SshConnection {
     /// Timeout in seconds for SSH connection and downloading the remote server binary.
     /// Defaults to 10 seconds if not specified.
     pub connection_timeout: Option<u16>,
+    /// Name of the network `host` is reached over, such as "Office". Shown in
+    /// the fleet panel and used by its network switch.
+    pub host_label: Option<String>,
+    /// Other addresses of this machine, tried in order when `host` doesn't
+    /// answer. The machine is still identified by `host`.
+    #[serde(default)]
+    pub secondary_hosts: Vec<SshSecondaryHost>,
+}
+
+/// Another address of an SSH machine, such as its Tailscale name.
+#[with_fallible_options]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema, MergeFrom,
+)]
+pub struct SshSecondaryHost {
+    pub host: String,
+    /// Port for this address. Defaults to the machine's `port`.
+    pub port: Option<u16>,
+    /// Name of the network this address is reached over, such as "Tailscale".
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom, Debug)]

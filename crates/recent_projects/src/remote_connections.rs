@@ -41,16 +41,31 @@ impl RemoteSettings {
         self.wsl_connections.clone().0.into_iter()
     }
 
+    /// Fills `options` from the matching `ssh_connections` entry. Options that
+    /// name one of an entry's secondary hosts are moved to its primary `host`,
+    /// so a machine has one identity whichever address it was saved under.
     pub fn fill_connection_options_from_settings(&self, options: &mut SshConnectionOptions) {
         let host = options.host.to_string();
         for conn in self.ssh_connections() {
-            if conn.host == host && conn.username == options.username && conn.port == options.port {
-                options.nickname = conn.nickname;
-                options.upload_binary_over_ssh = conn.upload_binary_over_ssh.unwrap_or_default();
-                options.args = Some(conn.args);
-                options.port_forwards = conn.port_forwards;
-                break;
+            if conn.username != options.username {
+                continue;
             }
+            let is_primary = conn.host == host && conn.port == options.port;
+            let is_secondary = conn.secondary_hosts.iter().any(|secondary| {
+                secondary.host == host && secondary.port.or(conn.port) == options.port
+            });
+            if !is_primary && !is_secondary {
+                continue;
+            }
+            options.host = conn.host.into();
+            options.port = conn.port;
+            options.nickname = conn.nickname;
+            options.upload_binary_over_ssh = conn.upload_binary_over_ssh.unwrap_or_default();
+            options.args = Some(conn.args);
+            options.port_forwards = conn.port_forwards;
+            options.host_label = conn.host_label;
+            options.secondary_hosts = conn.secondary_hosts;
+            break;
         }
     }
 
@@ -522,6 +537,44 @@ mod tests {
     use workspace::dock::DockPosition;
     use workspace::dock::test::TestPanel;
     use workspace::find_existing_workspace;
+
+    #[test]
+    fn options_saved_under_a_secondary_host_move_to_the_primary() {
+        let settings = RemoteSettings {
+            ssh_connections: ExtendingVec(vec![SshConnection {
+                host: "172.17.21.106".to_string(),
+                username: Some("ayasser".to_string()),
+                nickname: Some("gpu-06".to_string()),
+                host_label: Some("Office".to_string()),
+                secondary_hosts: vec![settings::SshSecondaryHost {
+                    host: "gpu-06.example.ts.net".to_string(),
+                    port: None,
+                    label: Some("Tailscale".to_string()),
+                }],
+                ..Default::default()
+            }]),
+            wsl_connections: ExtendingVec(Vec::new()),
+            read_ssh_config: false,
+        };
+
+        let mut options = settings.connection_options_for(
+            "gpu-06.example.ts.net".to_string(),
+            None,
+            Some("ayasser".to_string()),
+        );
+        assert_eq!(options.host.to_string(), "172.17.21.106");
+        assert_eq!(options.nickname.as_deref(), Some("gpu-06"));
+        assert_eq!(options.host_label.as_deref(), Some("Office"));
+        assert_eq!(options.secondary_hosts.len(), 1);
+
+        options = settings.connection_options_for(
+            "gpu-06.example.ts.net".to_string(),
+            None,
+            Some("someone-else".to_string()),
+        );
+        assert_eq!(options.host.to_string(), "gpu-06.example.ts.net");
+        assert!(options.secondary_hosts.is_empty());
+    }
 
     #[gpui::test]
     async fn test_first_remote_open_keeps_current_workspace_until_panels_are_ready(
