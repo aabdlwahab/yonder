@@ -437,7 +437,7 @@ impl UserMessage {
                             )
                             .ok();
                         }
-                        MentionUri::Thread { .. } => {
+                        MentionUri::Thread { .. } | MentionUri::Forward { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
                         }
                         MentionUri::Rule { .. } => {

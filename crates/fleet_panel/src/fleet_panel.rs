@@ -77,6 +77,7 @@ impl Global for FleetActivity {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(FleetActivity);
+    agent_ui::set_thread_opener(open_thread_metadata, cx);
     load_routes(cx);
     watch_primaries(cx);
     cx.on_window_closed(|cx, _| cx.update_global::<FleetActivity, _>(|_, _| {}))
@@ -213,7 +214,13 @@ fn sidebar_for_window(workspace: &MultiWorkspace) -> Option<Entity<Sidebar>> {
     workspace.sidebar()?.to_any().downcast::<Sidebar>().ok()
 }
 
-fn open_fleet_thread(thread: FleetThread, window: &Window, cx: &mut App) {
+fn open_fleet_thread(thread: FleetThread, window: &mut Window, cx: &mut App) {
+    open_thread_metadata(thread.metadata, window, cx);
+}
+
+/// Opens a thread in its own project, on its own machine, switching windows
+/// or opening the project when needed.
+fn open_thread_metadata(metadata: ThreadMetadata, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |window, cx| {
         let Some(sidebar) = window
             .root::<MultiWorkspace>()
@@ -223,7 +230,7 @@ fn open_fleet_thread(thread: FleetThread, window: &Window, cx: &mut App) {
             return;
         };
         sidebar.update(cx, |sidebar, cx| {
-            sidebar.open_known_thread(thread.metadata, window, cx)
+            sidebar.open_known_thread(metadata, window, cx)
         });
     });
 }

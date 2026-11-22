@@ -198,6 +198,17 @@ fn open_mention_uri(
         MentionUri::Thread { id, name } => {
             open_thread(workspace, id, name, window, cx);
         }
+        MentionUri::Forward { session_id, .. } => {
+            let workspace_entity = cx.entity();
+            window.defer(cx, move |window, cx| {
+                crate::forward::open_thread_by_session(
+                    &session_id,
+                    Some(workspace_entity),
+                    window,
+                    cx,
+                )
+            });
+        }
         MentionUri::Skill {
             skill_file_path, ..
         } => {

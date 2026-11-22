@@ -1263,6 +1263,17 @@ impl ThreadView {
             }));
         }));
 
+        crate::forward::ensure_links_loaded(cx);
+        subscriptions.push(cx.observe_global::<crate::forward::ForwardLinks>(|_, cx| cx.notify()));
+        subscriptions.push(
+            cx.observe_global_in::<crate::forward::PendingForwards>(window, |this, window, cx| {
+                this.take_pending_forwards(window, cx)
+            }),
+        );
+        cx.defer_in(window, |this, window, cx| {
+            this.take_pending_forwards(window, cx)
+        });
+
         let current_submission = thread.read(cx).latest_submission_id();
         // Submissions that were already in flight when this view was built have had
         // time to settle, so they are shown without a reveal delay.
@@ -7094,6 +7105,134 @@ impl ThreadView {
         targets
     }
 
+    /// The reply at `entry_ix`, or `selection` from it, ready for the Forward picker.
+    fn forward_source(
+        &self,
+        entry_ix: usize,
+        selection: Option<String>,
+        cx: &Context<Self>,
+    ) -> Option<crate::forward::ForwardSource> {
+        let entries = self.thread.read(cx).entries();
+        let response_ix = Self::agent_message_copy_index(entries, entry_ix, cx);
+        let (text, is_selection) = match selection {
+            Some(selection) => (selection, true),
+            None => (
+                Self::get_agent_message_content(entries, response_ix?, cx)?,
+                false,
+            ),
+        };
+        let agents = self.fork_targets(cx);
+        let other_claude_accounts = agents
+            .iter()
+            .filter(|(agent_id, _)| self.is_other_claude_account(agent_id))
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+        Some(crate::forward::ForwardSource {
+            thread_view: cx.weak_entity(),
+            workspace: self.workspace.clone(),
+            thread_id: self.root_thread_id,
+            session_id: self.session_id.clone(),
+            title: self
+                .thread
+                .read(cx)
+                .title()
+                .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into()),
+            agent_id: self.agent_id.clone(),
+            agent_name: self.agent_display_name.clone(),
+            entry_ix: response_ix.unwrap_or(entry_ix),
+            text,
+            is_selection,
+            agents,
+            other_claude_accounts,
+        })
+    }
+
+    fn open_forward_picker(
+        &mut self,
+        entry_ix: usize,
+        selection: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.forward_source(entry_ix, selection, cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::forward::open_forward_picker(source, workspace, window, cx)
+            });
+        });
+    }
+
+    /// Puts messages forwarded to this thread into its message box, and sends
+    /// them when the sender chose Send now.
+    fn take_pending_forwards(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.parent_session_id.is_some() {
+            return;
+        }
+        let pending = crate::forward::take_pending_forwards(self.root_thread_id, cx);
+        if pending.is_empty() {
+            return;
+        }
+        let send = pending.iter().any(|forward| forward.send);
+        for forward in pending {
+            self.message_editor.update(cx, |editor, cx| {
+                editor.append_message(forward.blocks, Some("\n"), window, cx)
+            });
+        }
+        if send {
+            self.send(window, cx);
+        } else {
+            self.message_editor.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn render_forward_links(&self, response_ix: usize, cx: &Context<Self>) -> Option<AnyElement> {
+        let links = crate::forward::forward_links(&self.session_id, response_ix, cx);
+        if links.is_empty() {
+            return None;
+        }
+        let store = ThreadMetadataStore::try_global(cx);
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .px_2()
+                .children(links.into_iter().enumerate().map(|(index, link)| {
+                    let metadata = store
+                        .as_ref()
+                        .and_then(|store| store.read(cx).entry(link.thread_id).cloned());
+                    let title = metadata
+                        .as_ref()
+                        .map(|metadata| metadata.display_title().to_string())
+                        .unwrap_or(link.title);
+                    let workspace = self.workspace.clone();
+                    Button::new(
+                        SharedString::from(format!("forward-link-{response_ix}-{index}")),
+                        format!("Forwarded to {} \u{00b7} {title}", link.agent),
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::ArrowUpRight)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .disabled(metadata.is_none())
+                    .on_click(move |_, window, cx| {
+                        if let Some(metadata) = metadata.clone() {
+                            crate::forward::open_thread(metadata, workspace.upgrade(), window, cx);
+                        }
+                    })
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn is_other_claude_account(&self, agent_id: &AgentId) -> bool {
         let registry_id = project::agent_server_store::registry_id_for_agent;
         *agent_id != self.agent_id
@@ -7101,7 +7240,7 @@ impl ThreadView {
             && registry_id(agent_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
     }
 
-    fn resume_claude_account(&self, agent_id: AgentId, window: &Window, cx: &mut App) {
+    pub(crate) fn resume_claude_account(&self, agent_id: AgentId, window: &Window, cx: &mut App) {
         let conversation = self.server_view.clone();
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
@@ -7121,7 +7260,7 @@ impl ThreadView {
     /// the new thread receives the conversation so far and continues the work while
     /// this one keeps running. With `use_new_worktree`, it works in a new git
     /// worktree so both can edit the project at the same time.
-    fn fork_conversation(
+    pub(crate) fn fork_conversation(
         &mut self,
         agent_id: AgentId,
         up_to_entry: Option<usize>,
@@ -8379,23 +8518,32 @@ impl ThreadView {
 
         // Not `Some(entry_ix)` for turn ends: a turn that only has thoughts would copy nothing
         // but still show the copied state. The search stops at `entry_ix` when it has text.
-        let copy_response_button =
-            Self::agent_message_copy_index(thread.read(cx).entries(), entry_ix, cx).map(
-                |response_index| {
-                    let thread = thread.clone();
-                    CopyButton::new(("copy_agent_response", entry_ix), "")
-                        .icon_size(IconSize::Small)
-                        .tooltip_label("Copy This Agent Response")
-                        .custom_on_click(move |_, cx| {
-                            let entries = thread.read(cx).entries();
-                            if let Some(text) =
-                                Self::get_agent_message_content(entries, response_index, cx)
-                            {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            }
-                        })
-                },
-            );
+        let response_index =
+            Self::agent_message_copy_index(thread.read(cx).entries(), entry_ix, cx);
+        let forward_button = response_index.map(|response_index| {
+            IconButton::new(("forward_agent_response", entry_ix), IconName::ArrowUpRight)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Forward This Response…"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_forward_picker(response_index, None, window, cx);
+                }))
+        });
+        let forward_links =
+            response_index.and_then(|response_index| self.render_forward_links(response_index, cx));
+        let copy_response_button = response_index.map(|response_index| {
+            let thread = thread.clone();
+            CopyButton::new(("copy_agent_response", entry_ix), "")
+                .icon_size(IconSize::Small)
+                .tooltip_label("Copy This Agent Response")
+                .custom_on_click(move |_, cx| {
+                    let entries = thread.read(cx).entries();
+                    if let Some(text) = Self::get_agent_message_content(entries, response_index, cx)
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                })
+        });
 
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
@@ -8512,7 +8660,7 @@ impl ThreadView {
                 .alpha(0.5)
         };
 
-        h_flex()
+        let controls = h_flex()
             .w_full()
             .py_1p5()
             .px_4()
@@ -8537,9 +8685,17 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
+            .when_some(forward_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
-            .when_some(scroll_to_top, |this, button| this.child(button))
-            .into_any_element()
+            .when_some(scroll_to_top, |this, button| this.child(button));
+        match forward_links {
+            Some(links) => v_flex()
+                .w_full()
+                .child(controls)
+                .child(h_flex().w_full().px_2().justify_end().child(links))
+                .into_any_element(),
+            None => controls.into_any_element(),
+        }
     }
 
     fn is_thread_feedback_enabled(&self, cx: &App) -> bool {
@@ -9211,6 +9367,11 @@ impl ThreadView {
                         .and_then(|markdown| markdown.context_menu_selected_text().cloned());
                     let selected_markdown = markdown
                         .and_then(|markdown| markdown.context_menu_selected_markdown().cloned());
+                    let forward_selection = selected_markdown
+                        .as_ref()
+                        .map(|selection| selection.to_string())
+                        .or_else(|| selected_text.as_ref().map(|text| text.to_string()))
+                        .filter(|text| !text.trim().is_empty());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -9293,79 +9454,19 @@ impl ThreadView {
                         .item(scroll_item)
                         .item(open_thread_as_markdown);
 
-                    let targets = this.fork_targets(cx);
-                    if targets.is_empty() {
-                        return menu;
-                    }
-                    let fork_entry = |label: String,
-                                      agent_id: AgentId,
-                                      up_to_entry: Option<usize>,
-                                      use_new_worktree: bool| {
+                    let forward_entry = |label: &'static str, selection: Option<String>| {
                         let entity = entity.clone();
                         ContextMenuEntry::new(label).handler(move |window, cx| {
                             entity.update(cx, |this, cx| {
-                                this.fork_conversation(
-                                    agent_id.clone(),
-                                    up_to_entry,
-                                    use_new_worktree,
-                                    window,
-                                    cx,
-                                )
+                                this.open_forward_picker(entry_ix, selection.clone(), window, cx)
                             });
                         })
                     };
-                    let menu = targets.iter().fold(
-                        menu.separator().header("Fork from Here"),
-                        |menu, (agent_id, name)| {
-                            menu.item(fork_entry(
-                                format!("Fork to {name}"),
-                                agent_id.clone(),
-                                Some(entry_ix),
-                                false,
-                            ))
-                            .item(fork_entry(
-                                format!("Fork to {name} in New Worktree"),
-                                agent_id.clone(),
-                                Some(entry_ix),
-                                true,
-                            ))
-                        },
-                    );
-                    let menu = targets
-                        .iter()
-                        .filter(|(id, _)| !this.is_other_claude_account(id))
-                        .fold(
-                            menu.separator().header("Continue Whole Conversation As"),
-                            |menu, (agent_id, name)| {
-                                menu.item(fork_entry(
-                                    name.to_string(),
-                                    agent_id.clone(),
-                                    None,
-                                    false,
-                                ))
-                            },
-                        );
-                    let accounts = targets
-                        .iter()
-                        .filter(|(id, _)| this.is_other_claude_account(id))
-                        .collect::<Vec<_>>();
-                    if accounts.is_empty() || this.thread.read(cx).parent_session_id().is_some() {
-                        return menu;
-                    }
-                    accounts.into_iter().fold(
-                        menu.separator().header("Resume Claude Session As"),
-                        |menu, (agent_id, name)| {
-                            let entity = entity.clone();
-                            let agent_id = agent_id.clone();
-                            menu.item(ContextMenuEntry::new(name.clone()).handler(
-                                move |window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.resume_claude_account(agent_id.clone(), window, cx);
-                                    });
-                                },
-                            ))
-                        },
-                    )
+                    menu.separator()
+                        .when_some(forward_selection, |menu, selection| {
+                            menu.item(forward_entry("Forward Selection…", Some(selection)))
+                        })
+                        .item(forward_entry("Forward…", None))
                 })
             })
             .into_any_element()
@@ -14916,6 +15017,17 @@ pub(crate) fn open_link(
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
+            MentionUri::Forward { session_id, .. } => {
+                let workspace_entity = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    crate::forward::open_thread_by_session(
+                        &session_id,
+                        Some(workspace_entity),
+                        window,
+                        cx,
+                    )
+                });
+            }
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
             MentionUri::Rule { name, .. } => {
