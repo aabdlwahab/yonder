@@ -16,9 +16,7 @@ use acp_thread::{
 use agent_client_protocol::v2::schema as acp_v2;
 use collections::HashMap;
 use db::kvp::KeyValueStore;
-use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Global, SharedString, Task, TaskExt as _,
-};
+use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task, TaskExt as _};
 use markdown::Markdown;
 use project::{AgentId, Project};
 use serde::{Deserialize, Serialize};
@@ -75,6 +73,8 @@ pub struct GuestReply {
     /// The guest's entry count before this question, so the reply is
     /// everything after it.
     start_ix: usize,
+    /// Whether the owner has been sent this answer, or the user left it out.
+    given_to_owner: bool,
 }
 
 pub struct GuestExchange {
@@ -130,12 +130,11 @@ impl GuestSession {
     }
 }
 
-/// A guest answer the owner hasn't been given yet.
-pub struct FinishedReply {
+/// A finished guest answer the owner hasn't been sent yet.
+pub struct PendingAnswer {
+    pub exchange_ix: usize,
+    pub reply_ix: usize,
     pub agent_name: SharedString,
-    pub session_id: acp_v2::SessionId,
-    pub question: String,
-    pub text: String,
 }
 
 /// What the owner thread looks like when the user asks.
@@ -148,19 +147,12 @@ pub struct OwnerContext {
     pub connection_store: Entity<AgentConnectionStore>,
 }
 
-pub enum ThreadGuestsEvent {
-    ReplyFinished,
-}
-
 /// The guests of one owner thread: their sessions and what they said.
 pub struct ThreadGuests {
     owner_session_id: acp_v2::SessionId,
     exchanges: Vec<GuestExchange>,
     sessions: HashMap<AgentId, GuestSession>,
-    undelivered: Vec<FinishedReply>,
 }
-
-impl EventEmitter<ThreadGuestsEvent> for ThreadGuests {}
 
 #[derive(Default)]
 struct GuestRegistry(HashMap<acp_v2::SessionId, Entity<ThreadGuests>>);
@@ -196,6 +188,9 @@ struct SavedReply {
     text: String,
     #[serde(default)]
     error: Option<String>,
+    /// Answers saved before this existed count as not yet sent to the owner.
+    #[serde(default)]
+    given_to_owner: bool,
 }
 
 /// The guests of the thread with `owner_session_id`, loaded from disk the
@@ -266,6 +261,7 @@ pub fn guests_for(
                         }),
                         text: reply.text,
                         start_ix: 0,
+                        given_to_owner: reply.given_to_owner,
                     })
                     .collect(),
             })
@@ -274,7 +270,6 @@ pub fn guests_for(
             owner_session_id: owner_session_id.clone(),
             exchanges,
             sessions,
-            undelivered: Vec::new(),
         }
     });
     cx.default_global::<GuestRegistry>()
@@ -303,8 +298,66 @@ impl ThreadGuests {
             .is_none_or(|session| session.read_only)
     }
 
-    pub fn take_undelivered(&mut self) -> Vec<FinishedReply> {
-        std::mem::take(&mut self.undelivered)
+    /// Finished answers the owner will get with the next message.
+    pub fn answers_for_owner(&self) -> Vec<PendingAnswer> {
+        let mut answers = Vec::new();
+        for (exchange_ix, exchange) in self.exchanges.iter().enumerate() {
+            for (reply_ix, reply) in exchange.replies.iter().enumerate() {
+                if reply.status == ReplyStatus::Done
+                    && !reply.given_to_owner
+                    && !reply.text.trim().is_empty()
+                {
+                    answers.push(PendingAnswer {
+                        exchange_ix,
+                        reply_ix,
+                        agent_name: reply.agent_name.clone(),
+                    });
+                }
+            }
+        }
+        answers
+    }
+
+    /// The pending answers as mentions to put in front of the owner's next
+    /// message, marking them sent.
+    pub fn take_answers_for_owner(&mut self, cx: &mut Context<Self>) -> Vec<acp_v2::ContentBlock> {
+        let pending = self.answers_for_owner();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let mut blocks = Vec::new();
+        for answer in pending {
+            let exchange = &self.exchanges[answer.exchange_ix];
+            let reply = &exchange.replies[answer.reply_ix];
+            let session_id = self
+                .sessions
+                .get(&reply.agent_id)
+                .and_then(|session| session.session_id.clone())
+                .unwrap_or_else(|| self.owner_session_id.clone());
+            blocks.extend(answer_blocks(
+                &reply.agent_name,
+                session_id,
+                &exchange.prompt_text,
+                &reply.text,
+            ));
+            self.exchanges[answer.exchange_ix].replies[answer.reply_ix].given_to_owner = true;
+        }
+        self.save(cx);
+        cx.notify();
+        blocks
+    }
+
+    /// Leaves an answer out of the owner's next message.
+    pub fn dismiss_answer(&mut self, exchange_ix: usize, reply_ix: usize, cx: &mut Context<Self>) {
+        if let Some(reply) = self
+            .exchanges
+            .get_mut(exchange_ix)
+            .and_then(|exchange| exchange.replies.get_mut(reply_ix))
+        {
+            reply.given_to_owner = true;
+            self.save(cx);
+            cx.notify();
+        }
     }
 
     /// Sends `blocks` to each of `guests`, with as much of the owner's
@@ -329,6 +382,7 @@ impl ThreadGuests {
                 markdown: cx.new(|cx| Markdown::new("".into(), Some(languages.clone()), None, cx)),
                 text: String::new(),
                 start_ix: 0,
+                given_to_owner: false,
             })
             .collect();
         self.exchanges.push(GuestExchange {
@@ -651,16 +705,6 @@ impl ThreadGuests {
                     .markdown
                     .update(cx, |markdown, cx| markdown.replace(text.clone(), cx));
                 reply.status = ReplyStatus::Done;
-                let agent_name = reply.agent_name.clone();
-                if !text.trim().is_empty() {
-                    self.undelivered.push(FinishedReply {
-                        agent_name,
-                        session_id: thread.read(cx).session_id().clone(),
-                        question: self.exchanges[exchange_ix].prompt_text.clone(),
-                        text,
-                    });
-                    cx.emit(ThreadGuestsEvent::ReplyFinished);
-                }
                 self.save(cx);
                 cx.notify();
             }
@@ -741,6 +785,7 @@ impl ThreadGuests {
                                 }
                                 _ => None,
                             },
+                            given_to_owner: reply.given_to_owner,
                         })
                         .collect(),
                 })
@@ -965,17 +1010,22 @@ fn start_failure_message(error: &anyhow::Error) -> String {
 }
 
 /// The mention that carries a guest's answer into the owner's next turn.
-pub fn reply_blocks(reply: &FinishedReply) -> Vec<acp_v2::ContentBlock> {
+fn answer_blocks(
+    agent_name: &str,
+    session_id: acp_v2::SessionId,
+    question: &str,
+    answer: &str,
+) -> Vec<acp_v2::ContentBlock> {
     let uri = MentionUri::GuestReply {
-        session_id: reply.session_id.clone(),
-        agent: reply.agent_name.to_string(),
+        session_id,
+        agent: agent_name.to_string(),
     };
-    let question = reply.question.trim();
+    let question = question.trim();
     let text = format!(
         "{agent} answered as a guest in this thread. The user asked {agent}:\n\n{question}\n\n\
          {agent}'s answer:\n\n{answer}",
-        agent = reply.agent_name,
-        answer = reply.text.trim(),
+        agent = agent_name,
+        answer = answer.trim(),
     );
     vec![
         acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(

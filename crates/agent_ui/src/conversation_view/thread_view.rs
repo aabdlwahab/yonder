@@ -2440,6 +2440,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let contents_task = if is_native_command {
+            contents_task
+        } else {
+            self.with_guest_answers(contents_task, cx)
+        };
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -5691,6 +5696,8 @@ impl ThreadView {
                             .when(fills_container, |this| this.flex_1())
                             .pt_1()
                             .pr_2p5()
+                            .gap_1()
+                            .children(self.render_pending_guest_answers(cx))
                             .child(self.message_editor.clone())
                             .when(has_messages, |this| {
                                 this.child(
@@ -7236,33 +7243,95 @@ impl ThreadView {
                 this.remeasure_guest_entries(cx);
                 cx.notify();
             }));
-        self._guest_subscriptions.push(cx.subscribe_in(
-            &guests,
-            window,
-            |this, _, _: &crate::guests::ThreadGuestsEvent, window, cx| {
-                this.deliver_guest_replies(window, cx)
-            },
-        ));
         self.guests = Some(guests.clone());
-        cx.defer_in(window, |this, window, cx| {
-            this.remeasure_guest_entries(cx);
-            this.deliver_guest_replies(window, cx);
-        });
+        cx.defer_in(window, |this, _, cx| this.remeasure_guest_entries(cx));
         Some(guests)
     }
 
-    /// Puts finished guest answers into the message box, so the owner gets
-    /// them with the next message unless the user deletes them.
-    fn deliver_guest_replies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(guests) = self.guests.clone() else {
-            return;
-        };
-        let replies = guests.update(cx, |guests, _| guests.take_undelivered());
-        for reply in replies {
-            self.message_editor.update(cx, |editor, cx| {
-                editor.append_message(crate::guests::reply_blocks(&reply), Some("\n"), window, cx)
-            });
+    /// Guest answers the owner hasn't had yet go in front of the next message
+    /// to it. They're saved with the thread, so a restart doesn't lose them.
+    fn with_guest_answers(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>> {
+        if self.parent_session_id.is_some() {
+            return contents_task;
         }
+        let Some(guests) = self.guests.clone() else {
+            return contents_task;
+        };
+        if guests.read(cx).answers_for_owner().is_empty() {
+            return contents_task;
+        }
+        cx.spawn(async move |_, cx| {
+            let Some((blocks, buffers)) = contents_task.await? else {
+                return Ok(None);
+            };
+            let mut answers = guests.update(cx, |guests, cx| guests.take_answers_for_owner(cx));
+            answers.extend(blocks);
+            Ok(Some((answers, buffers)))
+        })
+    }
+
+    /// "Includes Codex's answer" chips above the message box, one per answer
+    /// the owner will get with the next message.
+    fn render_pending_guest_answers(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let guests = self.guests.clone()?;
+        let answers = guests.read(cx).answers_for_owner();
+        if answers.is_empty() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_1()
+                .children(answers.into_iter().map(|answer| {
+                    let guests = guests.clone();
+                    let id = SharedString::from(format!(
+                        "dismiss-guest-answer-{}-{}",
+                        answer.exchange_ix, answer.reply_ix
+                    ));
+                    h_flex()
+                        .gap_1()
+                        .pl_1p5()
+                        .pr_0p5()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Icon::new(IconName::Quote)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("Includes {}'s answer", answer.agent_name))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            IconButton::new(id, IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(format!(
+                                    "Don't send {}'s answer to {}",
+                                    answer.agent_name, self.agent_display_name
+                                )))
+                                .on_click(move |_, _, cx| {
+                                    guests.update(cx, |guests, cx| {
+                                        guests.dismiss_answer(
+                                            answer.exchange_ix,
+                                            answer.reply_ix,
+                                            cx,
+                                        )
+                                    })
+                                }),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     /// The entry each exchange shows under.

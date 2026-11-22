@@ -5039,11 +5039,36 @@ pub(crate) mod tests {
             };
             assert_eq!(reply.status, crate::guests::ReplyStatus::Done);
             assert_eq!(reply.markdown.read(cx).source(), "Default response");
-            let editor_text = view.message_editor.read(cx).text(cx);
+            assert_eq!(guests.answers_for_owner().len(), 1);
+            assert!(view.message_editor.read(cx).text(cx).is_empty());
+        });
+
+        // The owner's next message carries the answer, even though nothing
+        // was put in the message box.
+        thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.update(cx, |editor, cx| {
+                editor.set_text("review what Codex said", window, cx)
+            });
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            let thread = view.thread.read(cx);
+            let last_user_message = thread
+                .entries()
+                .iter()
+                .rev()
+                .find(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                .map(|entry| entry.to_markdown(cx))
+                .expect("the owner got a message");
             assert!(
-                editor_text.contains("zed:///agent/guest-reply/"),
-                "message box: {editor_text}"
+                last_user_message.contains("zed:///agent/guest-reply/")
+                    && last_user_message.contains("review what Codex said"),
+                "owner message: {last_user_message}"
             );
+            let guests = view.guests.as_ref().expect("guests attached").read(cx);
+            assert!(guests.answers_for_owner().is_empty());
         });
     }
 
