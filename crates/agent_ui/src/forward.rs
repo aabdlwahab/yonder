@@ -708,7 +708,7 @@ mod tests {
             title: "Fix login race".to_string(),
             agent: "Claude Agent".to_string(),
         };
-        let parsed = MentionUri::parse(&uri.to_uri().to_string(), util::paths::PathStyle::Unix)
+        let parsed = MentionUri::parse(uri.to_uri().as_ref(), util::paths::PathStyle::Unix)
             .expect("forward mention parses");
         assert_eq!(parsed, uri);
         assert_eq!(parsed.name(), "From Claude Agent");
