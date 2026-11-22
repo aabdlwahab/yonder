@@ -1,3 +1,4 @@
+mod agent_accounts_page;
 mod audio_input_output_setup;
 mod audio_test_window;
 mod edit_prediction_provider_setup;
@@ -11,6 +12,7 @@ mod skill_creator;
 mod skills_setup;
 mod tool_permissions_setup;
 
+pub(crate) use agent_accounts_page::{AgentAccountsPage, render_agent_accounts_page};
 pub(crate) use audio_input_output_setup::{
     render_input_audio_device_dropdown, render_output_audio_device_dropdown,
 };
