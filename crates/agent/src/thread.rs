@@ -437,9 +437,12 @@ impl UserMessage {
                             )
                             .ok();
                         }
-                        MentionUri::Thread { .. } | MentionUri::Forward { .. } => {
+                        MentionUri::Thread { .. }
+                        | MentionUri::Forward { .. }
+                        | MentionUri::GuestReply { .. } => {
                             write!(&mut thread_context, "\n{}\n", content).ok();
                         }
+                        MentionUri::Guest { .. } => {}
                         MentionUri::Rule { .. } => {
                             // Deprecated: keeps legacy rule mentions as context.
                             write!(

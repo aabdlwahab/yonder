@@ -111,6 +111,8 @@ pub struct MarkdownStyle {
     pub container_style: StyleRefinement,
     pub code_block: StyleRefinement,
     pub code_block_overflow_x_scroll: bool,
+    /// Shows a strip above fenced code blocks naming their language or file.
+    pub code_block_header: bool,
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
@@ -143,6 +145,7 @@ impl Default for MarkdownStyle {
             container_style: Default::default(),
             code_block: Default::default(),
             code_block_overflow_x_scroll: false,
+            code_block_header: false,
             inline_code: Default::default(),
             block_quote: Default::default(),
             link: Default::default(),
@@ -2929,6 +2932,22 @@ impl Element for MarkdownElement {
                                     // corner radii and borders to round the scrollbar track.
                                     parent_container.style().refine(&self.style.code_block);
 
+                                    if self.style.code_block_header
+                                        && let Some(label) = code_block_label(kind)
+                                    {
+                                        parent_container = parent_container.child(
+                                            div()
+                                                .pb_1()
+                                                .mb_1p5()
+                                                .border_b_1()
+                                                .border_color(cx.theme().colors().border_variant)
+                                                .text_xs()
+                                                .text_color(cx.theme().colors().text_muted)
+                                                .truncate()
+                                                .child(label),
+                                        );
+                                    }
+
                                     let parent_container: AnyDiv = if let Some(scroll_handle) =
                                         scroll_handle.as_ref()
                                     {
@@ -3261,7 +3280,9 @@ impl Element for MarkdownElement {
                                     })
                                     .gap_0p5()
                                     .absolute()
-                                    .bg(cx.theme().colors().editor_background)
+                                    .when(!self.style.code_block_header, |this| {
+                                        this.bg(cx.theme().colors().editor_background)
+                                    })
                                     .when_else(
                                         use_hover,
                                         |this| {
@@ -5295,6 +5316,27 @@ impl InputHandler for MarkdownInputHandler {
 
     fn accepts_text_input(&mut self, _: &mut Window, _: &mut App) -> bool {
         false
+    }
+}
+
+/// What a fenced code block's header says: its file and lines, or its language.
+fn code_block_label(kind: &CodeBlockKind) -> Option<SharedString> {
+    match kind {
+        CodeBlockKind::FencedLang(language) if !language.trim().is_empty() => {
+            Some(language.trim().to_string().into())
+        }
+        CodeBlockKind::FencedSrc(path_range) => {
+            let mut label = path_range.path.to_string();
+            if let Some(range) = &path_range.range {
+                if range.start.line == range.end.line {
+                    label.push_str(&format!(":{}", range.start.line));
+                } else {
+                    label.push_str(&format!(":{}-{}", range.start.line, range.end.line));
+                }
+            }
+            Some(label.into())
+        }
+        _ => None,
     }
 }
 
