@@ -39,6 +39,7 @@ use util::truncate_and_remove_front;
 use workspace::Workspace;
 
 use crate::AgentPanel;
+use crate::guests::GuestCandidate;
 use crate::mention_set::MentionSet;
 
 #[derive(Clone)]
@@ -291,6 +292,7 @@ impl PromptContextType {
 }
 
 pub(crate) enum Match {
+    Guest(GuestCandidate),
     File(FileMatch),
     Symbol(SymbolMatch),
     Thread(SessionMatch),
@@ -309,6 +311,8 @@ pub struct BranchDiffMatch {
 impl Match {
     pub fn score(&self) -> f64 {
         match self {
+            // Agents come before everything else.
+            Match::Guest(_) => f64::MAX,
             Match::File(file) => file.mat.score,
             Match::Entry(mode) => mode.mat.as_ref().map(|mat| mat.score).unwrap_or(1.),
             Match::Thread(_) => 1.,
@@ -456,6 +460,12 @@ pub trait PromptCompletionProviderDelegate: Send + Sync + 'static {
     fn supports_images(&self, cx: &App) -> bool;
 
     fn available_commands(&self, cx: &App) -> Vec<AvailableCommand>;
+
+    /// Agents the user can tag into this thread as guests.
+    fn available_guests(&self, _cx: &App) -> Vec<GuestCandidate> {
+        Vec::new()
+    }
+
     fn available_skills(&self, _cx: &App) -> Vec<AvailableSkill> {
         Vec::new()
     }
@@ -579,6 +589,48 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             icon_color: None,
             confirm: Some(confirm_completion_callback(
                 title,
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+            group: None,
+        }
+    }
+
+    fn completion_for_guest(
+        guest: GuestCandidate,
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        cx: &mut App,
+    ) -> Completion {
+        let uri = MentionUri::Guest {
+            agent_id: guest.agent_id.to_string(),
+            name: guest.name.to_string(),
+        };
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label: CodeLabel::plain(guest.name.to_string(), None),
+            documentation: Some(CompletionDocumentation::SingleLine(
+                format!("Only {} answers, as a guest in this thread", guest.name).into(),
+            )),
+            insert_text_mode: None,
+            source: project::CompletionSource::Custom,
+            match_start: None,
+            snippet_deduplication_key: None,
+            icon_path: Some(uri.icon_path(cx)),
+            icon_color: None,
+            confirm: Some(confirm_completion_callback(
+                guest.name,
                 source_range.start,
                 new_text_len - 1,
                 uri,
@@ -1181,8 +1233,10 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                     None
                 };
 
+                let guests = self.source.available_guests(cx);
                 cx.spawn(async move |_cx| {
-                    let mut matches = recent_task.await;
+                    let mut matches: Vec<Match> = guests.into_iter().map(Match::Guest).collect();
+                    matches.extend(recent_task.await);
                     matches.extend(entries);
 
                     if let Some(branch_diff_task) = branch_diff_task {
@@ -1216,12 +1270,20 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                     None
                 };
 
+                let guest_matches = self
+                    .source
+                    .available_guests(cx)
+                    .into_iter()
+                    .filter(|guest| {
+                        crate::forward::matches_in_order(&query, &guest.name)
+                            || crate::forward::matches_in_order(&query, guest.agent_id.as_ref())
+                    })
+                    .map(Match::Guest)
+                    .collect::<Vec<_>>();
+
                 cx.spawn(async move |cx| {
-                    let mut matches = search_files_task
-                        .await
-                        .into_iter()
-                        .map(Match::File)
-                        .collect::<Vec<_>>();
+                    let mut matches = guest_matches;
+                    matches.extend(search_files_task.await.into_iter().map(Match::File));
 
                     let entry_matches = fuzzy::match_strings(
                         &entry_candidates,
@@ -1728,12 +1790,13 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                     let mut matches = search_task.await;
                     if show_section_headers {
                         matches.sort_by_key(|mat| match mat {
+                            Match::Guest(_) => 0,
                             Match::File(FileMatch {
                                 is_recent: true, ..
                             })
-                            | Match::RecentThread(_) => 0,
-                            Match::Entry(_) | Match::BranchDiff(_) => 1,
-                            _ => 2,
+                            | Match::RecentThread(_) => 1,
+                            Match::Entry(_) | Match::BranchDiff(_) => 2,
+                            _ => 3,
                         });
                     }
 
@@ -1743,6 +1806,10 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                             .filter_map(|mat| {
                                 let group = if show_section_headers {
                                     match &mat {
+                                        Match::Guest(_) => Some(CompletionGroup {
+                                            key: "agents".into(),
+                                            label: None,
+                                        }),
                                         Match::File(FileMatch {
                                             is_recent: true, ..
                                         })
@@ -1807,6 +1874,15 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                             cx,
                                         )
                                     }
+                                    Match::Guest(guest) => Some(Self::completion_for_guest(
+                                        guest,
+                                        source_range.clone(),
+                                        source.clone(),
+                                        editor.clone(),
+                                        mention_set.clone(),
+                                        workspace.clone(),
+                                        cx,
+                                    )),
                                     Match::Thread(thread) => Some(Self::completion_for_thread(
                                         thread.session_id,
                                         Some(thread.title),

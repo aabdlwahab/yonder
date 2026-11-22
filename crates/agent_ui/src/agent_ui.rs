@@ -17,6 +17,7 @@ mod entry_view_state;
 mod external_source_prompt;
 mod favorite_models;
 mod forward;
+mod guests;
 pub use forward::set_thread_opener;
 mod inline_assistant;
 mod inline_prompt_editor;

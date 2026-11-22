@@ -171,9 +171,11 @@ impl MentionSet {
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. }
             | MentionUri::Rule { .. }
-            | MentionUri::Forward { .. } => {
+            | MentionUri::Forward { .. }
+            | MentionUri::GuestReply { .. } => {
                 Task::ready(Err(anyhow!("Unsupported mention URI type for paste")))
             }
+            MentionUri::Guest { .. } => Task::ready(Ok(Mention::Link)),
         }
     }
 
@@ -358,10 +360,11 @@ impl MentionSet {
                 debug_panic!("unexpected rule URI");
                 Task::ready(Err(anyhow!("unexpected rule URI")))
             }
-            MentionUri::Forward { .. } => {
-                debug_panic!("unexpected forward URI");
-                Task::ready(Err(anyhow!("unexpected forward URI")))
+            MentionUri::Forward { .. } | MentionUri::GuestReply { .. } => {
+                debug_panic!("unexpected forwarded text URI");
+                Task::ready(Err(anyhow!("unexpected forwarded text URI")))
             }
+            MentionUri::Guest { .. } => Task::ready(Ok(Mention::Link)),
         };
         let task = cx
             .spawn(async move |_, _| task.await.map_err(|e| e.to_string()))
