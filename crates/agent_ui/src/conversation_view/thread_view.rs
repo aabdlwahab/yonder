@@ -770,6 +770,11 @@ pub struct ThreadView {
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
+    /// When each thinking block and tool call started and how long it took,
+    /// seen from this view. Threads loaded from history have no timings.
+    step_timings: RefCell<HashMap<StepKey, StepTiming>>,
+    /// Whether the message box currently says "Queue another message…".
+    queue_placeholder_shown: bool,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
@@ -1322,6 +1327,8 @@ impl ThreadView {
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
+            step_timings: RefCell::new(HashMap::default()),
+            queue_placeholder_shown: false,
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
@@ -6827,54 +6834,75 @@ impl ThreadView {
             } else {
                 IconName::Send
             };
-            IconButton::new("send-message", send_icon)
-                .style(ButtonStyle::Filled)
+            let can_send = !(is_editor_empty && !is_generating);
+            div()
+                .rounded_full()
+                .p_0p5()
                 .map(|this| {
-                    if is_editor_empty && !is_generating {
-                        this.disabled(true).icon_color(Color::Muted)
+                    if can_send {
+                        this.bg(working_color())
                     } else {
-                        this.icon_color(Color::Accent)
+                        this.border_1().border_color(cx.theme().colors().border)
                     }
                 })
-                .tooltip(move |_window, cx| {
-                    if is_editor_empty && !is_generating {
-                        Tooltip::for_action("Type to Send", &Chat, cx)
-                    } else if is_generating {
-                        let focus_handle = focus_handle.clone();
+                .child(
+                    IconButton::new("send-message", send_icon)
+                        .shape(ui::IconButtonShape::Square)
+                        .style(ButtonStyle::Transparent)
+                        .map(|this| {
+                            if is_editor_empty && !is_generating {
+                                this.disabled(true).icon_color(Color::Muted)
+                            } else {
+                                this.icon_color(Color::Accent)
+                            }
+                        })
+                        .tooltip(move |_window, cx| {
+                            if is_editor_empty && !is_generating {
+                                Tooltip::for_action("Type to Send", &Chat, cx)
+                            } else if is_generating {
+                                let focus_handle = focus_handle.clone();
 
-                        Tooltip::element(move |_window, cx| {
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .justify_between()
-                                        .child(Label::new("Queue and Send"))
-                                        .child(KeyBinding::for_action_in(&Chat, &focus_handle, cx)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .pt_1()
-                                        .gap_2()
-                                        .justify_between()
-                                        .border_t_1()
-                                        .border_color(cx.theme().colors().border_variant)
-                                        .child(Label::new("Send Immediately"))
-                                        .child(KeyBinding::for_action_in(
-                                            &SendImmediately,
-                                            &focus_handle,
-                                            cx,
-                                        )),
-                                )
-                                .into_any_element()
-                        })(_window, cx)
-                    } else {
-                        Tooltip::for_action("Send Message", &Chat, cx)
-                    }
-                })
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.send(window, cx);
-                }))
+                                Tooltip::element(move |_window, cx| {
+                                    v_flex()
+                                        .gap_1()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .justify_between()
+                                                .child(Label::new("Queue and Send"))
+                                                .child(KeyBinding::for_action_in(
+                                                    &Chat,
+                                                    &focus_handle,
+                                                    cx,
+                                                )),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .pt_1()
+                                                .gap_2()
+                                                .justify_between()
+                                                .border_t_1()
+                                                .border_color(cx.theme().colors().border_variant)
+                                                .child(Label::new("Send Immediately"))
+                                                .child(KeyBinding::for_action_in(
+                                                    &SendImmediately,
+                                                    &focus_handle,
+                                                    cx,
+                                                )),
+                                        )
+                                        .into_any_element()
+                                })(_window, cx)
+                            } else {
+                                Tooltip::for_action("Send Message", &Chat, cx)
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.send(window, cx);
+                        }))
+                        .when(can_send, |this| {
+                            this.icon_color(Color::Custom(gpui::black()))
+                        }),
+                )
                 .into_any_element()
         }
     }
@@ -9874,6 +9902,93 @@ impl ThreadView {
         )
     }
 
+    /// Records when a step started and, once it's done, how long it took.
+    /// Returns the duration when known.
+    fn track_step(&self, key: StepKey, running: bool) -> Option<Duration> {
+        let mut timings = self.step_timings.borrow_mut();
+        if running {
+            timings.entry(key).or_insert(StepTiming {
+                started_at: Instant::now(),
+                duration: None,
+            });
+            return None;
+        }
+        let timing = timings.get_mut(&key)?;
+        Some(
+            *timing
+                .duration
+                .get_or_insert_with(|| timing.started_at.elapsed()),
+        )
+    }
+
+    /// A short result after a tool's target: how many lines it read or
+    /// results it found, whether it failed, and how long it took.
+    fn tool_call_meta(&self, tool_call: &ToolCall, cx: &App) -> Option<SharedString> {
+        let status = tool_call.status();
+        let running = matches!(
+            status,
+            ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::Paused
+        );
+        let duration = self.track_step(StepKey::Tool(tool_call.id.clone()), running);
+        let mut parts = Vec::new();
+        match status {
+            ToolCallStatus::Failed => parts.push("failed".to_string()),
+            ToolCallStatus::Rejected => parts.push("denied".to_string()),
+            ToolCallStatus::Completed => {
+                let output = tool_call
+                    .content()
+                    .iter()
+                    .filter_map(|content| match content {
+                        ToolCallContent::ContentBlock { block, .. } => block
+                            .markdown()
+                            .map(|markdown| markdown.read(cx).source().to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let lines = output
+                    .lines()
+                    .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with("```"))
+                    .count();
+                match tool_call.kind() {
+                    acp_v2::ToolKind::Read if lines > 0 => {
+                        parts.push(format!("{lines} line{}", if lines == 1 { "" } else { "s" }))
+                    }
+                    acp_v2::ToolKind::Search => parts.push(format!(
+                        "{lines} result{}",
+                        if lines == 1 { "" } else { "s" }
+                    )),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if let Some(duration) = duration.filter(|duration| duration.as_secs() >= 1) {
+            parts.push(duration_alt_display(duration));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · ").into())
+    }
+
+    /// While the agent works, the message box offers to queue the next message.
+    fn sync_queue_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let working = self.thread.read(cx).status() == ThreadStatus::Generating;
+        if working == self.queue_placeholder_shown {
+            return;
+        }
+        self.queue_placeholder_shown = working;
+        let placeholder = if working {
+            "Queue another message…".to_string()
+        } else {
+            placeholder_text(
+                self.agent_display_name.as_ref(),
+                self.session_capabilities.read().has_slash_completions(),
+            )
+        };
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(&placeholder, window, cx)
+        });
+    }
+
     /// Whether this thinking chunk is the one the agent is still writing.
     fn is_still_thinking(&self, entry_ix: usize, chunk_ix: usize, cx: &App) -> bool {
         let thread = self.thread.read(cx);
@@ -9986,10 +10101,22 @@ impl ThreadView {
                                     .text_size(self.tool_name_font_size())
                                     .italic()
                                     .text_color(agent_thought_color(cx))
-                                    .child(if self.is_still_thinking(entry_ix, chunk_ix, cx) {
-                                        "Thinking…"
-                                    } else {
-                                        "Thought"
+                                    .child({
+                                        let still_thinking =
+                                            self.is_still_thinking(entry_ix, chunk_ix, cx);
+                                        let duration = self.track_step(
+                                            StepKey::Thought(entry_ix, chunk_ix),
+                                            still_thinking,
+                                        );
+                                        match (still_thinking, duration) {
+                                            (true, _) => SharedString::from("Thinking…"),
+                                            (false, Some(duration)) => format!(
+                                                "Thought for {}",
+                                                duration_alt_display(duration)
+                                            )
+                                            .into(),
+                                            (false, None) => SharedString::from("Thought"),
+                                        }
                                     }),
                             ),
                     )
@@ -12776,6 +12903,10 @@ impl ThreadView {
         let tool_argument = tool_verb
             .filter(|_| !use_card_layout)
             .map(|verb| tool_argument_text(tool_call.label.read(cx).source(), verb));
+        let tool_meta = tool_argument
+            .is_some()
+            .then(|| self.tool_call_meta(tool_call, cx))
+            .flatten();
         let tool_icon = if interrupted_edit {
             div()
                 .child(DecoratedIcon::new(
@@ -12929,7 +13060,18 @@ impl ThreadView {
                     })
                     .into_any()
             })
-            .when(!is_edit, |this| this.child(gradient_overlay))
+            .when_some(tool_meta.clone(), |this, meta| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_size(self.tool_name_font_size())
+                        .text_color(cx.theme().colors().text_placeholder)
+                        .child(meta),
+                )
+            })
+            .when(!is_edit && tool_meta.is_none(), |this| {
+                this.child(gradient_overlay)
+            })
     }
 
     fn open_tool_call_location(
@@ -15177,6 +15319,9 @@ impl Render for ThreadView {
         // current availability of feedback/sharing, which can change between
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
+        if self.parent_session_id.is_none() {
+            self.sync_queue_placeholder(window, cx);
+        }
 
         let has_messages = self.has_visible_conversation(cx);
         let list_state = self.list_state.clone();
@@ -15960,6 +16105,17 @@ fn agent_tool_label_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 /// Orange like Claude Code's working star: a step that's still running.
 fn working_color() -> Hsla {
     gpui::rgb(0xd97757).into()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum StepKey {
+    Thought(usize, usize),
+    Tool(acp_v2::ToolCallId),
+}
+
+struct StepTiming {
+    started_at: Instant,
+    duration: Option<Duration>,
 }
 
 #[derive(Clone, Copy)]
