@@ -5659,6 +5659,7 @@ impl ThreadView {
 
         h_flex()
             .py_2()
+            .px_3()
             .bg(editor_bg_color)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
@@ -5679,6 +5680,10 @@ impl ThreadView {
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
                     .px_2()
+                    .py_1p5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
@@ -8273,7 +8278,20 @@ impl ThreadView {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
                         || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
+                    let is_first = !entries.last().is_some_and(|entry| {
+                        matches!(
+                            entry,
+                            AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_)
+                        ) && !entry.is_indented()
+                    });
+                    let rendered = render_timeline_step(
+                        rendered.into_any_element(),
+                        TimelineDot::Solid(working_color()),
+                        is_first,
+                        true,
+                        cx,
+                    );
+                    centered_container(rendered).into_any_element()
                 } else {
                     Empty.into_any()
                 }
@@ -8375,7 +8393,7 @@ impl ThreadView {
                                     .py_3()
                                     .when(compact_chat, |this| this.py_1p5())
                                     .px_2()
-                                    .rounded_md()
+                                    .rounded_lg()
                                     .bg(cx.theme().colors().editor_background)
                                     .border_1()
                                     .when(is_indented, |this| {
@@ -8699,14 +8717,12 @@ impl ThreadView {
             primary
         };
 
-        let primary = if self.is_agent_turn_start(entry_ix, entry, cx) {
-            v_flex()
-                .w_full()
-                .child(self.render_agent_turn_header(entry_ix))
-                .child(primary)
-                .into_any_element()
-        } else {
-            primary
+        let primary = match self.timeline_dot(entry, cx) {
+            Some(dot) if !is_indented && !self.is_subagent() && !assistant_message_is_blank => {
+                let (is_first, is_last) = self.timeline_edges(entry_ix, cx);
+                render_timeline_step(primary, dot, is_first, is_last, cx)
+            }
+            _ => primary,
         };
 
         let thread = self.thread.clone();
@@ -9576,11 +9592,32 @@ impl ThreadView {
         }
     }
 
-    /// What the agent is doing right now, for the indicator under the thread.
+    /// What the agent is doing right now, for the status line under the thread.
     fn activity_label(&self, cx: &App) -> &'static str {
         let thread = self.thread.read(cx);
-        if thread.has_in_progress_tool_calls() {
-            return "Running a tool";
+        let running_tool = thread.entries().iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call)
+                if matches!(
+                    tool_call.status(),
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                ) =>
+            {
+                Some(tool_call.kind())
+            }
+            _ => None,
+        });
+        if let Some(kind) = running_tool {
+            return match kind {
+                acp_v2::ToolKind::Read => "Reading",
+                acp_v2::ToolKind::Edit | acp_v2::ToolKind::Delete | acp_v2::ToolKind::Move => {
+                    "Editing"
+                }
+                acp_v2::ToolKind::Execute => "Running",
+                acp_v2::ToolKind::Search => "Searching",
+                acp_v2::ToolKind::Fetch => "Fetching",
+                acp_v2::ToolKind::Think => "Thinking",
+                _ => "Working",
+            };
         }
         match thread.entries().last() {
             Some(AgentThreadEntry::AssistantMessage(message))
@@ -9597,7 +9634,6 @@ impl ThreadView {
     }
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
-        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
         // The elapsed time always shows, so a long turn reads as still working.
         let elapsed_label = self.turn_fields.turn_started_at.and_then(|started_at| {
             let elapsed = started_at.elapsed();
@@ -9608,7 +9644,8 @@ impl ThreadView {
             !confirmation && self.is_blocked_on_terminal_command(cx);
         let is_waiting = confirmation || self.thread.read(cx).has_in_progress_tool_calls();
 
-        let turn_tokens_label = (show_stats && elapsed_label.is_some())
+        let turn_tokens_label = elapsed_label
+            .is_some()
             .then(|| {
                 self.turn_fields
                     .turn_tokens
@@ -9648,16 +9685,15 @@ impl ThreadView {
                     this
                 } else {
                     this.child(
-                        h_flex()
-                            .w_2()
-                            .justify_center()
-                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
+                        Label::new("✻")
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(working_color())),
                     )
                     .child(
                         div().min_w(rems(6.)).child(
                             LoadingLabel::new(self.activity_label(cx))
                                 .size(LabelSize::Small)
-                                .color(Color::Muted)
+                                .color(Color::Custom(working_color()))
                                 .single_line(),
                         ),
                     )
@@ -9684,6 +9720,13 @@ impl ThreadView {
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
+                )
+            })
+            .when(!confirmation, |this| {
+                this.child(
+                    Label::new("Esc to stop")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                 )
             })
             .into_any_element()
@@ -9777,41 +9820,52 @@ impl ThreadView {
             )
     }
 
-    /// The first entry the agent wrote after a user message.
-    fn is_agent_turn_start(&self, entry_ix: usize, entry: &AgentThreadEntry, cx: &App) -> bool {
-        if self.is_subagent() || entry.is_indented() {
-            return false;
+    /// The dot an entry gets on the turn's timeline, if it sits on one.
+    fn timeline_dot(&self, entry: &AgentThreadEntry, cx: &App) -> Option<TimelineDot> {
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        match entry {
+            AgentThreadEntry::AssistantMessage(message) => {
+                let only_thinking = message
+                    .chunks
+                    .iter()
+                    .all(|chunk| matches!(chunk, AssistantMessageChunk::Thought { .. }));
+                Some(if only_thinking {
+                    TimelineDot::Hollow
+                } else {
+                    TimelineDot::Solid(colors.text.opacity(0.8))
+                })
+            }
+            AgentThreadEntry::ToolCall(tool_call) => {
+                Some(TimelineDot::Solid(match tool_call.status() {
+                    ToolCallStatus::Completed => status.success,
+                    ToolCallStatus::Failed | ToolCallStatus::Rejected => status.error,
+                    ToolCallStatus::Canceled => colors.text_muted,
+                    ToolCallStatus::WaitingForConfirmation => status.warning,
+                    ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::Paused => working_color(),
+                }))
+            }
+            _ => None,
         }
-        if !matches!(
-            entry,
-            AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_)
-        ) {
-            return false;
-        }
-        let entries = self.thread.read(cx).entries();
-        entry_ix == 0
-            || matches!(
-                entries.get(entry_ix - 1),
-                Some(AgentThreadEntry::UserMessage(_))
-            )
     }
 
-    fn render_agent_turn_header(&self, entry_ix: usize) -> impl IntoElement {
-        let icon = match &self.agent_icon_from_external_svg {
-            Some(path) => Icon::from_external_svg(path.clone()),
-            None => Icon::new(self.agent_icon),
+    /// Whether the entry starts or ends its turn's timeline.
+    fn timeline_edges(&self, entry_ix: usize, cx: &App) -> (bool, bool) {
+        let entries = self.thread.read(cx).entries();
+        let on_timeline = |entry: &AgentThreadEntry| {
+            matches!(
+                entry,
+                AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_)
+            ) && !entry.is_indented()
         };
-        h_flex()
-            .id(("agent-turn-header", entry_ix))
-            .px_5()
-            .pt_2()
-            .gap_1p5()
-            .child(icon.size(IconSize::XSmall).color(Color::Muted))
-            .child(
-                Label::new(self.agent_display_name.clone())
-                    .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::SEMIBOLD),
-            )
+        let is_first = entry_ix == 0 || !entries.get(entry_ix - 1).is_some_and(on_timeline);
+        let is_last = match entries.get(entry_ix + 1) {
+            Some(next) => !on_timeline(next),
+            None => !self.generating_indicator_in_list,
+        };
+        (is_first, is_last)
     }
 
     fn render_thinking_block(
@@ -9859,13 +9913,9 @@ impl ThreadView {
                             .gap_1p5()
                             .overflow_hidden()
                             .child(
-                                Icon::new(IconName::ToolThink)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
                                 div()
                                     .text_size(self.tool_name_font_size())
+                                    .italic()
                                     .text_color(agent_thought_color(cx))
                                     .child(if self.is_still_thinking(entry_ix, chunk_ix, cx) {
                                         "Thinking…"
@@ -9877,8 +9927,7 @@ impl ThreadView {
                     .child(
                         Disclosure::new(("expand", entry_ix), is_open)
                             .opened_icon(IconName::ChevronUp)
-                            .closed_icon(IconName::ChevronDown)
-                            .visible_on_hover(&card_header_id)
+                            .closed_icon(IconName::ChevronRight)
                             .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                                 this.toggle_thinking_block_expansion(key, window, cx);
                             })),
@@ -12650,6 +12699,14 @@ impl ThreadView {
         };
 
         let interrupted_edit = is_file && has_failed && has_diff_changes;
+        // Outside cards, a tool reads as a bold verb and its target, the way
+        // Claude Code shows it; the timeline dot carries the status.
+        let tool_verb = (!is_subagent_tool_call)
+            .then(|| tool_verb(tool_call))
+            .flatten();
+        let tool_argument = tool_verb
+            .filter(|_| !use_card_layout)
+            .map(|verb| tool_argument_text(tool_call.label.read(cx).source(), verb));
         let tool_icon = if interrupted_edit {
             div()
                 .child(DecoratedIcon::new(
@@ -12675,6 +12732,8 @@ impl ThreadView {
                 .size(IconSize::Small)
                 .color(Color::Muted)
                 .into_any_element()
+        } else if !use_card_layout && tool_verb.is_some() {
+            Empty.into_any_element()
         } else {
             Icon::new(match tool_call.kind() {
                 acp_v2::ToolKind::Read => IconName::ToolSearch,
@@ -12746,8 +12805,12 @@ impl ThreadView {
                     )
                     .child(tool_icon),
             )
-            .when(!use_card_layout, |this| {
-                this.children(tool_call_status_mark(tool_call.status()))
+            .when_some(tool_verb.filter(|_| !use_card_layout), |this, verb| {
+                this.child(
+                    Label::new(verb)
+                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                        .weight(gpui::FontWeight::SEMIBOLD),
+                )
             })
             .child(if has_location {
                 h_flex()
@@ -12760,14 +12823,21 @@ impl ThreadView {
                             this.text_color(cx.theme().colors().text_muted)
                         }
                     })
-                    .child(self.render_markdown(
-                        tool_call.label.clone(),
-                        MarkdownStyle {
-                            prevent_mouse_interaction: true,
-                            ..agent_tool_label_markdown_style(window, cx)
-                        },
-                        cx,
-                    ))
+                    .child(match &tool_argument {
+                        Some(argument) => {
+                            render_tool_argument(argument.clone(), self.tool_name_font_size(), cx)
+                        }
+                        None => self
+                            .render_markdown(
+                                tool_call.label.clone(),
+                                MarkdownStyle {
+                                    prevent_mouse_interaction: true,
+                                    ..agent_tool_label_markdown_style(window, cx)
+                                },
+                                cx,
+                            )
+                            .into_any_element(),
+                    })
                     .tooltip(Tooltip::text("Go to File"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_tool_call_location(entry_ix, 0, window, cx);
@@ -12776,11 +12846,18 @@ impl ThreadView {
             } else {
                 h_flex()
                     .w_full()
-                    .child(self.render_markdown(
-                        tool_call.label.clone(),
-                        agent_tool_label_markdown_style(window, cx),
-                        cx,
-                    ))
+                    .child(match &tool_argument {
+                        Some(argument) => {
+                            render_tool_argument(argument.clone(), self.tool_name_font_size(), cx)
+                        }
+                        None => self
+                            .render_markdown(
+                                tool_call.label.clone(),
+                                agent_tool_label_markdown_style(window, cx),
+                                cx,
+                            )
+                            .into_any_element(),
+                    })
                     .into_any()
             })
             .when(!is_edit, |this| this.child(gradient_overlay))
@@ -15811,19 +15888,116 @@ fn agent_tool_label_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     style
 }
 
-/// A ✓ or ✗ in front of finished tool calls.
-fn tool_call_status_mark(status: ToolCallStatus) -> Option<AnyElement> {
-    let (icon, color) = match status {
-        ToolCallStatus::Completed => (IconName::Check, Color::Success),
-        ToolCallStatus::Failed | ToolCallStatus::Rejected => (IconName::XCircle, Color::Error),
-        _ => return None,
-    };
-    Some(
+/// Orange like Claude Code's working star: a step that's still running.
+fn working_color() -> Hsla {
+    gpui::rgb(0xd97757).into()
+}
+
+#[derive(Clone, Copy)]
+enum TimelineDot {
+    Solid(Hsla),
+    Hollow,
+}
+
+const TIMELINE_INSET: Pixels = px(16.);
+const TIMELINE_DOT_LEFT: Pixels = px(20.);
+const TIMELINE_DOT_TOP: Pixels = px(11.);
+const TIMELINE_DOT_SIZE: Pixels = px(8.);
+
+/// Puts an agent step on its turn's timeline: a thin line down the left with
+/// a dot whose colour is the step's state.
+fn render_timeline_step(
+    content: AnyElement,
+    dot: TimelineDot,
+    is_first: bool,
+    is_last: bool,
+    cx: &App,
+) -> AnyElement {
+    let colors = cx.theme().colors();
+    let dot_center = TIMELINE_DOT_TOP + TIMELINE_DOT_SIZE / 2.;
+    let line = (!(is_first && is_last)).then(|| {
         div()
-            .flex_none()
-            .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-            .into_any_element(),
-    )
+            .absolute()
+            .left(TIMELINE_DOT_LEFT + TIMELINE_DOT_SIZE / 2. - px(0.5))
+            .w_px()
+            .bg(colors.border)
+            .map(|line| {
+                if is_first {
+                    line.top(dot_center).bottom_0()
+                } else if is_last {
+                    line.top_0().h(dot_center)
+                } else {
+                    line.top_0().bottom_0()
+                }
+            })
+    });
+    let dot_element = div()
+        .absolute()
+        .left(TIMELINE_DOT_LEFT)
+        .top(TIMELINE_DOT_TOP)
+        .size(TIMELINE_DOT_SIZE)
+        .rounded_full()
+        .map(|element| match dot {
+            TimelineDot::Solid(color) => element.bg(color),
+            TimelineDot::Hollow => element
+                .border_1()
+                .border_color(colors.text_muted)
+                .bg(colors.panel_background),
+        });
+    div()
+        .relative()
+        .w_full()
+        .pl(TIMELINE_INSET)
+        .child(content)
+        .children(line)
+        .child(dot_element)
+        .into_any_element()
+}
+
+/// The verb a tool call shows in front of its target.
+fn tool_verb(tool_call: &ToolCall) -> Option<&'static str> {
+    Some(match tool_call.kind() {
+        acp_v2::ToolKind::Read => "Read",
+        acp_v2::ToolKind::Edit => "Edit",
+        acp_v2::ToolKind::Delete => "Delete",
+        acp_v2::ToolKind::Move => "Move",
+        acp_v2::ToolKind::Search => "Search",
+        acp_v2::ToolKind::Execute => "Bash",
+        acp_v2::ToolKind::Fetch => "Fetch",
+        acp_v2::ToolKind::Think => "Think",
+        _ => return None,
+    })
+}
+
+/// A tool's target from its title, without the verb the title often repeats.
+fn tool_argument_text(label: &str, verb: &str) -> String {
+    let text = label.replace('`', "");
+    let text = text.trim();
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    let repeats_verb = first_word.eq_ignore_ascii_case(verb)
+        || (verb == "Bash"
+            && matches!(
+                first_word.to_ascii_lowercase().as_str(),
+                "run" | "ran" | "running" | "bash"
+            ));
+    let rest = if repeats_verb {
+        text[first_word.len()..].trim_start()
+    } else {
+        text
+    };
+    rest.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn render_tool_argument(argument: String, font_size: Rems, cx: &App) -> AnyElement {
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .text_size(font_size)
+        .text_color(cx.theme().colors().text_muted)
+        .font_buffer(cx)
+        .truncate()
+        .child(argument)
+        .into_any_element()
 }
 
 /// A stable colour for each guest agent.
@@ -15855,6 +16029,28 @@ fn plain_mentions(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::tool_argument_text;
+
+    #[test]
+    fn tool_argument_drops_the_repeated_verb() {
+        assert_eq!(
+            tool_argument_text("Read src/main.rs", "Read"),
+            "src/main.rs"
+        );
+        assert_eq!(
+            tool_argument_text("`cargo test -p auth`", "Bash"),
+            "cargo test -p auth"
+        );
+        assert_eq!(
+            tool_argument_text("Run cargo   build\n--release", "Bash"),
+            "cargo build --release"
+        );
+        assert_eq!(
+            tool_argument_text("grep refresh src", "Search"),
+            "grep refresh src"
+        );
+    }
+
     use super::*;
     use acp_thread::MessageContent;
     use gpui::UpdateGlobal;
