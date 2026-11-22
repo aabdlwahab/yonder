@@ -1428,23 +1428,74 @@ fn read_proxy_settings(cx: &mut Context<HeadlessProject>) -> Option<Url> {
 
 fn cleanup_old_binaries() -> Result<()> {
     let server_dir = paths::remote_server_dir_relative();
-    let release_channel = release_channel::RELEASE_CHANNEL.dev_name();
-    let prefix = format!("zed-remote-server-{}-", release_channel);
+    let own_name = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default();
+    let file_names = std::fs::read_dir(server_dir.as_std_path())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
 
-    for entry in std::fs::read_dir(server_dir.as_std_path())? {
-        let path = entry?.path();
-
-        if let Some(file_name) = path.file_name()
-            && let Some(version) = file_name.to_string_lossy().strip_prefix(&prefix)
-            && !is_new_version(version)
-            && !is_file_in_use(file_name)
-        {
-            log::info!("removing old remote server binary: {:?}", path);
-            std::fs::remove_file(&path)?;
+    for file_name in binaries_to_remove(
+        &file_names,
+        &own_name,
+        release_channel::RELEASE_CHANNEL.dev_name(),
+        env!("ZED_PKG_VERSION"),
+    ) {
+        if is_file_in_use(OsStr::new(&file_name)) {
+            continue;
         }
+        let path = server_dir.as_std_path().join(&file_name);
+        log::info!("removing old remote server binary: {:?}", path);
+        std::fs::remove_file(&path)?;
     }
 
     Ok(())
+}
+
+/// Which server binaries in the server folder are safe to delete.
+///
+/// - Older versions of this server's own channel go, as upstream does.
+/// - Names whose version isn't a version number stay: `dev-build` is Yonder
+///   Dev's server, and `-upload-` files are uploads in progress. Deleting
+///   Yonder Dev's server made it upload itself again after every Yonder.app
+///   connection.
+/// - Yonder.app runs a dev-channel build under the stable name, with the
+///   commit in the version. When this server is one of those, the other
+///   stable copies are earlier installs and go too.
+fn binaries_to_remove(
+    file_names: &[String],
+    own_name: &str,
+    channel: &str,
+    current_version: &str,
+) -> Vec<String> {
+    const SERVER_PREFIX: &str = "zed-remote-server-";
+    let channel_prefix = format!("{SERVER_PREFIX}{channel}-");
+    let stable_prefix = format!("{SERVER_PREFIX}stable-");
+    let runs_as_stable_copy = channel != "stable" && own_name.starts_with(&stable_prefix);
+    let current_version = semver::Version::from_str(current_version).ok();
+
+    file_names
+        .iter()
+        .filter(|name| name.as_str() != own_name)
+        .filter(|name| {
+            if let Some(version) = name.strip_prefix(&channel_prefix) {
+                return semver::Version::from_str(version)
+                    .ok()
+                    .zip(current_version.as_ref())
+                    .is_some_and(|(version, current)| version < *current);
+            }
+            runs_as_stable_copy
+                && name.starts_with(&stable_prefix)
+                && !name.contains("-upload-")
+                && !name.ends_with(".gz")
+        })
+        .cloned()
+        .collect()
 }
 
 // Remove this once 223 goes stable, we only have this to clean up old binaries on WSL
@@ -1454,13 +1505,6 @@ fn cleanup_old_binaries_wsl() {
     if let Ok(()) = std::fs::remove_dir_all(server_dir.as_std_path()) {
         log::info!("removing old wsl remote server folder: {:?}", server_dir);
     }
-}
-
-fn is_new_version(version: &str) -> bool {
-    semver::Version::from_str(version)
-        .ok()
-        .zip(semver::Version::from_str(env!("ZED_PKG_VERSION")).ok())
-        .is_some_and(|(version, current_version)| version >= current_version)
 }
 
 fn is_file_in_use(file_name: &OsStr) -> bool {
@@ -1483,6 +1527,59 @@ fn is_file_in_use(file_name: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn stable_copy_keeps_the_dev_server() {
+        let files = names(&[
+            "zed-remote-server-dev-build",
+            "zed-remote-server-dev-build-upload-123.gz",
+            "zed-remote-server-stable-1.30.0+stable.aaa",
+            "zed-remote-server-stable-1.30.0+stable.bbb",
+        ]);
+        assert_eq!(
+            binaries_to_remove(
+                &files,
+                "zed-remote-server-stable-1.30.0+stable.bbb",
+                "dev",
+                "1.30.0"
+            ),
+            names(&["zed-remote-server-stable-1.30.0+stable.aaa"])
+        );
+    }
+
+    #[test]
+    fn dev_server_leaves_stable_copies_alone() {
+        let files = names(&[
+            "zed-remote-server-dev-build",
+            "zed-remote-server-stable-1.30.0+stable.aaa",
+        ]);
+        assert!(
+            binaries_to_remove(&files, "zed-remote-server-dev-build", "dev", "1.30.0").is_empty()
+        );
+    }
+
+    #[test]
+    fn older_versions_of_the_own_channel_go() {
+        let files = names(&[
+            "zed-remote-server-stable-1.29.0",
+            "zed-remote-server-stable-1.30.0",
+            "zed-remote-server-stable-1.31.0",
+            "zed-remote-server-preview-1.20.0",
+        ]);
+        assert_eq!(
+            binaries_to_remove(
+                &files,
+                "zed-remote-server-stable-1.30.0",
+                "stable",
+                "1.30.0"
+            ),
+            names(&["zed-remote-server-stable-1.29.0"])
+        );
+    }
 
     #[cfg(unix)]
     mod unix {
