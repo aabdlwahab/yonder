@@ -82,6 +82,18 @@ pub enum MentionUri {
         title: String,
         agent: String,
     },
+    /// Tags another agent into the thread: only that agent answers the
+    /// message, as a guest. The tag itself isn't sent to anyone.
+    Guest {
+        agent_id: String,
+        name: String,
+    },
+    /// A guest's answer, carried into the owner's next turn. The text travels
+    /// with the mention, like a forward.
+    GuestReply {
+        session_id: acp::SessionId,
+        agent: String,
+    },
 }
 
 impl MentionUri {
@@ -167,6 +179,19 @@ impl MentionUri {
                         session_id: acp::SessionId::new(session_id),
                         title: query_param(&url, "title").unwrap_or_default(),
                         agent: query_param(&url, "agent").context("Missing forwarding agent")?,
+                    })
+                } else if path == "/agent/guest" {
+                    validate_query_params(&url, &["id", "name"])?;
+                    let agent_id = query_param(&url, "id").context("Missing guest agent id")?;
+                    Ok(Self::Guest {
+                        name: query_param(&url, "name").unwrap_or_else(|| agent_id.clone()),
+                        agent_id,
+                    })
+                } else if let Some(session_id) = path.strip_prefix("/agent/guest-reply/") {
+                    validate_query_params(&url, &["agent"])?;
+                    Ok(Self::GuestReply {
+                        session_id: acp::SessionId::new(session_id),
+                        agent: query_param(&url, "agent").context("Missing guest agent")?,
                     })
                 } else if let Some(rule_id) = path.strip_prefix("/agent/rule/") {
                     // Deprecated: parses legacy rule mentions.
@@ -344,7 +369,9 @@ impl MentionUri {
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
             | MentionUri::MergeConflict { .. }
-            | MentionUri::Forward { .. } => None,
+            | MentionUri::Forward { .. }
+            | MentionUri::Guest { .. }
+            | MentionUri::GuestReply { .. } => None,
         }
     }
 
@@ -383,6 +410,8 @@ impl MentionUri {
             MentionUri::Fetch { url } => url.to_string(),
             MentionUri::Skill { name, .. } => name.clone(),
             MentionUri::Forward { agent, .. } => format!("From {agent}"),
+            MentionUri::Guest { name, .. } => name.clone(),
+            MentionUri::GuestReply { agent, .. } => format!("{agent}'s reply"),
         }
     }
 
@@ -450,6 +479,13 @@ impl MentionUri {
                 Some(format!("Forwarded from {agent} in \u{201c}{title}\u{201d}").into())
             }
             MentionUri::Forward { agent, .. } => Some(format!("Forwarded from {agent}").into()),
+            MentionUri::Guest { name, .. } => {
+                Some(format!("Only {name} answers this message, as a guest").into())
+            }
+            MentionUri::GuestReply { agent, .. } => Some(
+                format!("Includes {agent}'s answer from this thread. Delete it to leave it out.")
+                    .into(),
+            ),
             _ => None,
         }
     }
@@ -473,6 +509,8 @@ impl MentionUri {
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
             MentionUri::Forward { .. } => IconName::ArrowUpRight.path().into(),
+            MentionUri::Guest { .. } => IconName::UserGroup.path().into(),
+            MentionUri::GuestReply { .. } => IconName::Quote.path().into(),
         }
     }
 
@@ -614,6 +652,20 @@ impl MentionUri {
                 url.query_pairs_mut()
                     .append_pair("title", title)
                     .append_pair("agent", agent);
+                url
+            }
+            MentionUri::Guest { agent_id, name } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path("/agent/guest");
+                url.query_pairs_mut()
+                    .append_pair("id", agent_id)
+                    .append_pair("name", name);
+                url
+            }
+            MentionUri::GuestReply { session_id, agent } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path(&format!("/agent/guest-reply/{session_id}"));
+                url.query_pairs_mut().append_pair("agent", agent);
                 url
             }
         }

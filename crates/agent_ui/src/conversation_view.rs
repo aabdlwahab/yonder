@@ -4993,6 +4993,90 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_guest_answers_without_touching_the_owner_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_action(|thread, cx| {
+            thread.upsert_assistant_message(
+                acp_v2::AgentMessage::new("owner-answer")
+                    .content(vec!["Take a row lock in refresh().".into()]),
+                cx,
+            )
+        });
+        let (conversation_view, cx) =
+            setup_full_size_conversation_and_send(connection.clone(), "fix the race", cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let owner_entries =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
+
+        // The guest runs on its own stub connection, which gives the default answer.
+        thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.update(cx, |editor, cx| {
+                editor.set_text("which fix is safer?", window, cx)
+            });
+            view.send_to_guests(
+                vec![crate::guests::GuestCandidate {
+                    agent_id: AgentId("stub".into()),
+                    name: "Codex".into(),
+                }],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).entries().len(), owner_entries);
+            let guests = view.guests.as_ref().expect("guests attached").read(cx);
+            let [exchange] = guests.exchanges() else {
+                panic!("expected one exchange");
+            };
+            assert_eq!(exchange.anchor, owner_entries);
+            assert_eq!(exchange.prompt.read(cx).source(), "which fix is safer?");
+            let [reply] = exchange.replies.as_slice() else {
+                panic!("expected one reply");
+            };
+            assert_eq!(reply.status, crate::guests::ReplyStatus::Done);
+            assert_eq!(reply.markdown.read(cx).source(), "Default response");
+            let editor_text = view.message_editor.read(cx).text(cx);
+            assert!(
+                editor_text.contains("zed:///agent/guest-reply/"),
+                "message box: {editor_text}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_guest_needs_a_conversation_first(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.message_editor.update(cx, |editor, cx| {
+                editor.set_text("which fix is safer?", window, cx)
+            });
+            view.send_to_guests(
+                vec![crate::guests::GuestCandidate {
+                    agent_id: AgentId("stub".into()),
+                    name: "Codex".into(),
+                }],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.thread_error.is_some());
+            assert!(view.guests.is_none());
+            assert_eq!(view.message_editor.read(cx).text(cx), "which fix is safer?");
+        });
+    }
+
+    #[gpui::test]
     async fn test_forward_with_send_now_sends_it(cx: &mut TestAppContext) {
         init_test(cx);
 

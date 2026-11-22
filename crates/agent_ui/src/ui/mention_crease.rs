@@ -209,6 +209,7 @@ fn open_mention_uri(
                 )
             });
         }
+        MentionUri::Guest { .. } | MentionUri::GuestReply { .. } => {}
         MentionUri::Skill {
             skill_file_path, ..
         } => {

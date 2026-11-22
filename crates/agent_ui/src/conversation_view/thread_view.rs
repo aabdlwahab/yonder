@@ -817,6 +817,9 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    /// Agents tagged into this thread and what they answered.
+    pub(crate) guests: Option<Entity<crate::guests::ThreadGuests>>,
+    _guest_subscriptions: Vec<Subscription>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1356,6 +1359,8 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            guests: None,
+            _guest_subscriptions: Vec::new(),
         };
 
         this.sync_reported_activity(cx);
@@ -1384,6 +1389,22 @@ impl ThreadView {
                     });
                 });
             });
+
+        if this.parent_session_id.is_none() {
+            this.refresh_guest_candidates(cx);
+            if let Some(project) = this.project.upgrade() {
+                let agent_server_store = project.read(cx).agent_server_store().clone();
+                this._guest_subscriptions.push(cx.subscribe(
+                    &agent_server_store,
+                    |this, _, _: &project::AgentServersUpdated, cx| {
+                        this.refresh_guest_candidates(cx)
+                    },
+                ));
+            }
+            if !this.thread.read(cx).is_draft_thread() {
+                this.attach_guests(window, cx);
+            }
+        }
 
         if should_auto_submit {
             this.send(window, cx);
@@ -2225,6 +2246,13 @@ impl ThreadView {
 
         let message_editor = self.message_editor.clone();
 
+        let guest_tags = message_editor.read(cx).guest_tags(cx);
+        if !guest_tags.is_empty() && self.parent_session_id.is_none() {
+            cx.emit(AcpThreadViewEvent::Interacted);
+            self.send_to_guests(guest_tags, window, cx);
+            return;
+        }
+
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
         let is_generating = thread.read(cx).status() == ThreadStatus::Generating;
 
@@ -2745,6 +2773,9 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        if let Some(guests) = &self.guests {
+            guests.update(cx, |guests, cx| guests.stop_all(cx));
+        }
         self.thread_retry_status.take();
         self.thread_error.take();
         self.message_queue.pause();
@@ -5718,6 +5749,7 @@ impl ThreadView {
                                     .flex_wrap()
                                     .gap_1()
                                     .children(self.render_activity_status_label(cx))
+                                    .children(self.render_guest_recipient_label(cx))
                                     .children(discard_draft_button)
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
@@ -6743,7 +6775,14 @@ impl ThreadView {
         let is_editor_empty = message_editor.is_empty(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        let is_tagged = !message_editor.guest_tags(cx).is_empty();
+        let guests_working = self
+            .guests
+            .as_ref()
+            .is_some_and(|guests| guests.read(cx).is_working());
+        // A tagged message goes to its guests right away instead of waiting
+        // in the owner's queue.
+        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating && !is_tagged;
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
 
         if self.is_loading_contents {
@@ -6753,7 +6792,7 @@ impl ThreadView {
                 .tooltip(Tooltip::text("Loading Added Context…"))
                 .child(loading_contents_spinner(IconSize::default()))
                 .into_any_element()
-        } else if (is_generating || is_unconfirmed) && is_editor_empty {
+        } else if (is_generating || is_unconfirmed || guests_working) && is_editor_empty {
             IconButton::new("stop-generation", IconName::Stop)
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(TintColor::Error))
@@ -7165,6 +7204,438 @@ impl ThreadView {
                 crate::forward::open_forward_picker(source, workspace, window, cx)
             });
         });
+    }
+
+    /// Agents that can be tagged into this thread: every agent set up for this
+    /// project except the one that owns the thread.
+    fn refresh_guest_candidates(&self, cx: &mut Context<Self>) {
+        let candidates = self
+            .fork_targets(cx)
+            .into_iter()
+            .filter(|(agent_id, _)| *agent_id != self.agent_id)
+            .map(|(agent_id, name)| crate::guests::GuestCandidate { agent_id, name })
+            .collect();
+        self.message_editor
+            .read(cx)
+            .set_guest_candidates(candidates);
+    }
+
+    fn attach_guests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::guests::ThreadGuests>> {
+        if let Some(guests) = &self.guests {
+            return Some(guests.clone());
+        }
+        let project = self.project.upgrade()?;
+        let session_id = self.thread.read(cx).session_id().clone();
+        let guests = crate::guests::guests_for(&session_id, &project, cx);
+        self._guest_subscriptions
+            .push(cx.observe(&guests, |this, _, cx| {
+                this.remeasure_guest_entries(cx);
+                cx.notify();
+            }));
+        self._guest_subscriptions.push(cx.subscribe_in(
+            &guests,
+            window,
+            |this, _, _: &crate::guests::ThreadGuestsEvent, window, cx| {
+                this.deliver_guest_replies(window, cx)
+            },
+        ));
+        self.guests = Some(guests.clone());
+        cx.defer_in(window, |this, window, cx| {
+            this.remeasure_guest_entries(cx);
+            this.deliver_guest_replies(window, cx);
+        });
+        Some(guests)
+    }
+
+    /// Puts finished guest answers into the message box, so the owner gets
+    /// them with the next message unless the user deletes them.
+    fn deliver_guest_replies(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(guests) = self.guests.clone() else {
+            return;
+        };
+        let replies = guests.update(cx, |guests, _| guests.take_undelivered());
+        for reply in replies {
+            self.message_editor.update(cx, |editor, cx| {
+                editor.append_message(crate::guests::reply_blocks(&reply), Some("\n"), window, cx)
+            });
+        }
+    }
+
+    /// The entry each exchange shows under.
+    fn guest_anchor_entry(anchor: usize, total_entries: usize) -> Option<usize> {
+        (total_entries > 0).then(|| anchor.clamp(1, total_entries) - 1)
+    }
+
+    fn remeasure_guest_entries(&self, cx: &App) {
+        let Some(guests) = &self.guests else {
+            return;
+        };
+        let total_entries = self.thread.read(cx).entries().len();
+        let entries: HashSet<usize> = guests
+            .read(cx)
+            .exchanges()
+            .iter()
+            .filter_map(|exchange| Self::guest_anchor_entry(exchange.anchor, total_entries))
+            .collect();
+        for entry_ix in entries {
+            self.list_state.remeasure_items(entry_ix..entry_ix + 1);
+        }
+        if self.list_state.is_following_tail() {
+            self.list_state.scroll_to_end();
+        }
+    }
+
+    /// Sends a tagged message to its guests instead of the owner.
+    pub(crate) fn send_to_guests(
+        &mut self,
+        tags: Vec<crate::guests::GuestCandidate>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread.read(cx).entries().is_empty() {
+            self.handle_thread_error(
+                anyhow!(
+                    "Start the conversation with {} first, then tag another agent into it.",
+                    self.agent_display_name
+                ),
+                cx,
+            );
+            return;
+        }
+        let Some(guests) = self.attach_guests(window, cx) else {
+            return;
+        };
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let Some(connection_store) = self
+            .server_view
+            .upgrade()
+            .map(|view| view.read(cx).connection_store.clone())
+        else {
+            return;
+        };
+        let work_dirs = self
+            .thread
+            .read(cx)
+            .work_dirs()
+            .cloned()
+            .unwrap_or_else(|| project.read(cx).default_path_list(cx));
+        let owner = crate::guests::OwnerContext {
+            owner_name: self.agent_display_name.clone(),
+            entries: self
+                .thread
+                .read(cx)
+                .entries()
+                .iter()
+                .map(|entry| entry.to_markdown(cx))
+                .collect(),
+            project,
+            work_dirs,
+            connection_store,
+        };
+        let prompt_text = plain_mentions(&self.message_editor.read(cx).text(cx));
+        let message_editor = self.message_editor.clone();
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        self.thread_error.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let (blocks, _) = contents.await?;
+            this.update_in(cx, |this, window, cx| {
+                let mut prompt = Vec::new();
+                let mut kept_replies = Vec::new();
+                for block in blocks {
+                    match crate::guests::guest_tag(&block) {
+                        Some(MentionUri::Guest { .. }) => {}
+                        Some(_) => kept_replies.push(block),
+                        None => prompt.push(block),
+                    }
+                }
+                message_editor.update(cx, |editor, cx| {
+                    editor.clear(window, cx);
+                    // Answers waiting for the owner stay in the box for it.
+                    for reply in kept_replies {
+                        editor.append_message(
+                            vec![
+                                reply,
+                                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(" ")),
+                            ],
+                            Some("\n"),
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                guests.update(cx, |guests, cx| {
+                    guests.ask(tags, prompt_text, prompt, owner, cx)
+                });
+                this.list_state.scroll_to_end();
+                this.remeasure_guest_entries(cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_guest_recipient_label(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let tags = self.message_editor.read(cx).guest_tags(cx);
+        if tags.is_empty() {
+            return None;
+        }
+        let names = tags
+            .iter()
+            .map(|tag| tag.name.to_string())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let tooltip = if tags.len() == 1 {
+            format!(
+                "Only {names} answers this message, as a guest. {} sees the answer on its next turn.",
+                self.agent_display_name
+            )
+        } else {
+            format!(
+                "Only {names} answer this message, as guests. {} sees their answers on its next turn.",
+                self.agent_display_name
+            )
+        };
+        Some(
+            div()
+                .id("guest-recipients")
+                .child(
+                    Label::new(format!("To {names}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+                .tooltip(Tooltip::text(tooltip)),
+        )
+    }
+
+    /// The guest exchanges that show under the entry at `entry_ix`.
+    fn render_guest_exchanges(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let Some(guests_entity) = &self.guests else {
+            return Vec::new();
+        };
+        let guests = guests_entity.read(cx);
+        let exchanges = guests.exchanges();
+        let latest_by_agent = |agent_id: &AgentId| {
+            exchanges.iter().rposition(|exchange| {
+                exchange
+                    .replies
+                    .iter()
+                    .any(|reply| &reply.agent_id == agent_id)
+            })
+        };
+        let approvals = guests.approvals(cx);
+        let colors = cx.theme().colors();
+        let mut elements = Vec::new();
+        for (exchange_ix, exchange) in exchanges.iter().enumerate() {
+            if Self::guest_anchor_entry(exchange.anchor, total_entries) != Some(entry_ix) {
+                continue;
+            }
+            let prompt = div()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .text_ui_sm(cx)
+                .child(self.render_markdown(
+                    exchange.prompt.clone(),
+                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                    cx,
+                ));
+            let replies = exchange
+                .replies
+                .iter()
+                .enumerate()
+                .map(|(reply_ix, reply)| {
+                    let accent = cx
+                        .theme()
+                        .players()
+                        .color_for_participant(guest_color_index(&reply.agent_id))
+                        .cursor;
+                    let is_latest = latest_by_agent(&reply.agent_id) == Some(exchange_ix);
+                    let read_only = guests.is_read_only(&reply.agent_id);
+                    let status: Option<AnyElement> = match &reply.status {
+                        crate::guests::ReplyStatus::Connecting => Some(
+                            Label::new("starting…")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        ),
+                        crate::guests::ReplyStatus::Working => Some(
+                            Label::new("thinking…")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        ),
+                        crate::guests::ReplyStatus::WaitingForApproval => Some(
+                            Label::new("waiting for your approval")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning)
+                                .into_any_element(),
+                        ),
+                        crate::guests::ReplyStatus::Stopped => Some(
+                            Label::new("stopped")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        ),
+                        crate::guests::ReplyStatus::Failed(_)
+                        | crate::guests::ReplyStatus::Done => None,
+                    };
+                    let mode_label = if read_only {
+                        "guest · read-only"
+                    } else {
+                        "guest · can edit"
+                    };
+                    let toggle =
+                        is_latest.then(|| {
+                            let agent_id = reply.agent_id.clone();
+                            let guests = guests_entity.clone();
+                            Button::new(
+                        SharedString::from(format!("guest-mode-{exchange_ix}-{reply_ix}")),
+                        if read_only { "Let It Edit" } else { "Make Read-Only" },
+                    )
+                    .label_size(LabelSize::XSmall)
+                    .style(ButtonStyle::Subtle)
+                    .tooltip(Tooltip::text(if read_only {
+                        "Let this guest change files and run commands, like the thread's owner"
+                    } else {
+                        "Only let this guest read and answer"
+                    }))
+                    .on_click(move |_, _, cx| {
+                        guests.update(cx, |guests, cx| {
+                            guests.set_read_only(&agent_id, !read_only, cx)
+                        })
+                    })
+                        });
+                    let header = h_flex()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::UserGroup)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(reply.agent_name.clone()).size(LabelSize::Small))
+                        .child(
+                            Label::new(mode_label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .children(status)
+                        .child(div().flex_1())
+                        .children(toggle);
+                    let body = (!reply.markdown.read(cx).source().is_empty()).then(|| {
+                        div().text_ui(cx).child(self.render_markdown(
+                            reply.markdown.clone(),
+                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                            cx,
+                        ))
+                    });
+                    let error = match &reply.status {
+                        crate::guests::ReplyStatus::Failed(error) => Some(
+                            Label::new(error.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        ),
+                        _ => None,
+                    };
+                    let approval_rows = approvals
+                        .iter()
+                        .filter(|approval| is_latest && approval.agent_id == reply.agent_id)
+                        .enumerate()
+                        .map(|(approval_ix, approval)| {
+                            let allow = {
+                                let guests = guests_entity.clone();
+                                let agent_id = reply.agent_id.clone();
+                                move |allow: bool, cx: &mut App| {
+                                    guests.update(cx, |guests, cx| {
+                                        let approvals = guests.approvals(cx);
+                                        if let Some(approval) = approvals
+                                            .iter()
+                                            .filter(|approval| approval.agent_id == agent_id)
+                                            .nth(approval_ix)
+                                        {
+                                            guests.answer(approval, allow, cx);
+                                        }
+                                    })
+                                }
+                            };
+                            let deny = allow.clone();
+                            h_flex()
+                                .gap_1()
+                                .flex_wrap()
+                                .child(
+                                    Label::new(format!(
+                                        "{} wants to: {}",
+                                        reply.agent_name,
+                                        if approval.title.is_empty() {
+                                            "use a tool"
+                                        } else {
+                                            approval.title.as_str()
+                                        }
+                                    ))
+                                    .size(LabelSize::Small),
+                                )
+                                .when(approval.can_answer(), |this| {
+                                    this.child(
+                                        Button::new(
+                                            SharedString::from(format!(
+                                                "guest-allow-{exchange_ix}-{reply_ix}-{approval_ix}"
+                                            )),
+                                            "Allow",
+                                        )
+                                        .label_size(LabelSize::Small)
+                                        .style(ButtonStyle::Filled)
+                                        .on_click(move |_, _, cx| allow(true, cx)),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            SharedString::from(format!(
+                                                "guest-deny-{exchange_ix}-{reply_ix}-{approval_ix}"
+                                            )),
+                                            "Deny",
+                                        )
+                                        .label_size(LabelSize::Small)
+                                        .on_click(move |_, _, cx| deny(false, cx)),
+                                    )
+                                })
+                                .into_any_element()
+                        })
+                        .collect::<Vec<_>>();
+                    v_flex()
+                        .gap_1()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(accent)
+                        .child(header)
+                        .children(body)
+                        .children(error)
+                        .children(approval_rows)
+                        .into_any_element()
+                });
+            elements.push(
+                v_flex()
+                    .id(("guest-exchange", exchange_ix))
+                    .w_full()
+                    .px_5()
+                    .py_2()
+                    .gap_2()
+                    .child(prompt)
+                    .children(replies)
+                    .into_any_element(),
+            );
+        }
+        elements
     }
 
     /// Puts messages forwarded to this thread into its message box, and sends
@@ -8282,6 +8753,17 @@ impl ThreadView {
                 .into_any_element()
         } else {
             primary
+        };
+
+        let guest_exchanges = self.render_guest_exchanges(entry_ix, total_entries, window, cx);
+        let primary = if guest_exchanges.is_empty() {
+            primary
+        } else {
+            v_flex()
+                .w_full()
+                .child(primary)
+                .children(guest_exchanges)
+                .into_any_element()
         };
 
         let is_assistant = matches!(entry, AgentThreadEntry::AssistantMessage(_));
@@ -15030,6 +15512,7 @@ pub(crate) fn open_link(
             }
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
+            MentionUri::Guest { .. } | MentionUri::GuestReply { .. } => {}
             MentionUri::Rule { name, .. } => {
                 crate::ui::open_migrated_rule(workspace, &name, window, cx);
             }
@@ -15174,6 +15657,33 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .and_then(|rest| rest.strip_prefix(command_name))
         .map(|rest| rest.trim_start().to_string())
         .unwrap_or_else(|| trimmed.to_string())
+}
+
+/// A stable colour for each guest agent.
+fn guest_color_index(agent_id: &AgentId) -> u32 {
+    agent_id.as_ref().bytes().fold(0u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u32)
+    })
+}
+
+/// Message text with each mention link shown as its `@name`.
+fn plain_mentions(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[@") {
+        let after = &rest[start..];
+        let Some(close) = after.find("](") else {
+            break;
+        };
+        let Some(end) = after[close..].find(')') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(&after[1..close]);
+        rest = &after[close + end + 1..];
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 #[cfg(test)]

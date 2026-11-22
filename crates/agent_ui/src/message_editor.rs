@@ -149,14 +149,21 @@ pub type SharedSessionCapabilities = Arc<RwLock<SessionCapabilities>>;
 
 pub type SharedLocalCommands = Arc<RwLock<Vec<PromptLocalCommand>>>;
 
+pub type SharedGuestCandidates = Arc<RwLock<Vec<crate::guests::GuestCandidate>>>;
+
 struct MessageEditorCompletionDelegate {
     session_capabilities: SharedSessionCapabilities,
     has_thread_store: bool,
     message_editor: WeakEntity<MessageEditor>,
     local_commands: SharedLocalCommands,
+    guest_candidates: SharedGuestCandidates,
 }
 
 impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
+    fn available_guests(&self, _cx: &App) -> Vec<crate::guests::GuestCandidate> {
+        self.guest_candidates.read().clone()
+    }
+
     fn supports_images(&self, _cx: &App) -> bool {
         self.session_capabilities.read().supports_images()
     }
@@ -212,6 +219,7 @@ pub struct MessageEditor {
     workspace: WeakEntity<Workspace>,
     session_capabilities: SharedSessionCapabilities,
     local_commands: SharedLocalCommands,
+    guest_candidates: SharedGuestCandidates,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
     _subscriptions: Vec<Subscription>,
@@ -536,12 +544,14 @@ impl MessageEditor {
         });
         let mention_set = cx.new(|_cx| MentionSet::new(project, thread_store.clone()));
         let local_commands: SharedLocalCommands = Arc::new(RwLock::new(Vec::new()));
+        let guest_candidates: SharedGuestCandidates = Arc::new(RwLock::new(Vec::new()));
         let completion_provider = Rc::new(PromptCompletionProvider::new(
             MessageEditorCompletionDelegate {
                 session_capabilities: session_capabilities.clone(),
                 has_thread_store: thread_store.is_some(),
                 message_editor: cx.weak_entity(),
                 local_commands: local_commands.clone(),
+                guest_candidates: guest_candidates.clone(),
             },
             editor.downgrade(),
             mention_set.clone(),
@@ -637,11 +647,32 @@ impl MessageEditor {
             workspace,
             session_capabilities,
             local_commands,
+            guest_candidates,
             agent_id,
             thread_store,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
+    }
+
+    /// Agents offered in the @ menu as guests. Empty turns tagging off.
+    pub fn set_guest_candidates(&self, candidates: Vec<crate::guests::GuestCandidate>) {
+        *self.guest_candidates.write() = candidates;
+    }
+
+    /// The agents this message is tagged to, in the order they were offered.
+    pub fn guest_tags(&self, cx: &App) -> Vec<crate::guests::GuestCandidate> {
+        let mentions = self.mention_set.read(cx).mentions();
+        self.guest_candidates
+            .read()
+            .iter()
+            .filter(|candidate| {
+                mentions.iter().any(|mention| {
+                    matches!(mention, MentionUri::Guest { agent_id, .. } if agent_id == candidate.agent_id.as_ref())
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn set_local_commands(&self, commands: Vec<PromptLocalCommand>) {

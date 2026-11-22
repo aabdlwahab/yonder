@@ -688,7 +688,7 @@ impl PickerDelegate for ForwardPickerDelegate {
 }
 
 /// Whether every character of `query` appears in `text`, in order, ignoring case.
-fn matches_in_order(query: &str, text: &str) -> bool {
+pub(crate) fn matches_in_order(query: &str, text: &str) -> bool {
     let mut text_characters = text.chars().flat_map(char::to_lowercase);
     query
         .chars()
