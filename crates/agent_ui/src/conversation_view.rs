@@ -4935,6 +4935,95 @@ pub(crate) mod tests {
         cx.run_until_parked();
     }
 
+    fn forwarded_blocks(uri: &MentionUri) -> Vec<acp_v2::ContentBlock> {
+        vec![
+            acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
+                acp_v2::EmbeddedResourceResource::TextResourceContents(
+                    acp_v2::TextResourceContents::new(
+                        "A reply forwarded from Claude Agent:\n\nTake a row lock.",
+                        uri.to_uri().to_string(),
+                    ),
+                ),
+            )),
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new(" ")),
+        ]
+    }
+
+    #[gpui::test]
+    async fn test_forward_lands_in_open_thread_message_box(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_id =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.root_thread_id);
+        let uri = MentionUri::Forward {
+            session_id: acp_v2::SessionId::new("source-session"),
+            title: "Fix login race".to_string(),
+            agent: "Claude Agent".to_string(),
+        };
+
+        cx.update(|_, cx| {
+            crate::forward::push_pending_forward(
+                thread_id,
+                crate::forward::PendingForward {
+                    blocks: forwarded_blocks(&uri),
+                    send: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            let editor = view.message_editor.read(cx);
+            assert!(
+                editor
+                    .text(cx)
+                    .contains("zed:///agent/forward/source-session"),
+                "message box: {}",
+                editor.text(cx)
+            );
+            assert!(editor.mention_set().read(cx).mentions().contains(&uri));
+            assert_eq!(view.thread.read(cx).entries().len(), 0);
+        });
+        cx.update(|_, cx| {
+            assert!(crate::forward::take_pending_forwards(thread_id, cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_forward_with_send_now_sends_it(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_id =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.root_thread_id);
+        let uri = MentionUri::Forward {
+            session_id: acp_v2::SessionId::new("source-session"),
+            title: "Fix login race".to_string(),
+            agent: "Claude Agent".to_string(),
+        };
+
+        cx.update(|_, cx| {
+            crate::forward::push_pending_forward(
+                thread_id,
+                crate::forward::PendingForward {
+                    blocks: forwarded_blocks(&uri),
+                    send: true,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_eq!(view.message_editor.read(cx).text(cx), "");
+            assert_eq!(view.thread.read(cx).entries().len(), 2);
+        });
+    }
+
     #[gpui::test]
     async fn test_external_source_prompt_requires_manual_send(cx: &mut TestAppContext) {
         init_test(cx);

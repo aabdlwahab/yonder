@@ -170,7 +170,8 @@ impl MentionSet {
             MentionUri::PastedImage { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. }
-            | MentionUri::Rule { .. } => {
+            | MentionUri::Rule { .. }
+            | MentionUri::Forward { .. } => {
                 Task::ready(Err(anyhow!("Unsupported mention URI type for paste")))
             }
         }
@@ -356,6 +357,10 @@ impl MentionSet {
             MentionUri::Rule { .. } => {
                 debug_panic!("unexpected rule URI");
                 Task::ready(Err(anyhow!("unexpected rule URI")))
+            }
+            MentionUri::Forward { .. } => {
+                debug_panic!("unexpected forward URI");
+                Task::ready(Err(anyhow!("unexpected forward URI")))
             }
         };
         let task = cx

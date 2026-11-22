@@ -75,6 +75,13 @@ pub enum MentionUri {
         source: String,
         skill_file_path: PathBuf,
     },
+    /// A message forwarded from another agent thread. The text travels with the
+    /// mention; the URI only records where it came from.
+    Forward {
+        session_id: acp::SessionId,
+        title: String,
+        agent: String,
+    },
 }
 
 impl MentionUri {
@@ -153,6 +160,13 @@ impl MentionUri {
                     Ok(Self::Thread {
                         id: acp::SessionId::new(thread_id),
                         name,
+                    })
+                } else if let Some(session_id) = path.strip_prefix("/agent/forward/") {
+                    validate_query_params(&url, &["title", "agent"])?;
+                    Ok(Self::Forward {
+                        session_id: acp::SessionId::new(session_id),
+                        title: query_param(&url, "title").unwrap_or_default(),
+                        agent: query_param(&url, "agent").context("Missing forwarding agent")?,
                     })
                 } else if let Some(rule_id) = path.strip_prefix("/agent/rule/") {
                     // Deprecated: parses legacy rule mentions.
@@ -329,7 +343,8 @@ impl MentionUri {
             | MentionUri::Fetch { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::GitDiff { .. }
-            | MentionUri::MergeConflict { .. } => None,
+            | MentionUri::MergeConflict { .. }
+            | MentionUri::Forward { .. } => None,
         }
     }
 
@@ -367,6 +382,7 @@ impl MentionUri {
             } => selection_name(path.as_deref(), line_range),
             MentionUri::Fetch { url } => url.to_string(),
             MentionUri::Skill { name, .. } => name.clone(),
+            MentionUri::Forward { agent, .. } => format!("From {agent}"),
         }
     }
 
@@ -430,6 +446,10 @@ impl MentionUri {
             MentionUri::Skill {
                 skill_file_path, ..
             } => Some(skill_file_path.to_string_lossy().into_owned().into()),
+            MentionUri::Forward { title, agent, .. } if !title.is_empty() => {
+                Some(format!("Forwarded from {agent} in \u{201c}{title}\u{201d}").into())
+            }
+            MentionUri::Forward { agent, .. } => Some(format!("Forwarded from {agent}").into()),
             _ => None,
         }
     }
@@ -452,6 +472,7 @@ impl MentionUri {
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
+            MentionUri::Forward { .. } => IconName::ArrowUpRight.path().into(),
         }
     }
 
@@ -581,6 +602,18 @@ impl MentionUri {
                     .append_pair("name", name)
                     .append_pair("source", source)
                     .append_pair("path", &skill_file_path.to_string_lossy());
+                url
+            }
+            MentionUri::Forward {
+                session_id,
+                title,
+                agent,
+            } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path(&format!("/agent/forward/{session_id}"));
+                url.query_pairs_mut()
+                    .append_pair("title", title)
+                    .append_pair("agent", agent);
                 url
             }
         }
