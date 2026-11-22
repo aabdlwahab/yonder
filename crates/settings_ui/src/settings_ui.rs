@@ -1012,6 +1012,8 @@ pub struct SettingsWindow {
     pub(crate) mcp_add_server_focus_handle: FocusHandle,
     /// The Machines page, which keeps its own editing state.
     pub(crate) machines_page: Option<Entity<pages::MachinesPage>>,
+    /// The Agent Accounts page; the Machines page shows its per-machine status.
+    pub(crate) agent_accounts_page: Option<Entity<pages::AgentAccountsPage>>,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
     pub(crate) custom_agent_form: Option<CustomAgentForm>,
     /// Stable focus handle for the external agents "Add Agent" button, so it can
@@ -2003,6 +2005,8 @@ impl SettingsWindow {
 
         let list_state = gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)).measure_all();
 
+        let agent_accounts_page =
+            cx.new(|cx| pages::AgentAccountsPage::new(<dyn fs::Fs>::global(cx), cx));
         let mut this = Self {
             title_bar,
             original_window,
@@ -2059,9 +2063,14 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
-            machines_page: Some(
-                cx.new(|cx| pages::MachinesPage::new(<dyn fs::Fs>::global(cx), cx)),
-            ),
+            machines_page: Some(cx.new(|cx| {
+                pages::MachinesPage::new(
+                    <dyn fs::Fs>::global(cx),
+                    Some(agent_accounts_page.clone()),
+                    cx,
+                )
+            })),
+            agent_accounts_page: Some(agent_accounts_page),
         };
 
         this.fetch_files(window, cx);
@@ -5548,6 +5557,7 @@ pub mod test {
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
                 machines_page: None,
+                agent_accounts_page: None,
             }
         }
     }
@@ -5689,6 +5699,7 @@ pub mod test {
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
             machines_page: None,
+            agent_accounts_page: None,
         };
 
         settings_window.build_filter_table();

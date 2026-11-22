@@ -16568,6 +16568,7 @@ dependencies = [
  "shell_command_parser",
  "strum 0.28.0",
  "telemetry",
+ "tempfile",
  "theme",
  "theme_settings",
  "ui",

@@ -10,6 +10,7 @@ use ui::{
 };
 
 use crate::SettingsWindow;
+use crate::pages::AgentAccountsPage;
 
 pub(crate) fn render_machines_page(
     settings_window: &SettingsWindow,
@@ -190,6 +191,8 @@ enum CheckState {
 
 pub(crate) struct MachinesPage {
     fs: Arc<dyn Fs>,
+    /// Shows each machine's agent sign-ins in its editor.
+    accounts: Option<Entity<AgentAccountsPage>>,
     editing: Option<MachineEditor>,
     adding: Option<NewMachineForm>,
     /// Address checks by `host:port`, so a result follows its address when
@@ -197,6 +200,7 @@ pub(crate) struct MachinesPage {
     checks: HashMap<String, CheckState>,
     check_tasks: Vec<Task<()>>,
     _settings_subscription: Subscription,
+    _accounts_subscription: Option<Subscription>,
 }
 
 fn text_input(
@@ -247,14 +251,21 @@ fn check_key(host: &str, port: &str) -> String {
 }
 
 impl MachinesPage {
-    pub fn new(fs: Arc<dyn Fs>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        fs: Arc<dyn Fs>,
+        accounts: Option<Entity<AgentAccountsPage>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             fs,
+            accounts: accounts.clone(),
             editing: None,
             adding: None,
             checks: HashMap::default(),
             check_tasks: Vec::new(),
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+            _accounts_subscription: accounts
+                .map(|accounts| cx.observe(&accounts, |_, _, cx| cx.notify())),
         }
     }
 
@@ -743,6 +754,11 @@ impl MachinesPage {
                     .size(LabelSize::Small)
                     .color(Color::Warning),
                 )
+            })
+            .when_some(self.accounts.clone(), |this, accounts| {
+                this.child(accounts.update(cx, |accounts, cx| {
+                    accounts.render_machine_agents(connection, cx)
+                }))
             })
             .child(
                 v_flex()

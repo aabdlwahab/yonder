@@ -13,9 +13,10 @@ use crate::{
     ActionLink, CustomItem, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
     SettingsPage, SettingsPageItem, SubPageLink, USER, active_language, all_language_names,
     pages::{
-        open_audio_test_window, render_edit_prediction_setup_page, render_external_agents_page,
-        render_llm_providers_page, render_machines_page, render_mcp_servers_page,
-        render_sandbox_settings_page, render_skills_setup_page, render_tool_permissions_setup_page,
+        open_audio_test_window, render_agent_accounts_page, render_edit_prediction_setup_page,
+        render_external_agents_page, render_llm_providers_page, render_machines_page,
+        render_mcp_servers_page, render_sandbox_settings_page, render_skills_setup_page,
+        render_tool_permissions_setup_page,
     },
 };
 
@@ -69,6 +70,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         keymap_page(),
         editor_page(),
         machines_page(),
+        agent_accounts_page(),
         languages_and_tools_page(cx),
         search_and_files_page(),
         window_and_layout_page(),
@@ -152,6 +154,18 @@ fn machines_page() -> SettingsPage {
             ],
             files: USER,
             render: render_machines_page,
+        })]),
+    }
+}
+
+fn agent_accounts_page() -> SettingsPage {
+    SettingsPage {
+        title: "Agent Accounts",
+        items: Box::new([SettingsPageItem::Custom(CustomItem {
+            title: "Agent Accounts",
+            search_aliases: &["account", "claude account", "codex", "login", "sign in"],
+            files: USER,
+            render: render_agent_accounts_page,
         })]),
     }
 }
