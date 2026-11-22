@@ -5266,7 +5266,7 @@ impl ThreadView {
                                             |(content_ix, content)| {
                                                 self.render_output_content_block(
                                                     entry_ix, content_ix, content, None, true,
-                                                    window, cx,
+                                                    None, window, cx,
                                                 )
                                             },
                                         )),
@@ -7537,7 +7537,7 @@ impl ThreadView {
                     let body = (!reply.markdown.read(cx).source().is_empty()).then(|| {
                         div().text_ui(cx).child(self.render_markdown(
                             reply.markdown.clone(),
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                            agent_answer_markdown_style(window, cx),
                             cx,
                         ))
                     });
@@ -8509,7 +8509,12 @@ impl ThreadView {
                                     div()
                                         .id(("assistant-message-chunk", chunk_ix))
                                         .child(self.render_message_content(
-                                            entry_ix, chunk_ix, block, window, cx,
+                                            entry_ix,
+                                            chunk_ix,
+                                            block,
+                                            agent_answer_markdown_style(window, cx),
+                                            window,
+                                            cx,
                                         ))
                                         .into_any_element()
                                 })
@@ -8688,6 +8693,16 @@ impl ThreadView {
                         .child(Divider::horizontal())
                         .tooltip(Tooltip::text("Everything below this line was sent as output from this subagent to the main agent.")),
                 )
+                .child(primary)
+                .into_any_element()
+        } else {
+            primary
+        };
+
+        let primary = if self.is_agent_turn_start(entry_ix, entry, cx) {
+            v_flex()
+                .w_full()
+                .child(self.render_agent_turn_header(entry_ix))
                 .child(primary)
                 .into_any_element()
         } else {
@@ -9561,23 +9576,39 @@ impl ThreadView {
         }
     }
 
+    /// What the agent is doing right now, for the indicator under the thread.
+    fn activity_label(&self, cx: &App) -> &'static str {
+        let thread = self.thread.read(cx);
+        if thread.has_in_progress_tool_calls() {
+            return "Running a tool";
+        }
+        match thread.entries().last() {
+            Some(AgentThreadEntry::AssistantMessage(message))
+                if matches!(
+                    message.chunks.last(),
+                    Some(AssistantMessageChunk::Thought { .. })
+                ) =>
+            {
+                "Thinking"
+            }
+            Some(AgentThreadEntry::AssistantMessage(_)) => "Writing",
+            _ => "Working",
+        }
+    }
+
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
-        let elapsed_label = show_stats
-            .then(|| {
-                self.turn_fields.turn_started_at.and_then(|started_at| {
-                    let elapsed = started_at.elapsed();
-                    (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
-                })
-            })
-            .flatten();
+        // The elapsed time always shows, so a long turn reads as still working.
+        let elapsed_label = self.turn_fields.turn_started_at.and_then(|started_at| {
+            let elapsed = started_at.elapsed();
+            (elapsed > STOPWATCH_THRESHOLD).then(|| duration_alt_display(elapsed))
+        });
 
         let is_blocked_on_terminal_command =
             !confirmation && self.is_blocked_on_terminal_command(cx);
         let is_waiting = confirmation || self.thread.read(cx).has_in_progress_tool_calls();
 
-        let turn_tokens_label = elapsed_label
-            .is_some()
+        let turn_tokens_label = (show_stats && elapsed_label.is_some())
             .then(|| {
                 self.turn_fields
                     .turn_tokens
@@ -9621,6 +9652,14 @@ impl ThreadView {
                             .w_2()
                             .justify_center()
                             .child(GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
+                    )
+                    .child(
+                        div().min_w(rems(6.)).child(
+                            LoadingLabel::new(self.activity_label(cx))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
                     )
                 }
             })
@@ -9688,6 +9727,7 @@ impl ThreadView {
         entry_ix: usize,
         chunk_ix: usize,
         content: &acp_thread::MessageContent,
+        style: MarkdownStyle,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
@@ -9698,7 +9738,14 @@ impl ThreadView {
                 .filter(|(_, block)| block.visible_content(cx))
                 .map(|(block_ix, block)| {
                     let content = self.render_output_content_block(
-                        entry_ix, block_ix, block, None, false, window, cx,
+                        entry_ix,
+                        block_ix,
+                        block,
+                        None,
+                        false,
+                        Some(style.clone()),
+                        window,
+                        cx,
                     );
                     div()
                         .id(("message-content-block", block_ix))
@@ -9713,6 +9760,58 @@ impl ThreadView {
                         ))
                 }),
         )
+    }
+
+    /// Whether this thinking chunk is the one the agent is still writing.
+    fn is_still_thinking(&self, entry_ix: usize, chunk_ix: usize, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        if thread.status() != ThreadStatus::Generating {
+            return false;
+        }
+        let entries = thread.entries();
+        entry_ix + 1 == entries.len()
+            && matches!(
+                entries.last(),
+                Some(AgentThreadEntry::AssistantMessage(message))
+                    if chunk_ix + 1 == message.chunks.len()
+            )
+    }
+
+    /// The first entry the agent wrote after a user message.
+    fn is_agent_turn_start(&self, entry_ix: usize, entry: &AgentThreadEntry, cx: &App) -> bool {
+        if self.is_subagent() || entry.is_indented() {
+            return false;
+        }
+        if !matches!(
+            entry,
+            AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_)
+        ) {
+            return false;
+        }
+        let entries = self.thread.read(cx).entries();
+        entry_ix == 0
+            || matches!(
+                entries.get(entry_ix - 1),
+                Some(AgentThreadEntry::UserMessage(_))
+            )
+    }
+
+    fn render_agent_turn_header(&self, entry_ix: usize) -> impl IntoElement {
+        let icon = match &self.agent_icon_from_external_svg {
+            Some(path) => Icon::from_external_svg(path.clone()),
+            None => Icon::new(self.agent_icon),
+        };
+        h_flex()
+            .id(("agent-turn-header", entry_ix))
+            .px_5()
+            .pt_2()
+            .gap_1p5()
+            .child(icon.size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(self.agent_display_name.clone())
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD),
+            )
     }
 
     fn render_thinking_block(
@@ -9767,8 +9866,12 @@ impl ThreadView {
                             .child(
                                 div()
                                     .text_size(self.tool_name_font_size())
-                                    .text_color(cx.theme().colors().text_muted)
-                                    .child("Thinking"),
+                                    .text_color(agent_thought_color(cx))
+                                    .child(if self.is_still_thinking(entry_ix, chunk_ix, cx) {
+                                        "Thinking…"
+                                    } else {
+                                        "Thought"
+                                    }),
                             ),
                     )
                     .child(
@@ -9803,11 +9906,14 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(
-                                    self.render_message_content(
-                                        entry_ix, chunk_ix, chunk, window, cx,
-                                    ),
-                                ),
+                                .child(self.render_message_content(
+                                    entry_ix,
+                                    chunk_ix,
+                                    chunk,
+                                    agent_thought_markdown_style(window, cx),
+                                    window,
+                                    cx,
+                                )),
                         )
                         .when(is_constrained, |this| {
                             this.child(div().absolute().inset_0().size_full().bg(linear_gradient(
@@ -10127,7 +10233,14 @@ impl ThreadView {
                     .pl_3()
                     .border_l_2()
                     .border_color(cx.theme().colors().border)
-                    .child(self.render_message_content(entry_ix, 0, &message.content, window, cx)),
+                    .child(self.render_message_content(
+                        entry_ix,
+                        0,
+                        &message.content,
+                        agent_answer_markdown_style(window, cx),
+                        window,
+                        cx,
+                    )),
             )
     }
 
@@ -12633,6 +12746,9 @@ impl ThreadView {
                     )
                     .child(tool_icon),
             )
+            .when(!use_card_layout, |this| {
+                this.children(tool_call_status_mark(tool_call.status()))
+            })
             .child(if has_location {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))
@@ -12644,17 +12760,14 @@ impl ThreadView {
                             this.text_color(cx.theme().colors().text_muted)
                         }
                     })
-                    .child(
-                        self.render_markdown(
-                            tool_call.label.clone(),
-                            MarkdownStyle {
-                                prevent_mouse_interaction: true,
-                                ..MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
-                                    .with_muted_text(cx)
-                            },
-                            cx,
-                        ),
-                    )
+                    .child(self.render_markdown(
+                        tool_call.label.clone(),
+                        MarkdownStyle {
+                            prevent_mouse_interaction: true,
+                            ..agent_tool_label_markdown_style(window, cx)
+                        },
+                        cx,
+                    ))
                     .tooltip(Tooltip::text("Go to File"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_tool_call_location(entry_ix, 0, window, cx);
@@ -12665,7 +12778,7 @@ impl ThreadView {
                     .w_full()
                     .child(self.render_markdown(
                         tool_call.label.clone(),
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                        agent_tool_label_markdown_style(window, cx),
                         cx,
                     ))
                     .into_any()
@@ -12765,6 +12878,7 @@ impl ThreadView {
                 block.as_view(),
                 Some(tool_call),
                 card_layout,
+                None,
                 window,
                 cx,
             ),
@@ -12919,6 +13033,7 @@ impl ThreadView {
         content: acp_thread::ContentBlockView<'_>,
         tool_call: Option<&ToolCall>,
         card_layout: bool,
+        style: Option<MarkdownStyle>,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -12936,7 +13051,7 @@ impl ThreadView {
             } else {
                 self.render_markdown(
                     markdown.clone(),
-                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                    style.unwrap_or_else(|| agent_answer_markdown_style(window, cx)),
                     cx,
                 )
                 .into_any()
@@ -15657,6 +15772,58 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .and_then(|rest| rest.strip_prefix(command_name))
         .map(|rest| rest.trim_start().to_string())
         .unwrap_or_else(|| trimmed.to_string())
+}
+
+/// Agent answers: code sits on its own panel with a header, and inline code
+/// stands out from the text around it.
+pub(crate) fn agent_answer_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let colors = cx.theme().colors();
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    style.code_block_header = true;
+    style.code_block.background = Some(colors.surface_background.opacity(0.85).into());
+    style.code_block.border_color = Some(colors.border);
+    style.inline_code.background_color = Some(colors.editor_foreground.opacity(0.14));
+    style.paragraph_line_height = rems(1.4).into();
+    style
+}
+
+/// Thinking steps back: dimmer, smaller and italic, so the answer reads first.
+fn agent_thought_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = agent_answer_markdown_style(window, cx);
+    let font_size = style.base_text_style.font_size.to_pixels(window.rem_size());
+    style.base_text_style.font_size = (font_size * 0.92).into();
+    style.base_text_style.color = agent_thought_color(cx);
+    style.base_text_style.font_style = gpui::FontStyle::Italic;
+    // Thinking often quotes whole commands; a background on each would turn
+    // the block into a wall of highlights.
+    style.inline_code.background_color = Some(gpui::transparent_black());
+    style
+}
+
+fn agent_thought_color(cx: &App) -> Hsla {
+    cx.theme().colors().text_muted.opacity(0.8)
+}
+
+/// Tool use reads as a list of steps the eye can skip.
+fn agent_tool_label_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
+    style.base_text_style.color = cx.theme().colors().text_muted.opacity(0.85);
+    style
+}
+
+/// A ✓ or ✗ in front of finished tool calls.
+fn tool_call_status_mark(status: ToolCallStatus) -> Option<AnyElement> {
+    let (icon, color) = match status {
+        ToolCallStatus::Completed => (IconName::Check, Color::Success),
+        ToolCallStatus::Failed | ToolCallStatus::Rejected => (IconName::XCircle, Color::Error),
+        _ => return None,
+    };
+    Some(
+        div()
+            .flex_none()
+            .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+            .into_any_element(),
+    )
 }
 
 /// A stable colour for each guest agent.
