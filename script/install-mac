@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+
+# Builds Yonder in release mode and installs it as /Applications/Yonder.app.
+#
+# The app is signed for this Mac only (ad-hoc), which is enough to run it here
+# but not to hand it to someone else.
+
+set -euo pipefail
+
+skip_build=false
+open_app=true
+
+help_info() {
+  echo "
+Usage: ${0##*/} [options]
+Build Yonder in release mode and install it into /Applications.
+
+Options:
+  -s    Skip the build and package the existing target/release binaries.
+  -n    Don't open Yonder after installing.
+  -h    Display this help and exit.
+  "
+}
+
+while getopts 'snh' flag; do
+  case "${flag}" in
+    s) skip_build=true ;;
+    n) open_app=false ;;
+    h)
+      help_info
+      exit 0
+      ;;
+    *)
+      help_info
+      exit 1
+      ;;
+  esac
+done
+
+cd "$(dirname "$0")/.."
+
+version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/zed/Cargo.toml | head -n 1)
+# Spotlight skips folders ending in .noindex, so this copy never shows up in
+# search next to the installed one.
+app="target/install-mac.noindex/Yonder.app"
+installed="/Applications/Yonder.app"
+data_dir="$HOME/Library/Application Support/Yonder"
+
+if [[ "$skip_build" = false ]]; then
+  echo "Building Yonder ${version} (release)"
+  # The channel is baked in at compile time. Stable gives the app its own name,
+  # bundle id and database, separate from Yonder Dev.
+  ZED_COMMIT_SHA=$(git rev-parse HEAD)
+  export ZED_RELEASE_CHANNEL=stable MACOSX_DEPLOYMENT_TARGET=12.0 ZED_COMMIT_SHA
+  cargo build --release --package zed --bin yonder
+  cargo build --release --package cli
+  echo "${ZED_COMMIT_SHA}" > target/release/yonder.commit
+fi
+
+if [[ ! -f target/release/yonder.commit ]]; then
+  echo "target/release/yonder wasn't built by this script; run it without -s." >&2
+  exit 1
+fi
+# Stable versions carry the commit, and so does the server's file name on each
+# machine, so every build gets a server of its own.
+full_version="${version}+stable.$(cat target/release/yonder.commit)"
+
+echo "Assembling ${app}"
+rm -rf "${app}"
+mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
+cp target/release/yonder "${app}/Contents/MacOS/yonder"
+cp target/release/cli "${app}/Contents/MacOS/cli"
+# The release profile keeps debug info for crash symbolication; the installed
+# app doesn't need it.
+strip -x "${app}/Contents/MacOS/yonder" "${app}/Contents/MacOS/cli"
+cp crates/zed/resources/Document.icns "${app}/Contents/Resources/Document.icns"
+
+iconset_dir=$(mktemp -d)
+iconset="${iconset_dir}/Yonder.iconset"
+mkdir -p "${iconset}"
+for size in 16 32 128 256 512; do
+  sips -z "${size}" "${size}" crates/zed/resources/app-icon@2x.png \
+    --out "${iconset}/icon_${size}x${size}.png" > /dev/null
+  sips -z "$((size * 2))" "$((size * 2))" crates/zed/resources/app-icon@2x.png \
+    --out "${iconset}/icon_${size}x${size}@2x.png" > /dev/null
+done
+iconutil -c icns "${iconset}" -o "${app}/Contents/Resources/Yonder.icns"
+rm -rf "${iconset_dir}"
+
+python3 -I - "${version}" "${app}/Contents/Info.plist" crates/zed/resources/info/*.plist <<'EOF'
+import plistlib
+import sys
+
+version, output, *fragments = sys.argv[1:]
+info = {
+    "CFBundleDevelopmentRegion": "English",
+    "CFBundleDisplayName": "Yonder",
+    "CFBundleExecutable": "yonder",
+    "CFBundleIconFile": "Yonder.icns",
+    "CFBundleIdentifier": "io.github.aabdlwahab.Yonder",
+    "CFBundleInfoDictionaryVersion": "6.0",
+    "CFBundleName": "Yonder",
+    "CFBundlePackageType": "APPL",
+    "CFBundleShortVersionString": version,
+    "CFBundleVersion": version,
+    "CFBundleURLTypes": [{"CFBundleURLName": "Yonder", "CFBundleURLSchemes": ["yonder"]}],
+    "LSApplicationCategoryType": "public.app-category.developer-tools",
+    "LSMinimumSystemVersion": "12.0",
+    "NSHighResolutionCapable": True,
+}
+# The files in resources/info are bare <key>/<value> pairs, as cargo-bundle
+# expects, so each one is wrapped into a full plist before merging.
+for fragment in fragments:
+    with open(fragment, "rb") as file:
+        body = file.read()
+    document = (
+        b'<?xml version="1.0" encoding="UTF-8"?>'
+        b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        b'"http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+        b'<plist version="1.0"><dict>' + body + b"</dict></plist>"
+    )
+    info.update(plistlib.loads(document))
+with open(output, "wb") as file:
+    plistlib.dump(info, file)
+EOF
+
+echo "Signing for this Mac"
+codesign --force --deep --entitlements crates/zed/resources/zed.entitlements --sign - "${app}"
+
+if pgrep -fq "${installed}/Contents/MacOS/yonder"; then
+  echo "Yonder is running from ${installed}. Quit it, then run ${0##*/} -s to install." >&2
+  exit 1
+fi
+
+echo "Installing ${installed}"
+rm -rf "${installed}"
+ditto "${app}" "${installed}"
+rm -rf "${app}"
+
+# On the first install, start from Yonder Dev's projects, chats and settings
+# state instead of an empty database. sqlite's backup is safe while Yonder Dev
+# is running.
+if [[ ! -e "${data_dir}/db/0-stable/db.sqlite" && -e "${data_dir}/db/0-dev/db.sqlite" ]]; then
+  echo "Copying Yonder Dev's projects and chats"
+  mkdir -p "${data_dir}/db/0-stable"
+  sqlite3 "${data_dir}/db/0-dev/db.sqlite" ".backup '${data_dir}/db/0-stable/db.sqlite'"
+fi
+
+# Remote machines run a server whose file name carries the channel and version.
+# Reuse the server Yonder Dev uploads when there's none for this version yet.
+for platform_dir in "${data_dir}"/remote_servers/yonder/*/; do
+  [[ -d "${platform_dir}" ]] || continue
+  stable_server="${platform_dir}zed-remote-server-stable-${full_version}.gz"
+  dev_server="${platform_dir}zed-remote-server-dev-build.gz"
+  if [[ ! -e "${stable_server}" && -e "${dev_server}" ]]; then
+    echo "Using Yonder Dev's server for $(basename "${platform_dir}")"
+    cp "${dev_server}" "${stable_server}"
+  fi
+done
+
+echo "Installed Yonder ${version}"
+if [[ "${open_app}" = true ]]; then
+  open "${installed}"
+fi
