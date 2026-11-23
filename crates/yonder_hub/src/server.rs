@@ -2,6 +2,7 @@
 //! the relay between them.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,11 +20,13 @@ use futures::channel::mpsc;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
 use project::{AgentId, Project};
+use serde_json::{Value, json};
 
+use crate::dispatch::{self, Dispatch};
 use crate::headless::AgentCliAppState;
 use crate::machines::Machines;
 use crate::registry::Registry;
-use crate::relay::{AgentKey, ClientId, Endpoint, Output, Relay};
+use crate::relay::{AgentKey, ClientId, Endpoint, Output, Relay, error_response, result_response};
 
 pub const DEFAULT_PORT: u16 = 7766;
 
@@ -61,6 +64,7 @@ struct Hub {
     machines: Machines,
     clients: HashMap<ClientId, mpsc::UnboundedSender<String>>,
     agents: HashMap<AgentKey, RunningAgent>,
+    dispatch: Option<Dispatch>,
     next_generation: u64,
     events: mpsc::UnboundedSender<Event>,
 }
@@ -70,11 +74,13 @@ pub fn serve(
     app_state: Arc<AgentCliAppState>,
     listen: String,
     local_name: String,
+    dispatch_codex: Option<PathBuf>,
     cx: &mut App,
 ) -> Task<Result<()>> {
     cx.spawn(async move |cx| {
         let registry = Registry::open(Registry::default_dir())?;
         let token = registry.token()?;
+        let dispatch = dispatch_codex.map(|codex| Dispatch::new(codex, registry.dispatch_dir()));
         let mut relay = Relay::new(now);
         let saved = registry.load()?;
         log::info!("restored {} sessions", saved.len());
@@ -87,6 +93,7 @@ pub fn serve(
             machines: Machines::new(app_state, local_name.clone()),
             clients: HashMap::default(),
             agents: HashMap::default(),
+            dispatch,
             next_generation: 0,
             events: events.clone(),
         }));
@@ -163,6 +170,9 @@ fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {
                 }
             }
             Output::StartAgent(key) => start_agent(hub.clone(), key, cx),
+            Output::AskDispatch { client, id, prompt } => {
+                start_dispatch(hub.clone(), client, id, prompt, cx);
+            }
             Output::SaveSessions => save = true,
             Output::AppendLog { session, line } => {
                 if let Err(error) = hub.borrow().registry.append_log(&session, &line) {
@@ -177,6 +187,44 @@ fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {
             log::error!("saving sessions: {error:#}");
         }
     }
+}
+
+fn start_dispatch(
+    hub: Rc<RefCell<Hub>>,
+    client: ClientId,
+    id: Value,
+    prompt: String,
+    cx: &mut AsyncApp,
+) {
+    let (tx, dispatch) = {
+        let hub = hub.borrow();
+        let Some(tx) = hub.clients.get(&client) else {
+            return;
+        };
+        (tx.clone(), hub.dispatch.clone())
+    };
+    let Some(dispatch) = dispatch else {
+        tx.unbounded_send(error_response(&id, "Dispatch is disabled on this hub"))
+            .ok();
+        return;
+    };
+    cx.spawn(async move |cx| {
+        let ask = dispatch.ask(&prompt, |name, arguments| {
+            dispatch::call_tool(&hub.borrow().relay, name, arguments)
+        });
+        let timeout = cx.background_executor().timer(dispatch::ASK_TIMEOUT);
+        let result = smol::future::race(ask, async move {
+            timeout.await;
+            Err(anyhow!("Dispatch timed out"))
+        })
+        .await;
+        let reply = match result {
+            Ok(reply) => result_response(&id, json!(reply)),
+            Err(error) => error_response(&id, &format!("{error:#}")),
+        };
+        tx.unbounded_send(reply).ok();
+    })
+    .detach();
 }
 
 fn start_agent(hub: Rc<RefCell<Hub>>, key: AgentKey, cx: &mut AsyncApp) {

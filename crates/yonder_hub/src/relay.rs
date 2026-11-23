@@ -18,6 +18,8 @@ use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::dispatch::{ASK_METHOD, MAX_PROMPT_BYTES, SessionFilter};
+
 pub type ClientId = u64;
 
 /// One agent on one machine; the hub runs one process for each.
@@ -41,8 +43,16 @@ pub enum Output {
     ToClient(ClientId, String),
     ToAgent(AgentKey, String),
     StartAgent(AgentKey),
+    AskDispatch {
+        client: ClientId,
+        id: Value,
+        prompt: String,
+    },
     SaveSessions,
-    AppendLog { session: String, line: String },
+    AppendLog {
+        session: String,
+        line: String,
+    },
 }
 
 /// A session as the hub lists it.
@@ -182,6 +192,143 @@ impl Relay {
         sessions
     }
 
+    pub fn dispatch_sessions(&self, filter: SessionFilter, limit: usize) -> Value {
+        let mut sessions: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| filter.matches(dispatch_state(session)))
+            .collect();
+        sessions.sort_unstable_by_key(|session| {
+            (
+                !SessionFilter::Active.matches(dispatch_state(session)),
+                std::cmp::Reverse(session.meta.updated_at),
+                session.meta.id.as_str(),
+            )
+        });
+        let total = sessions.len();
+        let sessions: Vec<_> = sessions
+            .into_iter()
+            .take(limit)
+            .map(|session| {
+                let meta = &session.meta;
+                json!({
+                    "id": meta.id,
+                    "title": meta.title.as_deref().map(|text| tail(text, 160)),
+                    "machine": meta.machine,
+                    "agent": meta.agent,
+                    "project": meta.cwd,
+                    "state": dispatch_state(session),
+                    "updatedAt": meta.updated_at,
+                    "lastText": meta.last_text,
+                })
+            })
+            .collect();
+        json!({ "sessions": sessions, "total": total })
+    }
+
+    pub fn dispatch_session_now(&self, id: &str) -> Option<Value> {
+        let session = self.sessions.get(id)?;
+        let meta = &session.meta;
+        let state = dispatch_state(session);
+        let pending_approval = (state == "waiting")
+            .then(|| {
+                self.agents
+                    .iter()
+                    .find(|(key, _)| key.machine == meta.machine && key.agent == meta.agent)
+                    .and_then(|(_, agent)| {
+                        agent.pending.iter().rev().find_map(|pending| {
+                            if pending.session.as_deref() != Some(id) {
+                                return None;
+                            }
+                            let request: Value = serde_json::from_str(&pending.line).ok()?;
+                            let method = request.get("method")?.as_str()?;
+                            if !method.contains("request_permission") {
+                                return None;
+                            }
+                            Some(json!({
+                                "title": request.pointer("/params/toolCall/title")
+                                    .and_then(Value::as_str)
+                                    .map(|title| tail(title, 400)),
+                            }))
+                        })
+                    })
+            })
+            .flatten();
+        let recent_tool = SessionFilter::Active
+            .matches(state)
+            .then(|| recent_dispatch_tool(&session.log))
+            .flatten();
+        Some(json!({
+            "id": id,
+            "state": state,
+            "updatedAt": meta.updated_at,
+            "lastText": meta.last_text,
+            "recentTool": recent_tool,
+            "pendingApproval": pending_approval,
+        }))
+    }
+
+    pub fn dispatch_history(&self, id: &str, limit: usize) -> Option<Value> {
+        let session = self.sessions.get(id)?;
+        let mut messages: Vec<(&str, Option<String>, String)> = Vec::new();
+        let mut remaining_chars = 6_000;
+        let mut after_turn_boundary = false;
+        for line in session.log.iter().rev().take(2_048) {
+            let Ok(message) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(update) = message.pointer("/params/update") else {
+                continue;
+            };
+            let role = match update.get("sessionUpdate").and_then(Value::as_str) {
+                Some("user_message_chunk") => "user",
+                Some("agent_message_chunk") => "assistant",
+                Some("state_update") if update["state"] == "idle" => {
+                    after_turn_boundary = true;
+                    continue;
+                }
+                _ => continue,
+            };
+            let Some(text) = update.pointer("/content/text").and_then(Value::as_str) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let message_id = update.get("messageId").and_then(Value::as_str);
+            if after_turn_boundary
+                || messages.last().is_none_or(|(last_role, last_id, _)| {
+                    *last_role != role || last_id.as_deref() != message_id
+                })
+            {
+                if messages.len() == limit {
+                    break;
+                }
+                messages.push((role, message_id.map(str::to_owned), String::new()));
+            }
+            after_turn_boundary = false;
+            if let Some((_, _, message)) = messages.last_mut() {
+                let available =
+                    remaining_chars.min(1_200_usize.saturating_sub(message.chars().count()));
+                let chunk = tail(text, available);
+                remaining_chars -= chunk.chars().count();
+                message.insert_str(0, &chunk);
+            }
+            if remaining_chars == 0 {
+                break;
+            }
+        }
+        let messages: Vec<_> = messages
+            .into_iter()
+            .map(|(role, _, text)| json!({ "role": role, "text": text }))
+            .collect();
+        Some(json!({ "id": id, "messages": messages, "order": "newest_first" }))
+    }
+
+    pub fn dispatch_has_session(&self, id: &str) -> bool {
+        self.sessions.contains_key(id)
+    }
+
     pub fn client_connected(&mut self, client: ClientId, endpoint: Endpoint) {
         self.clients.insert(
             client,
@@ -221,7 +368,9 @@ impl Relay {
             .map(str::to_string);
         let id = message.get("id").cloned();
         match (endpoint, method.as_deref(), id) {
-            (Endpoint::Hub, Some(method), Some(id)) => self.hub_request(client, method, id),
+            (Endpoint::Hub, Some(method), Some(id)) => {
+                self.hub_request(client, method, id, message.get("params"))
+            }
             (Endpoint::Hub, _, _) => Vec::new(),
             (Endpoint::Agent(agent), Some(method), Some(id)) => {
                 self.client_request(client, agent, method, id, message)
@@ -300,7 +449,13 @@ impl Relay {
         }
     }
 
-    fn hub_request(&mut self, client: ClientId, method: &str, id: Value) -> Vec<Output> {
+    fn hub_request(
+        &mut self,
+        client: ClientId,
+        method: &str,
+        id: Value,
+        params: Option<&Value>,
+    ) -> Vec<Output> {
         let result = match method {
             "initialize" => json!({
                 "protocolVersion": 2,
@@ -308,6 +463,29 @@ impl Relay {
                 "capabilities": {},
             }),
             "_yonder/hub/sessions" => json!({ "sessions": self.sessions() }),
+            ASK_METHOD => {
+                let prompt = params
+                    .and_then(|params| params.get("prompt"))
+                    .and_then(Value::as_str)
+                    .map(str::trim);
+                if let Some(prompt) =
+                    prompt.filter(|prompt| !prompt.is_empty() && prompt.len() <= MAX_PROMPT_BYTES)
+                {
+                    return vec![Output::AskDispatch {
+                        client,
+                        id,
+                        prompt: prompt.to_owned(),
+                    }];
+                }
+                return vec![Output::ToClient(
+                    client,
+                    error_response_with_code(
+                        &id,
+                        -32602,
+                        "Dispatch requires a nonempty prompt of at most 8192 bytes",
+                    ),
+                )];
+            }
             _ => {
                 return vec![Output::ToClient(
                     client,
@@ -800,16 +978,55 @@ fn apply_update(session: &mut Session, update: &Value, now: u64) -> bool {
     }
 }
 
+fn dispatch_state(session: &Session) -> &str {
+    if session.live {
+        &session.meta.state
+    } else {
+        "inactive"
+    }
+}
+
+fn recent_dispatch_tool(log: &[String]) -> Option<Value> {
+    let mut statuses = HashMap::default();
+    for line in log.iter().rev().take(128) {
+        let Ok(message) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(update) = message.pointer("/params/update") else {
+            continue;
+        };
+        match update["sessionUpdate"].as_str() {
+            Some("state_update") if update["state"] == "idle" => break,
+            Some("tool_call" | "tool_call_update") => {
+                let id = update["toolCallId"].as_str().unwrap_or_default();
+                if let Some(status) = update["status"].as_str() {
+                    statuses
+                        .entry(id.to_owned())
+                        .or_insert_with(|| status.to_owned());
+                }
+                if let Some(title) = update["title"].as_str() {
+                    return Some(json!({
+                        "title": tail(title, 400),
+                        "status": statuses.get(id),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn tail(text: &str, chars: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(chars)).collect()
 }
 
-fn result_response(id: &Value, result: Value) -> String {
+pub(crate) fn result_response(id: &Value, result: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
 
-fn error_response(id: &Value, message: &str) -> String {
+pub(crate) fn error_response(id: &Value, message: &str) -> String {
     error_response_with_code(id, -32000, message)
 }
 
@@ -896,6 +1113,81 @@ mod tests {
             .extend(extra.as_object().unwrap().clone());
         json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":update}})
             .to_string()
+    }
+
+    #[test]
+    fn dispatch_routes_a_valid_question_with_the_original_client_and_id() {
+        let mut relay = Relay::new(|| 100);
+        relay.client_connected(2, Endpoint::Hub);
+        let outputs = relay.client_message(
+            2,
+            r#"{"jsonrpc":"2.0","id":"dispatch-1","method":"_yonder/dispatch/ask","params":{"prompt":"  What's running?  "}}"#,
+        );
+        assert_eq!(
+            outputs,
+            vec![Output::AskDispatch {
+                client: 2,
+                id: json!("dispatch-1"),
+                prompt: "What's running?".into(),
+            }]
+        );
+        let outputs = relay.client_message(
+            2,
+            r#"{"jsonrpc":"2.0","id":2,"method":"_yonder/dispatch/ask","params":{"prompt":" "}}"#,
+        );
+        assert_eq!(parse(&outputs[0])["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn dispatch_reports_live_state_and_keeps_the_order_of_history_chunks() {
+        let mut relay = with_session(ready_relay(&[1]), 1);
+        for (kind, data) in [
+            ("state_update", json!({ "state": "running" })),
+            (
+                "tool_call",
+                json!({ "toolCallId": "tool", "title": "Run checks" }),
+            ),
+            (
+                "tool_call_update",
+                json!({ "toolCallId": "tool", "status": "in_progress" }),
+            ),
+            (
+                "agent_message_chunk",
+                json!({ "messageId": "a", "content": { "text": "Running " } }),
+            ),
+            (
+                "agent_message_chunk",
+                json!({ "messageId": "a", "content": { "text": "checks." } }),
+            ),
+        ] {
+            relay.agent_line(&key(), &update(kind, data));
+        }
+        assert_eq!(
+            relay.dispatch_sessions(SessionFilter::Active, 20)["total"],
+            1
+        );
+        let state = relay.dispatch_session_now("s1").unwrap();
+        assert_eq!(state["recentTool"]["title"], "Run checks");
+        assert_eq!(state["recentTool"]["status"], "in_progress");
+        let history = relay.dispatch_history("s1", 12).unwrap();
+        assert_eq!(history["messages"][0]["text"], "Running checks.");
+
+        let mut restored = Relay::new(|| 101);
+        restored.restore(
+            relay
+                .sessions()
+                .into_iter()
+                .map(|meta| (meta, Vec::new()))
+                .collect(),
+        );
+        assert_eq!(
+            restored.dispatch_sessions(SessionFilter::Active, 20)["total"],
+            0
+        );
+        assert_eq!(
+            restored.dispatch_session_now("s1").unwrap()["state"],
+            "inactive"
+        );
     }
 
     #[test]
