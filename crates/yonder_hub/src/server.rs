@@ -17,11 +17,13 @@ use async_tungstenite::tungstenite::{
 };
 use collections::HashMap;
 use futures::channel::mpsc;
+use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 
+use crate::dispatch::VoiceCall;
 use crate::dispatch::{self, Dispatch};
 use crate::headless::AgentCliAppState;
 use crate::machines::Machines;
@@ -30,7 +32,7 @@ use crate::relay::{AgentKey, ClientId, Endpoint, Output, Relay, error_response, 
 
 pub const DEFAULT_PORT: u16 = 7766;
 
-enum Event {
+pub(crate) enum Event {
     ClientConnected {
         client: ClientId,
         endpoint: Endpoint,
@@ -49,6 +51,11 @@ enum Event {
     AgentGone {
         key: AgentKey,
         generation: u64,
+    },
+    Voice(VoiceCall),
+    DispatchSessions {
+        id: Option<String>,
+        reply: oneshot::Sender<Value>,
     },
 }
 
@@ -75,6 +82,7 @@ pub fn serve(
     listen: String,
     local_name: String,
     dispatch_codex: Option<PathBuf>,
+    dispatch_web: crate::dispatch_web::Options,
     cx: &mut App,
 ) -> Task<Result<()>> {
     cx.spawn(async move |cx| {
@@ -105,12 +113,25 @@ pub fn serve(
             .with_context(|| format!("listening on {listen}"))?;
         eprintln!("yonder-hub on {local_name}: listening on ws://{listen}");
         eprintln!("token: {}", Registry::default_dir().join("token").display());
-        cx.background_spawn(accept_loop(listener, token, events))
+        cx.background_spawn(accept_loop(listener, token, events.clone()))
             .detach();
+
+        if dispatch_web.enabled() {
+            let server = gpui_tokio::Tokio::spawn_result(
+                cx,
+                crate::dispatch_web::serve(dispatch_web, events),
+            );
+            cx.spawn(async move |_| {
+                if let Err(error) = server.await {
+                    log::error!("Dispatch web server: {error:#}");
+                }
+            })
+            .detach();
+        }
 
         while let Some(event) = event_rx.next().await {
             let outputs = {
-                let mut hub = hub.borrow_mut();
+                let mut state = hub.borrow_mut();
                 match event {
                     Event::ClientConnected {
                         client,
@@ -118,15 +139,15 @@ pub fn serve(
                         tx,
                     } => {
                         log::info!("client {client} connected to {endpoint:?}");
-                        hub.clients.insert(client, tx);
-                        hub.relay.client_connected(client, endpoint);
+                        state.clients.insert(client, tx);
+                        state.relay.client_connected(client, endpoint);
                         Vec::new()
                     }
-                    Event::ClientLine { client, line } => hub.relay.client_message(client, &line),
+                    Event::ClientLine { client, line } => state.relay.client_message(client, &line),
                     Event::ClientGone(client) => {
                         log::info!("client {client} left");
-                        hub.clients.remove(&client);
-                        hub.relay.client_gone(client);
+                        state.clients.remove(&client);
+                        state.relay.client_gone(client);
                         Vec::new()
                     }
                     Event::AgentLine {
@@ -134,20 +155,38 @@ pub fn serve(
                         generation,
                         line,
                     } => {
-                        if hub.agents.get(&key).map(|agent| agent.generation) == Some(generation) {
-                            hub.relay.agent_line(&key, &line)
+                        if state.agents.get(&key).map(|agent| agent.generation) == Some(generation)
+                        {
+                            state.relay.agent_line(&key, &line)
                         } else {
                             Vec::new()
                         }
                     }
                     Event::AgentGone { key, generation } => {
-                        if hub.agents.get(&key).map(|agent| agent.generation) == Some(generation) {
+                        if state.agents.get(&key).map(|agent| agent.generation) == Some(generation)
+                        {
                             log::warn!("{} on {} exited", key.agent, key.machine);
-                            hub.agents.remove(&key);
-                            hub.relay.agent_gone(&key, "the agent exited")
+                            state.agents.remove(&key);
+                            state.relay.agent_gone(&key, "the agent exited")
                         } else {
                             Vec::new()
                         }
+                    }
+                    Event::DispatchSessions { id, reply } => {
+                        let sessions = match id {
+                            Some(id) => {
+                                state.relay.dispatch_history(&id, 12).unwrap_or(Value::Null)
+                            }
+                            None => state
+                                .relay
+                                .dispatch_sessions(dispatch::SessionFilter::All, 50),
+                        };
+                        reply.send(sessions).ok();
+                        Vec::new()
+                    }
+                    Event::Voice(call) => {
+                        start_dispatch_voice(hub.clone(), state.dispatch.clone(), call, cx);
+                        Vec::new()
                     }
                 }
             };
@@ -155,6 +194,35 @@ pub fn serve(
         }
         Ok(())
     })
+}
+
+fn start_dispatch_voice(
+    hub: Rc<RefCell<Hub>>,
+    dispatch: Option<Dispatch>,
+    mut call: VoiceCall,
+    cx: &mut AsyncApp,
+) {
+    cx.spawn(async move |cx| {
+        let result = match dispatch {
+            Some(dispatch) => {
+                dispatch
+                    .voice(
+                        &mut call,
+                        |name, arguments| dispatch::call_tool(&hub.borrow().relay, name, arguments),
+                        cx.background_executor(),
+                    )
+                    .await
+            }
+            None => Err(anyhow!("Dispatch is disabled on this hub")),
+        };
+        if let Err(error) = result {
+            call.updates
+                .send(json!({ "type": "error", "message": format!("{error:#}") }))
+                .await
+                .ok();
+        }
+    })
+    .detach();
 }
 
 fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {

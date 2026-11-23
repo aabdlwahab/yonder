@@ -1,0 +1,44 @@
+:root {
+  color-scheme: dark;
+  font: 100%/1.5 system-ui, sans-serif;
+  color: #f0f3f8;
+  background: #161b22;
+  --surface: #202834;
+  --border: #364252;
+  --muted: #aebbc9;
+  --accent: #b7eed9;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+main { max-width: 39rem; margin: auto; padding: clamp(1.25rem, 5vw, 2.75rem); }
+header span, label, .speaker { font-size: .85rem; font-weight: 650; color: var(--muted); }
+header span { color: var(--accent); }
+h1, h2, h3, p { margin: 0; overflow-wrap: anywhere; }
+h1 { font-size: clamp(2.3rem, 8vw, 3.5rem); letter-spacing: -.055em; line-height: 1.1; }
+header { margin-bottom: .8rem; }
+h2 { font-size: 1.22rem; }
+#status, #catalog-status, #activity { color: var(--muted); margin-bottom: 1rem; }
+#status[data-error], #catalog-status[data-error] { color: #ffc2bc; }
+section { margin-top: 1.5rem; }
+.call, #history { background: var(--surface); border: 1px solid var(--border); border-radius: 1.1rem; padding: 1rem; }
+button, input { font: inherit; min-height: 2.75rem; border-radius: .6rem; }
+button { color: #12271f; background: var(--accent); font-weight: 700; border: 0; padding: .7rem 1rem; cursor: pointer; }
+button:disabled { opacity: .6; cursor: wait; }
+button:focus-visible, input:focus-visible { outline: 2px solid #d6f1fe; outline-offset: 3px; }
+input, .secondary { color: inherit; background: #161b22; border: 1px solid var(--border); }
+input { width: 100%; padding: .55rem .75rem; }
+form { display: grid; gap: .55rem; max-width: 25rem; }
+form button { justify-self: start; }
+.talk { width: 100%; min-height: 3.5rem; }
+.talk[data-active] { color: #3a1917; background: #ffc2bc; }
+#play, #activity { margin-top: .7rem; }
+#transcript:empty { display: none; }
+#transcript { margin-top: 1rem; max-height: 19rem; overflow: auto; }
+.entry { border-top: 1px solid var(--border); padding: .65rem 0; white-space: pre-wrap; }
+.speaker { display: block; margin-bottom: .2rem; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .6rem; }
+#sessions { padding: 0; list-style: none; margin: 0; }
+#sessions li { margin-bottom: .45rem; }
+#sessions button { display: block; width: 100%; text-align: left; color: inherit; background: var(--surface); border: 1px solid var(--border); overflow-wrap: anywhere; }
+#sessions small { display: block; color: var(--muted); font-weight: 450; }
+#history h3 { margin: .8rem 0 .5rem; }

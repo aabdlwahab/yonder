@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#161b22">
+  <title>Dispatch · Yonder</title>
+  <link rel="stylesheet" href="/dispatch/dispatch.css">
+  <script src="/dispatch/dispatch.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><span>Yonder</span><h1>Dispatch</h1></header>
+    <p id="status" role="status">Connecting to the hub…</p>
+    <form id="pair" hidden>
+      <label for="code">Hub pairing code</label>
+      <input id="code" type="password" required maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <button type="submit">Pair phone</button>
+    </form>
+    <div id="dispatch" hidden>
+      <section class="call" aria-label="Voice call">
+        <button id="talk" type="button" class="talk">Talk to Dispatch</button>
+        <button id="play" type="button" hidden>Enable speaker</button>
+        <audio id="speaker" autoplay playsinline></audio>
+        <p id="activity" role="status" hidden></p>
+        <div id="transcript" role="log" aria-label="Call transcript"></div>
+      </section>
+      <section aria-labelledby="threads-heading">
+        <div class="section-heading">
+          <h2 id="threads-heading">Threads</h2>
+          <button id="refresh" type="button" class="secondary">Refresh</button>
+        </div>
+        <p id="catalog-status" role="status" hidden></p>
+        <div id="history" hidden>
+          <button id="back" type="button" class="secondary">← All threads</button>
+          <h3 id="thread-title" tabindex="-1"></h3>
+          <div id="messages"></div>
+        </div>
+        <ul id="sessions"></ul>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
