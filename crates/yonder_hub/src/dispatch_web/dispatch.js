@@ -9,6 +9,11 @@ const activity = byId('activity');
 const sessions = byId('sessions');
 const history = byId('history');
 const catalogStatus = byId('catalog-status');
+const toolActivity = {
+  tell_session: 'Passed your message to the thread',
+  ask_session: 'Asked the thread’s agent',
+  answer_approval: 'Answered the approval',
+};
 let call;
 let historyRequest;
 
@@ -218,7 +223,7 @@ async function startCall() {
             transcript.scrollTop = transcript.scrollHeight;
             break;
           case 'tool':
-            showStatus(activity, 'Checked the hub’s threads');
+            showStatus(activity, toolActivity[update.name] || 'Checked the hub’s threads');
             break;
           case 'openThread':
             await openThread(update.id);

@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -269,29 +270,9 @@ impl Relay {
         let meta = &session.meta;
         let state = dispatch_state(session);
         let pending_approval = (state == "waiting")
-            .then(|| {
-                self.agents
-                    .iter()
-                    .find(|(key, _)| key.machine == meta.machine && key.agent == meta.agent)
-                    .and_then(|(_, agent)| {
-                        agent.pending.iter().rev().find_map(|pending| {
-                            if pending.session.as_deref() != Some(id) {
-                                return None;
-                            }
-                            let request: Value = serde_json::from_str(&pending.line).ok()?;
-                            let method = request.get("method")?.as_str()?;
-                            if !method.contains("request_permission") {
-                                return None;
-                            }
-                            Some(json!({
-                                "title": request.pointer("/params/toolCall/title")
-                                    .and_then(Value::as_str)
-                                    .map(|title| tail(title, 400)),
-                            }))
-                        })
-                    })
-            })
-            .flatten();
+            .then(|| self.pending_approval(id))
+            .flatten()
+            .map(|(_, pending, request)| describe_approval(pending, &request));
         let recent_tool = SessionFilter::Active
             .matches(state)
             .then(|| recent_dispatch_tool(&session.log))
@@ -370,6 +351,78 @@ impl Relay {
 
     pub fn dispatch_has_session(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
+    }
+
+    /// The agent that runs a session and the session's project directory.
+    pub fn dispatch_target(&self, id: &str) -> Option<(AgentKey, String)> {
+        let meta = &self.sessions.get(id)?.meta;
+        Some((
+            AgentKey {
+                machine: meta.machine.clone(),
+                agent: meta.agent.clone(),
+            },
+            meta.cwd.clone(),
+        ))
+    }
+
+    /// Whether a running agent is working on the session or waiting for an
+    /// approval in it.
+    pub fn dispatch_session_busy(&self, id: &str) -> bool {
+        self.sessions
+            .get(id)
+            .is_some_and(|session| SessionFilter::Active.matches(dispatch_state(session)))
+    }
+
+    pub fn dispatch_session_live(&self, id: &str) -> bool {
+        self.sessions.get(id).is_some_and(|session| session.live)
+    }
+
+    /// Answers the approval a session waits on with the agent's one-time
+    /// option, never an "always" one.
+    pub fn dispatch_answer_approval(
+        &mut self,
+        session_id: &str,
+        approval_id: &str,
+        approve: bool,
+    ) -> Result<Vec<Output>> {
+        if !self.sessions.contains_key(session_id) {
+            bail!("unknown hub session ID");
+        }
+        let (key, pending, request) = self
+            .pending_approval(session_id)
+            .filter(|(_, pending, _)| approval_id_of(&pending.id) == approval_id)
+            .context("That approval is no longer waiting. Check the thread again.")?;
+        let kind = if approve { "allow_once" } else { "reject_once" };
+        let option = request
+            .pointer("/params/options")
+            .and_then(Value::as_array)
+            .and_then(|options| options.iter().find(|option| option["kind"] == kind))
+            .and_then(|option| option["optionId"].as_str())
+            .with_context(|| format!("The agent doesn't offer a {kind} answer"))?;
+        let id = pending.id.clone();
+        let answer = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "outcome": { "outcome": "selected", "optionId": option } },
+        });
+        Ok(self.client_response(key, id, &answer.to_string()))
+    }
+
+    /// The newest approval request a session waits on.
+    fn pending_approval(&self, id: &str) -> Option<(AgentKey, &PendingRequest, Value)> {
+        let (key, _) = self.dispatch_target(id)?;
+        let agent = self.agents.get(&key)?;
+        agent.pending.iter().rev().find_map(|pending| {
+            if pending.session.as_deref() != Some(id) {
+                return None;
+            }
+            let request: Value = serde_json::from_str(&pending.line).ok()?;
+            request
+                .get("method")?
+                .as_str()?
+                .contains("request_permission")
+                .then(|| (key.clone(), pending, request))
+        })
     }
 
     pub fn client_connected(&mut self, client: ClientId, endpoint: Endpoint) {
@@ -1179,7 +1232,11 @@ fn apply_update(session: &mut Session, update: &Value, now: u64) -> bool {
         }
         "state_update" => {
             if let Some(state) = update.get("state").and_then(Value::as_str) {
-                session.meta.state = state.to_string();
+                // Codex reports an approval it waits on as `requires_action`.
+                session.meta.state = match state {
+                    "requires_action" => "waiting".to_string(),
+                    state => state.to_string(),
+                };
             }
             session.meta.last_text = tail(&session.message_text, LAST_TEXT_CHARS);
             session.meta.updated_at = now;
@@ -1236,7 +1293,60 @@ fn recent_dispatch_tool(log: &[String]) -> Option<Value> {
     None
 }
 
-fn tail(text: &str, chars: usize) -> String {
+const APPROVAL_COMMAND_CHARS: usize = 1_000;
+
+/// What Dispatch reads back before an approval: the command as the agent
+/// would run it, keeping its start when it's long.
+fn describe_approval(pending: &PendingRequest, request: &Value) -> Value {
+    let tool_call = approval_tool_call(request);
+    let command = match tool_call.pointer("/rawInput/command") {
+        Some(Value::String(command)) => Some(command.clone()),
+        Some(Value::Array(parts)) => {
+            let parts: Vec<&str> = parts.iter().filter_map(Value::as_str).collect();
+            match parts.as_slice() {
+                [_, flag, script] if matches!(*flag, "-c" | "-lc") => Some(script.to_string()),
+                _ => Some(parts.join(" ")),
+            }
+        }
+        _ => None,
+    };
+    let details = match (&command, tool_call.get("rawInput")) {
+        (None, Some(input)) if !input.is_null() => Some(input.to_string()),
+        _ => None,
+    };
+    let shown = command.or(details);
+    let truncated = shown
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > APPROVAL_COMMAND_CHARS);
+    json!({
+        "approvalId": approval_id_of(&pending.id),
+        "question": request["params"]["description"].as_str().map(|text| tail(text, 400)),
+        "title": tool_call["title"].as_str().map(|title| tail(title, 400)),
+        "kind": tool_call["kind"],
+        "command": shown.map(|text| text.chars().take(APPROVAL_COMMAND_CHARS).collect::<String>()),
+        "commandTruncated": truncated,
+    })
+}
+
+/// The id Dispatch passes back to answer an approval: the agent's request
+/// id, without JSON quotes.
+fn approval_id_of(id: &Value) -> String {
+    match id {
+        Value::String(id) => id.clone(),
+        id => id.to_string(),
+    }
+}
+
+/// The tool call an approval request is about. ACP v2 puts it under
+/// `subject`; v1 put it directly in the params.
+pub(crate) fn approval_tool_call(request: &Value) -> &Value {
+    let params = &request["params"];
+    params
+        .pointer("/subject/toolCall")
+        .unwrap_or(&params["toolCall"])
+}
+
+pub(crate) fn tail(text: &str, chars: usize) -> String {
     let count = text.chars().count();
     text.chars().skip(count.saturating_sub(chars)).collect()
 }
@@ -1532,6 +1642,81 @@ mod tests {
             relay.client_message(1, answer).is_empty(),
             "a second answer is ignored"
         );
+    }
+
+    #[test]
+    fn dispatch_answers_only_the_approval_it_read_with_a_one_time_option() {
+        let mut relay = with_session(ready_relay(&[1]), 1);
+        assert!(!relay.dispatch_session_busy("s1"));
+        let request = json!({"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{
+            "sessionId":"s1",
+            "description":"May I run npm test outside the sandbox?",
+            "subject":{"type":"tool_call","toolCall":{"title":"Run tests","kind":"execute","rawInput":{"command":["bash","-lc","npm test"]}}},
+            "options":[
+                {"optionId":"always","name":"Always allow","kind":"allow_always"},
+                {"optionId":"once","name":"Allow","kind":"allow_once"},
+                {"optionId":"no","name":"Reject","kind":"reject_once"},
+            ],
+        }})
+        .to_string();
+        relay.agent_line(&key(), &request);
+        relay.agent_line(
+            &key(),
+            &update("state_update", json!({"state":"requires_action"})),
+        );
+        assert!(relay.dispatch_session_busy("s1"));
+        assert_eq!(relay.sessions()[0].state, "waiting");
+
+        let pending = relay.dispatch_session_now("s1").unwrap()["pendingApproval"].clone();
+        assert_eq!(pending["command"], "npm test");
+        assert_eq!(pending["title"], "Run tests");
+        assert_eq!(
+            pending["question"],
+            "May I run npm test outside the sandbox?"
+        );
+        let approval = pending["approvalId"].as_str().unwrap().to_string();
+        assert_eq!(approval, "perm-1");
+
+        assert!(
+            relay
+                .dispatch_answer_approval("s1", "perm-0", true)
+                .is_err(),
+            "an approval Dispatch didn't read can't be answered"
+        );
+        let outputs = relay
+            .dispatch_answer_approval("s1", &approval, true)
+            .unwrap();
+        assert_eq!(
+            parse(&outputs[0])["result"]["outcome"],
+            json!({"outcome":"selected","optionId":"once"})
+        );
+        assert!(matches!(&outputs[0], Output::ToAgent(agent, _) if *agent == key()));
+        assert_eq!(relay.sessions()[0].state, "running");
+        assert!(
+            relay
+                .dispatch_answer_approval("s1", &approval, false)
+                .is_err(),
+            "an answered approval is gone"
+        );
+        assert!(
+            relay
+                .client_message(
+                    1,
+                    &json!({"jsonrpc":"2.0","id":"perm-1","result":{}}).to_string()
+                )
+                .is_empty(),
+            "a client's late answer is ignored"
+        );
+
+        relay.agent_line(&key(), &request.replace("perm-1", "perm-2"));
+        let approval = relay.dispatch_session_now("s1").unwrap()["pendingApproval"]["approvalId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let outputs = relay
+            .dispatch_answer_approval("s1", &approval, false)
+            .unwrap();
+        assert_eq!(parse(&outputs[0])["result"]["outcome"]["optionId"], "no");
     }
 
     #[test]
