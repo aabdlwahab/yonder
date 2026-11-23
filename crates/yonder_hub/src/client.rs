@@ -248,7 +248,7 @@ pub fn approve(hub: &HubAddress, session: &str, option: Option<&str>) -> Result<
                 );
             }
             println!(
-                "Answer with: yonder-hub approve {} <option>",
+                "Answer with: yonder hub approve {} <option>",
                 short(&meta.id)
             );
             return Ok(());
@@ -340,7 +340,7 @@ fn print_message(message: &Value, last_message: &mut Option<String>) {
     let method = message.get("method").and_then(Value::as_str);
     if method.is_some_and(|method| method.contains("request_permission")) {
         println!("\n⏸ {}", describe_permission(message));
-        println!("  (answer with: yonder-hub approve <session> <option>)");
+        println!("  (answer with: yonder hub approve <session> <option>)");
         return;
     }
     let Some(update) = message.pointer("/params/update") else {

@@ -18,7 +18,7 @@ Have a Tailscale operator run the following command there, using the hub's full 
 tailscale cert --cert-file cert.pem --key-file key.pem hub.example.ts.net
 ```
 
-Add these flags to the hub's existing `yonder-hub serve` command, alongside `--dispatch-codex /path/to/codex`.
+Add these flags to the hub's existing `yonder hub serve` command, alongside `--dispatch-codex /path/to/codex`.
 
 ```sh
 --dispatch-web-listen 100.64.0.10:8443 \

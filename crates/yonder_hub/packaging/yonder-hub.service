@@ -1,5 +1,5 @@
 # User service for the Yonder hub. Install with:
-#   cp yonder-hub ~/.local/bin/
+#   cp yonder-headless ~/.local/bin/yonder   # see script/build-yonder-headless
 #   cp yonder-hub.service ~/.config/systemd/user/
 #   systemctl --user enable --now yonder-hub
 #   loginctl enable-linger $USER   # keep it running after logout
@@ -9,7 +9,7 @@ After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/yonder-hub serve
+ExecStart=%h/.local/bin/yonder hub serve
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=yonder_hub=info

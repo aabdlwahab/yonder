@@ -22446,6 +22446,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yonder_headless"
+version = "0.1.0"
+dependencies = [
+ "remote_server",
+ "yonder_hub",
+]
+
+[[package]]
 name = "yonder_hub"
 version = "0.1.0"
 dependencies = [
@@ -22776,6 +22784,7 @@ dependencies = [
  "windows 0.62.2",
  "windows_resources",
  "workspace",
+ "yonder_headless",
  "zed-reqwest",
  "zed_actions",
  "zed_credentials_provider",

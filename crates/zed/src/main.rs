@@ -218,6 +218,16 @@ fn main() {
     #[cfg(target_os = "linux")]
     sandbox_linux::run_hidden_entrypoint_if_invoked();
 
+    // `yonder hub …` and `yonder server …` do the hub's and the machine
+    // server's jobs from the app's own binary, as the `yonder` program on
+    // servers does.
+    {
+        let args = std::env::args_os().collect::<Vec<_>>();
+        if let Some((job, args)) = yonder_headless::job_from_args(&args) {
+            yonder_headless::run_job(job, args);
+        }
+    }
+
     #[cfg(unix)]
     util::prevent_root_execution();
 

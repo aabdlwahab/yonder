@@ -1,0 +1,24 @@
+[package]
+name = "yonder_headless"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "The yonder program's jobs that need no screen: the machine server and the hub"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/yonder_headless.rs"
+doctest = false
+
+# The `yonder` program for machines without a screen. Installed as `yonder`,
+# with `yonder-hub` as a link to it for the hub's old name.
+[[bin]]
+name = "yonder-headless"
+path = "src/main.rs"
+
+[dependencies]
+remote_server.workspace = true
+yonder_hub.workspace = true

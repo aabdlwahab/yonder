@@ -247,6 +247,7 @@ members = [
     "crates/worktree_benchmarks",
     "crates/x_ai",
     "crates/x_ai_subscribed",
+    "crates/yonder_headless",
     "crates/yonder_hub",
     "crates/zed",
     "crates/zed_actions",
@@ -522,6 +523,8 @@ workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }
 x_ai_subscribed = { path = "crates/x_ai_subscribed" }
+yonder_headless = { path = "crates/yonder_headless" }
+yonder_hub = { path = "crates/yonder_hub" }
 zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }

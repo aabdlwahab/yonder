@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Builds the `yonder` program for Linux machines without a screen: the
+# machine server and the hub in one static (musl) binary that runs on any
+# Linux, whatever its glibc version and with no display libraries.
+#
+#   script/build-yonder-headless [x86_64|aarch64]   (default: this machine's)
+#
+# Writes target/yonder-headless/yonder-linux-<arch> and a .gz copy. Install it
+# on a machine as ~/.local/bin/yonder; a `yonder-hub` link to it keeps the
+# hub's old name working.
+#
+# C libraries (sqlite, zstd, lmdb, aws-lc) are built from source for musl, so
+# this needs a musl C compiler: set CC_<triple> (for example
+# CC_x86_64_unknown_linux_musl=musl-gcc), or have cargo-zigbuild and zig on
+# PATH. Build on Linux; macOS can't link these for Linux.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+arch=${1:-$(uname -m)}
+case "$arch" in
+    x86_64 | amd64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *)
+        echo "Unsupported architecture: $arch (use x86_64 or aarch64)" >&2
+        exit 1
+        ;;
+esac
+triple="$arch-unknown-linux-musl"
+cc_var="CC_${triple//-/_}"
+
+if command -v rustup >/dev/null 2>&1; then
+    rustup target add "$triple" >/dev/null
+fi
+
+build=(build)
+if [[ -z "${!cc_var:-}" ]]; then
+    if [[ "$arch" == "$(uname -m)" ]] && command -v musl-gcc >/dev/null 2>&1; then
+        export "$cc_var"=musl-gcc
+    elif command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
+        build=(zigbuild)
+    else
+        echo "No musl C compiler: set $cc_var, install musl-gcc, or put cargo-zigbuild and zig on PATH." >&2
+        exit 1
+    fi
+fi
+
+cargo --config .cargo/bundle-config.toml "${build[@]}" --release \
+    --package yonder_headless --bin yonder-headless --target "$triple"
+
+out=target/yonder-headless
+mkdir -p "$out"
+binary="$out/yonder-linux-$arch"
+cp "target/$triple/release/yonder-headless" "$binary"
+# The release profile keeps limited debug info for crash reports; the copy
+# that goes to machines doesn't need it.
+if command -v llvm-strip >/dev/null 2>&1; then
+    llvm-strip --strip-debug "$binary"
+elif [[ "$arch" == "$(uname -m)" ]] && command -v strip >/dev/null 2>&1; then
+    strip --strip-debug "$binary"
+fi
+gzip -9 -c "$binary" > "$binary.gz"
+
+if [[ "$arch" == "$(uname -m)" ]]; then
+    "$binary" server version >/dev/null
+    if command -v ldd >/dev/null 2>&1 && ldd "$binary" 2>&1 | grep -q '=>'; then
+        echo "$binary links shared libraries; expected a static binary:" >&2
+        ldd "$binary" >&2
+        exit 1
+    fi
+fi
+ls -lh "$binary" "$binary.gz"

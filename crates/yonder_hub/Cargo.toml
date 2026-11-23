@@ -8,9 +8,9 @@ license = "GPL-3.0-or-later"
 [lints]
 workspace = true
 
-[[bin]]
-name = "yonder-hub"
-path = "src/main.rs"
+[lib]
+path = "src/yonder_hub.rs"
+doctest = false
 
 [dependencies]
 acp_thread.workspace = true

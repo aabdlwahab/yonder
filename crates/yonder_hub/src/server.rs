@@ -37,7 +37,7 @@ use crate::relay::{
     AgentKey, ClientId, Endpoint, Notice, NoticeKind, Output, Relay, error_response,
     result_response,
 };
-use gpui::http_client::{AsyncBody, HttpClient as _, Method, Request as HttpRequest};
+use gpui::http_client::{AsyncBody, Method, Request as HttpRequest};
 
 pub const DEFAULT_PORT: u16 = 7766;
 
@@ -164,7 +164,7 @@ pub fn serve(
         let listener = smol::net::TcpListener::bind(&listen)
             .await
             .with_context(|| format!("listening on {listen}"))?;
-        eprintln!("yonder-hub on {local_name}: listening on ws://{listen}");
+        eprintln!("yonder hub on {local_name}: listening on ws://{listen}");
         eprintln!("token: {}", Registry::default_dir().join("token").display());
         cx.background_spawn(accept_loop(listener, token, events.clone()))
             .detach();

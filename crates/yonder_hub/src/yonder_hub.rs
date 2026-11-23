@@ -1,7 +1,7 @@
 //! Yonder hub: a headless Yonder that owns agent threads, so they keep
 //! running with the laptop shut. Clients (the Mac app, a phone, the CLI here)
 //! speak ACP to it over a websocket and it relays to agents it starts on each
-//! machine.
+//! machine. It runs as `yonder hub …` (see the `yonder_headless` crate).
 
 mod client;
 mod dispatch;
@@ -30,7 +30,8 @@ use util::path_list::PathList;
 
 #[derive(Parser)]
 #[command(
-    name = "yonder-hub",
+    name = "yonder hub",
+    bin_name = "yonder hub",
     about = "Run agent threads that outlive the laptop"
 )]
 struct Cli {
@@ -105,8 +106,10 @@ struct Args {
     timeout: u64,
 }
 
-fn main() {
-    let cli = Cli::parse();
+/// Runs the hub's command line. `args` starts with the program name, as
+/// `std::env::args_os` does.
+pub fn run_cli(args: impl IntoIterator<Item = std::ffi::OsString>) {
+    let cli = Cli::parse_from(args);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("yonder_hub=info"))
         .init();
 
@@ -176,7 +179,7 @@ fn main() {
         }),
     };
     if let Err(error) = result {
-        eprintln!("yonder-hub: {error:#}");
+        eprintln!("yonder hub: {error:#}");
         process::exit(1);
     }
 }
@@ -199,7 +202,7 @@ fn run_headless(
             let code = match task.await {
                 Ok(()) => 0,
                 Err(error) => {
-                    eprintln!("yonder-hub: {error:#}");
+                    eprintln!("yonder hub: {error:#}");
                     1
                 }
             };

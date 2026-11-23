@@ -91,6 +91,78 @@ pub enum Commands {
     Exec,
 }
 
+#[derive(clap::Parser)]
+#[command(disable_version_flag = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+    /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
+    /// by having Zed act like netcat communicating over a Unix socket.
+    #[arg(long, hide = true)]
+    askpass: Option<String>,
+    /// Used for recording minidumps on crashes by having the server run a separate
+    /// process communicating over a socket.
+    #[arg(long, hide = true)]
+    crash_handler: Option<PathBuf>,
+    /// Used for loading the environment from the project.
+    #[arg(long, hide = true)]
+    printenv: bool,
+}
+
+/// Runs the server's command line. `args` starts with the program name, as
+/// `std::env::args_os` does. `self_args` go before `run` when the server
+/// starts its daemon: empty for the standalone server, `["server"]` inside
+/// the `yonder` program.
+pub fn run_cli(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    self_args: Vec<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    use clap::Parser as _;
+    use std::io::Write as _;
+
+    SELF_ARGS.set(self_args).ok();
+    let cli = Cli::parse_from(args);
+
+    if let Some(socket_path) = &cli.askpass {
+        askpass::main(socket_path);
+        return Ok(());
+    }
+
+    if let Some(socket) = &cli.crash_handler {
+        crashes::crash_server(socket.as_path(), paths::logs_dir().clone());
+        return Ok(());
+    }
+
+    if cli.printenv {
+        util::shell_env::print_env();
+        return Ok(());
+    }
+
+    if let Some(command) = cli.command {
+        let res = run(command);
+        if let Err(e) = &res
+            && let Some(e) = e.downcast_ref::<ExecuteProxyError>()
+        {
+            std::io::stderr().write_fmt(format_args!("{e:#}\n")).ok();
+            // It is important for us to report the proxy spawn exit code here
+            // instead of the generic 1 that result returns
+            // The client reads the exit code to determine if the server process has died when trying to reconnect
+            // signaling that it needs to try spawning a new server
+            std::process::exit(e.to_exit_code());
+        }
+        res
+    } else {
+        std::io::stderr()
+            .write_all(if cfg!(unix) {
+                b"usage: remote <run|proxy|version|exec>\n"
+            } else {
+                b"usage: remote <run|proxy|version>\n"
+            })
+            .ok();
+        std::process::exit(1);
+    }
+}
+
 pub fn run(command: Commands) -> anyhow::Result<()> {
     use anyhow::Context;
     use release_channel::{RELEASE_CHANNEL, ReleaseChannel};
@@ -1140,6 +1212,15 @@ pub enum SpawnServerError {
     Timeout,
 }
 
+/// Arguments that go before the server's own when it starts itself again:
+/// `server` when it runs inside the `yonder` program, so the new process does
+/// the server's job too.
+static SELF_ARGS: std::sync::OnceLock<Vec<std::ffi::OsString>> = std::sync::OnceLock::new();
+
+fn self_args() -> &'static [std::ffi::OsString] {
+    SELF_ARGS.get().map(Vec::as_slice).unwrap_or_default()
+}
+
 async fn spawn_server(paths: &ServerPaths) -> Result<(), SpawnServerError> {
     log::info!("spawning server process",);
     if paths.stdin_socket.exists() {
@@ -1196,6 +1277,7 @@ fn spawn_server_windows(binary_name: &Path, paths: &ServerPaths) -> Result<(), S
         .stdin(util::command::Stdio::null())
         .stdout(util::command::Stdio::null())
         .stderr(util::command::Stdio::null())
+        .args(self_args())
         .arg("run")
         .arg("--log-file")
         .arg(&paths.log_file)
@@ -1220,6 +1302,7 @@ fn spawn_server_normal(binary_name: &Path, paths: &ServerPaths) -> Result<(), Sp
         .stdin(util::command::Stdio::null())
         .stdout(util::command::Stdio::null())
         .stderr(util::command::Stdio::null())
+        .args(self_args())
         .arg("run")
         .arg("--log-file")
         .arg(&paths.log_file)
