@@ -30,6 +30,83 @@ impl CustomAgentServer {
     }
 }
 
+impl CustomAgentServer {
+    /// The command that starts this agent, with the environment Yonder adds
+    /// (proxy, API keys, browser setting), resolved through the agent store.
+    /// The hub uses it to start agents without the agent panel.
+    pub fn command(
+        &self,
+        store: Entity<project::AgentServerStore>,
+        cx: &mut App,
+    ) -> Task<Result<project::agent_server_store::AgentServerCommand>> {
+        let is_registry_agent = is_registry_agent(self.agent_id(), cx);
+        if is_registry_agent {
+            if let Some(registry_store) = project::AgentRegistryStore::try_global(cx) {
+                registry_store.update(cx, |store, cx| store.refresh_if_stale(cx));
+            }
+        }
+        let delegate = AgentServerDelegate::new(store, None, None);
+        self.resolve_command(delegate, is_registry_agent, cx)
+    }
+
+    fn resolve_command(
+        &self,
+        delegate: AgentServerDelegate,
+        is_registry_agent: bool,
+        cx: &mut App,
+    ) -> Task<Result<project::agent_server_store::AgentServerCommand>> {
+        let agent_id = self.agent_id();
+        let mut extra_env = load_proxy_env(cx);
+        if delegate.store.read(cx).no_browser() {
+            extra_env.insert("NO_BROWSER".to_owned(), "1".to_owned());
+        }
+        if is_registry_agent {
+            match project::agent_server_store::registry_id_for_agent(agent_id.as_ref()) {
+                CLAUDE_AGENT_ID => {
+                    extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
+                }
+                CODEX_ID => {
+                    if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
+                        extra_env.insert("CODEX_API_KEY".into(), api_key);
+                    }
+                    if let Ok(api_key) = std::env::var("OPEN_AI_API_KEY") {
+                        extra_env.insert("OPEN_AI_API_KEY".into(), api_key);
+                    }
+                }
+                GEMINI_ID => {
+                    extra_env.insert("SURFACE".to_owned(), "zed".to_owned());
+                }
+                _ => {}
+            }
+        }
+        let store = delegate.store.downgrade();
+        let new_version_available = delegate.new_version_available;
+        let loading_status = delegate.loading_status;
+        cx.spawn(async move |cx| {
+            if is_registry_agent && agent_id.as_ref() == GEMINI_ID {
+                if let Some(api_key) = cx.update(api_key_for_gemini_cli).await.ok() {
+                    extra_env.insert("GEMINI_API_KEY".into(), api_key);
+                }
+            }
+            let command = store
+                .update(cx, |store, cx| {
+                    let agent = store.get_external_agent(&agent_id).with_context(|| {
+                        format!("Custom agent server `{}` is not registered", agent_id)
+                    })?;
+                    if let Some(new_version_available_tx) = new_version_available {
+                        agent.set_new_version_available_tx(new_version_available_tx);
+                    }
+                    if let Some(loading_status_tx) = loading_status {
+                        agent.set_loading_status_tx(loading_status_tx);
+                    }
+                    anyhow::Ok(agent.get_command(vec![], extra_env, &mut cx.to_async()))
+                })??
+                .await?;
+            Ok(command)
+        })
+    }
+}
+
 impl AgentServer for CustomAgentServer {
     fn agent_id(&self) -> AgentId {
         self.agent_id.clone()
@@ -227,50 +304,10 @@ impl AgentServer for CustomAgentServer {
             }
         }
 
-        let mut extra_env = load_proxy_env(cx);
-        if delegate.store.read(cx).no_browser() {
-            extra_env.insert("NO_BROWSER".to_owned(), "1".to_owned());
-        }
-        if is_registry_agent {
-            match project::agent_server_store::registry_id_for_agent(agent_id.as_ref()) {
-                CLAUDE_AGENT_ID => {
-                    extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
-                }
-                CODEX_ID => {
-                    if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
-                        extra_env.insert("CODEX_API_KEY".into(), api_key);
-                    }
-                    if let Ok(api_key) = std::env::var("OPEN_AI_API_KEY") {
-                        extra_env.insert("OPEN_AI_API_KEY".into(), api_key);
-                    }
-                }
-                GEMINI_ID => {
-                    extra_env.insert("SURFACE".to_owned(), "zed".to_owned());
-                }
-                _ => {}
-            }
-        }
         let store = delegate.store.downgrade();
+        let command = self.resolve_command(delegate, is_registry_agent, cx);
         cx.spawn(async move |cx| {
-            if is_registry_agent && agent_id.as_ref() == GEMINI_ID {
-                if let Some(api_key) = cx.update(api_key_for_gemini_cli).await.ok() {
-                    extra_env.insert("GEMINI_API_KEY".into(), api_key);
-                }
-            }
-            let command = store
-                .update(cx, |store, cx| {
-                    let agent = store.get_external_agent(&agent_id).with_context(|| {
-                        format!("Custom agent server `{}` is not registered", agent_id)
-                    })?;
-                    if let Some(new_version_available_tx) = delegate.new_version_available {
-                        agent.set_new_version_available_tx(new_version_available_tx);
-                    }
-                    if let Some(loading_status_tx) = delegate.loading_status {
-                        agent.set_loading_status_tx(loading_status_tx);
-                    }
-                    anyhow::Ok(agent.get_command(vec![], extra_env, &mut cx.to_async()))
-                })??
-                .await?;
+            let command = command.await?;
             let connection = crate::acp::connect(
                 agent_id,
                 project,

@@ -121,6 +121,43 @@ fn fallback_failure(failure: anyhow::Error, negotiation: anyhow::Error) -> anyho
     failure.context(context)
 }
 
+/// A started agent process and the line streams for speaking ACP to it.
+/// The process is killed when this is dropped.
+pub struct AgentProcess {
+    pub incoming: futures::stream::BoxStream<'static, std::io::Result<String>>,
+    pub outgoing: std::pin::Pin<Box<dyn futures::Sink<String, Error = std::io::Error> + Send>>,
+    /// Logs the agent's stderr until it exits.
+    pub stderr: futures::future::BoxFuture<'static, Result<()>>,
+    /// Kills the agent when dropped.
+    pub guard: AgentProcessGuard,
+}
+
+/// Keeps an agent process alive; dropping it kills the process.
+pub struct AgentProcessGuard(#[allow(dead_code)] transport::OwnedChild);
+
+/// Starts an agent the way Yonder does, over SSH for remote projects, but
+/// hands back the raw message streams instead of a connection. The hub uses
+/// this to relay ACP between agents and its own clients.
+pub fn spawn_agent_process(
+    project: &Entity<Project>,
+    command: AgentServerCommand,
+    cx: &AsyncApp,
+) -> Result<AgentProcess> {
+    let transport::StdioProcess {
+        child,
+        incoming,
+        outgoing,
+        stderr,
+        debug_log: _,
+    } = transport::spawn_stdio(project, command, cx)?;
+    Ok(AgentProcess {
+        incoming,
+        outgoing,
+        stderr,
+        guard: AgentProcessGuard(transport::OwnedChild(child)),
+    })
+}
+
 pub async fn connect(
     agent_id: AgentId,
     project: Entity<Project>,
