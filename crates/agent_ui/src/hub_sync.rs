@@ -159,13 +159,14 @@ impl HubSync {
     }
 
     pub(crate) fn ask_dispatch(&self, prompt: String, cx: &App) -> Task<Result<DispatchReply>> {
+        let sessions = self.importable_sessions(cx);
+        let mut calls = Vec::new();
+        if !sessions.is_empty() {
+            calls.push(("_yonder/hub/import", json!({ "sessions": sessions })));
+        }
+        calls.push(("_yonder/dispatch/ask", json!({ "prompt": prompt })));
         // Give the hub time to return its own error if the 90-second turn times out.
-        self.request(
-            "_yonder/dispatch/ask",
-            json!({ "prompt": prompt }),
-            Duration::from_secs(100),
-            cx,
-        )
+        self.request(calls, Duration::from_secs(100), cx)
     }
 
     pub(crate) fn sync_session(
@@ -181,8 +182,7 @@ impl HubSync {
 
         let address = self.address().map(str::to_owned);
         let request = self.request::<HubSessions>(
-            "_yonder/hub/sessions",
-            json!({}),
+            vec![("_yonder/hub/sessions", json!({}))],
             Duration::from_secs(10),
             cx,
         );
@@ -200,8 +200,7 @@ impl HubSync {
 
     fn request<Response: DeserializeOwned + Send + 'static>(
         &self,
-        method: &'static str,
-        params: Value,
+        calls: Vec<(&'static str, Value)>,
         timeout: Duration,
         cx: &App,
     ) -> Task<Result<Response>> {
@@ -215,7 +214,7 @@ impl HubSync {
         let token = token.clone();
         let executor = cx.background_executor().clone();
         cx.background_spawn(async move {
-            let request = agent_servers::call_hub(&address, &token, vec![(method, params)]);
+            let request = agent_servers::call_hub(&address, &token, calls);
             futures::pin_mut!(request);
             match select(request, executor.timer(timeout)).await {
                 Either::Left((result, _)) => {
@@ -350,13 +349,11 @@ impl HubSync {
         add_hub_sessions(sessions, cx);
     }
 
-    /// Hands the app's threads on served machines to the hub, so it (and
-    /// Dispatch) list them. The hub ignores ones it already knows.
-    fn import_threads(&self, address: String, token: String, cx: &mut Context<Self>) {
+    fn importable_sessions(&self, cx: &App) -> Vec<Value> {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
-            return;
+            return Vec::new();
         };
-        let sessions: Vec<Value> = store
+        store
             .read(cx)
             .entries()
             .filter(|thread| !thread.archived && thread.agent_id != *agent::ZED_AGENT_ID)
@@ -376,10 +373,15 @@ impl HubSync {
                     "agent": thread.agent_id.to_string(),
                     "cwd": cwd.to_string_lossy(),
                     "title": thread.title().map(|title| title.to_string()),
+                    "createdAt": thread.created_at.map(|created_at| created_at.timestamp()),
                     "updatedAt": thread.updated_at.timestamp(),
                 }))
             })
-            .collect();
+            .collect()
+    }
+
+    fn import_threads(&self, address: String, token: String, cx: &mut Context<Self>) {
+        let sessions = self.importable_sessions(cx);
         if sessions.is_empty() {
             return;
         }
