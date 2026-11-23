@@ -2,6 +2,8 @@
 //! the relay between them.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -9,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use agent_servers::{AgentProcess, AgentProcessGuard, CustomAgentServer, spawn_agent_process};
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_tungstenite::tungstenite::{
     Message,
     handshake::server::{ErrorResponse, Request, Response},
@@ -18,13 +20,13 @@ use async_tungstenite::tungstenite::{
 use collections::HashMap;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
-use futures::{SinkExt as _, StreamExt as _};
-use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
+use futures::future::{self, Either, select};
+use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
+use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 
-use crate::dispatch::VoiceCall;
-use crate::dispatch::{self, Dispatch};
+use crate::dispatch::{self, Action, Consent, Dispatch, ToolResult, ToolStep, VoiceCall};
 use crate::headless::AgentCliAppState;
 use crate::machines::Machines;
 use crate::registry::Registry;
@@ -74,6 +76,12 @@ struct Hub {
     dispatch: Option<Dispatch>,
     next_generation: u64,
     events: mpsc::UnboundedSender<Event>,
+    /// Messages from Dispatch per thread, sent one turn at a time. A thread
+    /// is in here while its messages are being delivered.
+    outbox: HashMap<String, VecDeque<ThreadMessage>>,
+    /// Ids for Dispatch's own connections, counting down so they never meet
+    /// the websocket ids counting up.
+    next_internal_client: ClientId,
 }
 
 /// Starts the hub and runs until the process exits.
@@ -106,6 +114,8 @@ pub fn serve(
             dispatch,
             next_generation: 0,
             events: events.clone(),
+            outbox: HashMap::default(),
+            next_internal_client: ClientId::MAX,
         }));
 
         let listener = smol::net::TcpListener::bind(&listen)
@@ -205,12 +215,9 @@ fn start_dispatch_voice(
     cx.spawn(async move |cx| {
         let result = match dispatch {
             Some(dispatch) => {
+                let tools = dispatch_tools(hub, dispatch.consent(), cx.clone());
                 dispatch
-                    .voice(
-                        &mut call,
-                        |name, arguments| dispatch::call_tool(&hub.borrow().relay, name, arguments),
-                        cx.background_executor(),
-                    )
+                    .voice(&mut call, &tools, cx.background_executor())
                     .await
             }
             None => Err(anyhow!("Dispatch is disabled on this hub")),
@@ -283,9 +290,8 @@ fn start_dispatch(
         return;
     }
     cx.spawn(async move |cx| {
-        let ask = dispatch.ask(&prompt, |name, arguments| {
-            dispatch::call_tool(&hub.borrow().relay, name, arguments)
-        });
+        let tools = dispatch_tools(hub, dispatch.consent(), cx.clone());
+        let ask = dispatch.ask(&prompt, &tools);
         let timeout = cx.background_executor().timer(dispatch::ASK_TIMEOUT);
         let result = smol::future::race(ask, async move {
             timeout.await;
@@ -299,6 +305,387 @@ fn start_dispatch(
         tx.unbounded_send(reply).ok();
     })
     .detach();
+}
+
+const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(300);
+const THREAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const SEND_WAIT: Duration = Duration::from_secs(20);
+const REPLY_WAIT: Duration = Duration::from_secs(45);
+const TURN_START_WAIT: Duration = Duration::from_secs(60);
+const REPLY_CHARS: usize = 2_000;
+
+/// Dispatch's tools: reads answer at once, and sends and approvals act
+/// through the hub.
+fn dispatch_tools(
+    hub: Rc<RefCell<Hub>>,
+    consent: Rc<RefCell<Consent>>,
+    cx: AsyncApp,
+) -> impl Fn(&str, Value) -> future::LocalBoxFuture<'static, Result<ToolResult>> {
+    move |name: &str, arguments: Value| {
+        let step = dispatch::call_tool(
+            &hub.borrow().relay,
+            &mut consent.borrow_mut(),
+            name,
+            arguments,
+        );
+        match step {
+            Ok(ToolStep::Done(result)) => future::ready(Ok(result)).boxed_local(),
+            Ok(ToolStep::Act(action)) => run_action(hub.clone(), action, cx.clone()).boxed_local(),
+            Err(error) => future::ready(Err(error)).boxed_local(),
+        }
+    }
+}
+
+async fn run_action(hub: Rc<RefCell<Hub>>, action: Action, mut cx: AsyncApp) -> Result<ToolResult> {
+    match action {
+        Action::AnswerApproval {
+            session,
+            approval,
+            approve,
+        } => {
+            let outputs = hub
+                .borrow_mut()
+                .relay
+                .dispatch_answer_approval(&session, &approval, approve)?;
+            apply(&hub, outputs, &mut cx);
+            let answer = if approve { "approved once" } else { "rejected" };
+            Ok(ToolResult::new(json!({ "answer": answer })))
+        }
+        Action::Send {
+            session,
+            text,
+            wait_for_reply,
+        } => send_to_thread(hub, session, text, wait_for_reply, cx).await,
+    }
+}
+
+struct ThreadMessage {
+    text: String,
+    progress: mpsc::UnboundedSender<Delivery>,
+}
+
+enum Delivery {
+    Queued,
+    Sent,
+    Replied(String),
+    Failed(String),
+}
+
+/// Queues a message for a thread and reports how far it got before the
+/// tool has to answer. Delivery carries on after that.
+async fn send_to_thread(
+    hub: Rc<RefCell<Hub>>,
+    session: String,
+    text: String,
+    wait_for_reply: bool,
+    cx: AsyncApp,
+) -> Result<ToolResult> {
+    let (progress, mut updates) = mpsc::unbounded();
+    let start_delivery = {
+        let mut state = hub.borrow_mut();
+        let start = !state.outbox.contains_key(&session);
+        state
+            .outbox
+            .entry(session.clone())
+            .or_default()
+            .push_back(ThreadMessage { text, progress });
+        start
+    };
+    if start_delivery {
+        cx.spawn({
+            let hub = hub.clone();
+            let session = session.clone();
+            async move |cx| deliver_messages(hub, session, cx).await
+        })
+        .detach();
+    }
+    let wait = if wait_for_reply {
+        REPLY_WAIT
+    } else {
+        SEND_WAIT
+    };
+    let deadline = cx.background_executor().timer(wait);
+    futures::pin_mut!(deadline);
+    let mut status = "sending";
+    loop {
+        match select(updates.next(), deadline.as_mut()).await {
+            Either::Left((Some(Delivery::Queued), _)) => {
+                status = "queued";
+                if !wait_for_reply {
+                    break;
+                }
+            }
+            Either::Left((Some(Delivery::Sent), _)) => {
+                status = "sent";
+                if !wait_for_reply {
+                    break;
+                }
+            }
+            Either::Left((Some(Delivery::Replied(reply)), _)) => {
+                return Ok(ToolResult::new(
+                    json!({ "status": "answered", "reply": reply }),
+                ));
+            }
+            Either::Left((Some(Delivery::Failed(error)), _)) => bail!("{error}"),
+            Either::Left((None, _)) => bail!("The hub stopped delivering the message"),
+            Either::Right(_) => break,
+        }
+    }
+    let note = match (status, wait_for_reply) {
+        ("queued", _) => {
+            "The thread is busy. The message is queued and goes out when its current turn ends."
+        }
+        ("sent", false) => "Sent. The agent is working on it.",
+        ("sent", true) => "Sent, but the agent hasn't answered yet. Check later with read_session.",
+        _ => "The thread's agent is starting. The message goes out when it's ready.",
+    };
+    Ok(ToolResult::new(json!({ "status": status, "note": note })))
+}
+
+async fn deliver_messages(hub: Rc<RefCell<Hub>>, session: String, cx: &mut AsyncApp) {
+    let executor = cx.background_executor().clone();
+    loop {
+        let message = {
+            let mut state = hub.borrow_mut();
+            match state.outbox.get_mut(&session).and_then(VecDeque::pop_front) {
+                Some(message) => message,
+                None => {
+                    state.outbox.remove(&session);
+                    return;
+                }
+            }
+        };
+        if let Err(error) = deliver(&hub, &session, &message, &executor).await {
+            log::warn!("Dispatch message to {session}: {error:#}");
+            message
+                .progress
+                .unbounded_send(Delivery::Failed(format!("{error:#}")))
+                .ok();
+        }
+    }
+}
+
+/// Sends one message once the thread is free, then follows the turn it
+/// starts so the next queued message waits for that turn as well.
+async fn deliver(
+    hub: &Rc<RefCell<Hub>>,
+    session: &str,
+    message: &ThreadMessage,
+    executor: &BackgroundExecutor,
+) -> Result<()> {
+    if hub.borrow().relay.dispatch_session_busy(session) {
+        message.progress.unbounded_send(Delivery::Queued).ok();
+        while hub.borrow().relay.dispatch_session_busy(session) {
+            executor.timer(Duration::from_secs(1)).await;
+        }
+    }
+    let (key, cwd) = hub
+        .borrow()
+        .relay
+        .dispatch_target(session)
+        .context("unknown hub session ID")?;
+    let mut connection = HubConnection::open(hub, Endpoint::Agent(key));
+    connection
+        .request_within(
+            executor,
+            AGENT_READY_TIMEOUT,
+            "initialize",
+            json!({ "protocolVersion": 2, "clientCapabilities": {} }),
+        )
+        .await
+        .context("starting the thread's agent")?;
+    connection
+        .request_within(
+            executor,
+            THREAD_REQUEST_TIMEOUT,
+            "session/resume",
+            json!({ "sessionId": session, "cwd": cwd, "mcpServers": [] }),
+        )
+        .await
+        .context("opening the thread")?;
+    connection.discard_received();
+    connection
+        .request_within(
+            executor,
+            THREAD_REQUEST_TIMEOUT,
+            "session/prompt",
+            json!({ "sessionId": session, "prompt": [{ "type": "text", "text": message.text }] }),
+        )
+        .await
+        .context("sending the message")?;
+    message.progress.unbounded_send(Delivery::Sent).ok();
+    let reply = follow_turn(&mut connection, hub, session, executor).await?;
+    if !reply.is_empty() {
+        message
+            .progress
+            .unbounded_send(Delivery::Replied(reply))
+            .ok();
+    }
+    Ok(())
+}
+
+/// Follows the turn a message started and returns the agent's last message.
+async fn follow_turn(
+    connection: &mut HubConnection,
+    hub: &Rc<RefCell<Hub>>,
+    session: &str,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
+    let mut reply = String::new();
+    let mut reply_id: Option<String> = None;
+    let mut started = false;
+    let sent_at = std::time::Instant::now();
+    loop {
+        let Some(message) =
+            within(executor, Duration::from_secs(5), connection.next_message()).await
+        else {
+            if !hub.borrow().relay.dispatch_session_live(session) {
+                bail!("The thread's agent stopped before answering");
+            }
+            if !started && sent_at.elapsed() > TURN_START_WAIT {
+                return Ok(String::new());
+            }
+            continue;
+        };
+        let message = message?;
+        if message["method"] != "session/update"
+            || message.pointer("/params/sessionId").and_then(Value::as_str) != Some(session)
+        {
+            continue;
+        }
+        let update = &message["params"]["update"];
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") => {
+                let id = update["messageId"].as_str();
+                if id != reply_id.as_deref() {
+                    reply_id = id.map(str::to_owned);
+                    reply.clear();
+                }
+                if let Some(text) = update.pointer("/content/text").and_then(Value::as_str) {
+                    reply.push_str(text);
+                }
+            }
+            Some("state_update") => match update["state"].as_str() {
+                Some("running") => started = true,
+                Some("idle") if started => return Ok(crate::relay::tail(&reply, REPLY_CHARS)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
+async fn within<T>(
+    executor: &BackgroundExecutor,
+    duration: Duration,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    let future = std::pin::pin!(future);
+    match select(future, executor.timer(duration)).await {
+        Either::Left((value, _)) => Some(value),
+        Either::Right(_) => None,
+    }
+}
+
+/// Dispatch's own connection to an agent, which the relay handles like any
+/// websocket client's.
+struct HubConnection {
+    client: ClientId,
+    events: mpsc::UnboundedSender<Event>,
+    incoming: mpsc::UnboundedReceiver<String>,
+    received: VecDeque<Value>,
+    next_id: u64,
+}
+
+impl HubConnection {
+    fn open(hub: &Rc<RefCell<Hub>>, endpoint: Endpoint) -> Self {
+        let mut state = hub.borrow_mut();
+        let client = state.next_internal_client;
+        state.next_internal_client -= 1;
+        let (tx, incoming) = mpsc::unbounded();
+        state
+            .events
+            .unbounded_send(Event::ClientConnected {
+                client,
+                endpoint,
+                tx,
+            })
+            .ok();
+        Self {
+            client,
+            events: state.events.clone(),
+            incoming,
+            received: VecDeque::new(),
+            next_id: 0,
+        }
+    }
+
+    async fn request_within(
+        &mut self,
+        executor: &BackgroundExecutor,
+        timeout: Duration,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.next_id += 1;
+        let id = json!(format!("dispatch-{}", self.next_id));
+        let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.events
+            .unbounded_send(Event::ClientLine {
+                client: self.client,
+                line: request.to_string(),
+            })
+            .map_err(|_| anyhow!("the hub stopped"))?;
+        let response = within(executor, timeout, async {
+            loop {
+                let message = self.receive().await?;
+                if message.get("method").is_none() && message["id"] == id {
+                    return anyhow::Ok(message);
+                }
+                self.received.push_back(message);
+            }
+        })
+        .await
+        .with_context(|| format!("{method} timed out"))??;
+        if let Some(error) = response.get("error") {
+            bail!(
+                "{method}: {}",
+                error["message"].as_str().unwrap_or("failed")
+            );
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn next_message(&mut self) -> Result<Value> {
+        match self.received.pop_front() {
+            Some(message) => Ok(message),
+            None => self.receive().await,
+        }
+    }
+
+    async fn receive(&mut self) -> Result<Value> {
+        let line = self
+            .incoming
+            .next()
+            .await
+            .context("the hub closed Dispatch's connection")?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    /// Drops what arrived before a message is sent, so an older turn's end
+    /// isn't taken for the new one's.
+    fn discard_received(&mut self) {
+        self.received.clear();
+        while self.incoming.try_recv().is_ok() {}
+    }
+}
+
+impl Drop for HubConnection {
+    fn drop(&mut self) {
+        self.events
+            .unbounded_send(Event::ClientGone(self.client))
+            .ok();
+    }
 }
 
 fn start_agent(hub: Rc<RefCell<Hub>>, key: AgentKey, cx: &mut AsyncApp) {

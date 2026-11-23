@@ -404,9 +404,8 @@ fn print_message(message: &Value, last_message: &mut Option<String>) {
 }
 
 fn describe_permission(request: &Value) -> String {
-    let title = request
-        .pointer("/params/toolCall/title")
-        .and_then(Value::as_str)
+    let title = crate::relay::approval_tool_call(request)["title"]
+        .as_str()
         .unwrap_or("a tool call");
     format!("Waiting for approval: {}", truncate(title, 160))
 }
