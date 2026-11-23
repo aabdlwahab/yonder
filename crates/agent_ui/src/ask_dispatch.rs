@@ -108,6 +108,9 @@ impl AskDispatchModal {
                         match result {
                             Ok(reply) => {
                                 this.response = Some((address, reply));
+                                // The question is saved as a conversation;
+                                // show it in the Fleet panel now.
+                                this.hub.update(cx, |hub, cx| hub.reload_conversations(cx));
                                 if this.composer.read(cx).text(cx) == draft {
                                     this.composer
                                         .update(cx, |editor, cx| editor.set_text("", window, cx));

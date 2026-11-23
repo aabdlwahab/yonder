@@ -39,6 +39,17 @@ impl Settings for HubSettings {
     }
 }
 
+/// Dispatch's saved conversations open from the hub as threads of this agent
+/// on this machine; no real agent or machine is behind them.
+pub const DISPATCH_AGENT_ID: &str = "dispatch";
+pub const DISPATCH_MACHINE: &str = "hub";
+/// Lists Dispatch's saved conversations on the hub's `/hub` endpoint.
+pub const DISPATCH_CONVERSATIONS_METHOD: &str = "_yonder/dispatch/conversations";
+
+pub fn is_dispatch(agent_id: &AgentId) -> bool {
+    agent_id.as_ref() == DISPATCH_AGENT_ID
+}
+
 /// Where a thread's agent runs when it runs on the hub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubRoute {
@@ -85,6 +96,9 @@ impl HubAgentServer {
 
 impl AgentServer for HubAgentServer {
     fn logo(&self) -> ui::IconName {
+        if is_dispatch(&self.inner.agent_id()) {
+            return ui::IconName::Sparkle;
+        }
         self.inner.logo()
     }
 

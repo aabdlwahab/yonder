@@ -1281,6 +1281,11 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
+        // Dispatch's conversations are kept on the hub and listed in a section
+        // of their own; they belong to no project.
+        if agent_servers::is_dispatch(&thread_ref.connection().agent_id()) {
+            return;
+        }
         let is_draft = thread_ref.is_draft_thread();
         let existing_thread = self.entry(thread_id);
 

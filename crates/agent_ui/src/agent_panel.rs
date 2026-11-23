@@ -1178,7 +1178,10 @@ impl AgentPanel {
             .active_terminal_id()
             .map(|terminal_id| terminal_id.to_key_string());
 
-        let last_active_thread = if last_active_terminal_id.is_some() {
+        let dispatch_active = self
+            .active_conversation_view()
+            .is_some_and(|view| view.read(cx).agent_key().is_dispatch());
+        let last_active_thread = if last_active_terminal_id.is_some() || dispatch_active {
             None
         } else {
             let is_draft_active = self.active_thread_is_draft(cx);
@@ -4443,13 +4446,17 @@ impl AgentPanel {
 
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let conversation_view = conversation_view.read(cx);
+            let thread_agent = conversation_view.agent_key().clone();
+            // Dispatch conversations aren't threads of any project: they get
+            // no tab and don't become the agent for new threads.
+            let is_dispatch = thread_agent.is_dispatch();
             if conversation_tab::enabled(cx)
+                && !is_dispatch
                 && !self.thread_tabs.contains(&conversation_view.thread_id)
             {
                 self.thread_tabs.push(conversation_view.thread_id);
             }
-            let thread_agent = conversation_view.agent_key().clone();
-            if self.selected_agent != thread_agent {
+            if !is_dispatch && self.selected_agent != thread_agent {
                 self.selected_agent = thread_agent;
                 self.serialize(cx);
             }
@@ -4874,6 +4881,61 @@ impl AgentPanel {
         );
     }
 
+    /// Opens one of Dispatch's saved conversations from the hub like a
+    /// thread: what was said, each step, and a box for a follow-up.
+    pub fn open_dispatch_conversation(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        title: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent = Agent::Custom {
+            id: AgentId(agent_servers::DISPATCH_AGENT_ID.into()),
+        };
+        let open = self
+            .conversation_views()
+            .into_iter()
+            .find(|view| view.read(cx).root_session_id.as_ref() == Some(&session_id));
+        if let Some(view) = open {
+            let thread_id = view.read(cx).thread_id;
+            self.load_agent_thread(
+                agent,
+                thread_id,
+                None,
+                title,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            return;
+        }
+        // Conversations have no folder, but sessions need an absolute one.
+        let work_dirs = PathList::new(&[std::path::PathBuf::from("/")]);
+        let thread = self.create_agent_thread_with_server_for_external_session(
+            agent,
+            None,
+            session_id,
+            Some(work_dirs),
+            title,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        self.set_base_view(thread.into(), true, window, cx);
+    }
+
+    /// The Dispatch conversation open in the panel, if one is.
+    pub fn active_dispatch_conversation(&self, cx: &App) -> Option<acp_v2::SessionId> {
+        let view = self.active_conversation_view()?.read(cx);
+        view.agent_key()
+            .is_dispatch()
+            .then(|| view.root_session_id.clone())
+            .flatten()
+    }
+
     pub(crate) fn create_agent_thread_with_server(
         &mut self,
         agent: Agent,
@@ -4959,7 +5021,9 @@ impl AgentPanel {
         let workspace = self.workspace.clone();
         let project = self.project.clone();
 
-        self.set_selected_agent_and_persist(agent.clone(), cx);
+        if !agent.is_dispatch() {
+            self.set_selected_agent_and_persist(agent.clone(), cx);
+        }
 
         let server = server_override
             .unwrap_or_else(|| agent.server(self.fs.clone(), self.thread_store.clone()));

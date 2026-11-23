@@ -13,7 +13,7 @@ use agent_servers::{HubBoard, HubRoute, HubSettings, HubStatus};
 use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{TimeZone as _, Utc};
 use futures::future::{Either, select};
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Global, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Global, SharedString, Task};
 use project::{AgentId, Project, WorktreePaths};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -23,12 +23,18 @@ use util::path_list::PathList;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore};
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+/// How often to check while a Dispatch conversation is going, so its row
+/// shows when it ends.
+const LIVE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const CONVERSATIONS_LIMIT: usize = 200;
 
 pub struct HubSync {
     settings: HubSettings,
     token: Option<String>,
     machines: Vec<String>,
     status: HubStatus,
+    conversations: Vec<DispatchConversation>,
+    conversation_total: usize,
     /// The hub address the app's threads were last handed to.
     imported_to: Option<String>,
     _sync: Option<Task<()>>,
@@ -76,6 +82,62 @@ impl HubSessions {
     }
 }
 
+/// One of Dispatch's saved conversations, a call or a typed question, as the
+/// hub lists it.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchConversation {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `voice` or `typed`.
+    #[serde(default)]
+    pub kind: String,
+    /// `running` while it's going, `idle` after.
+    #[serde(default)]
+    pub state: String,
+    /// What it touched, e.g. "2 threads, 1 command".
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+impl DispatchConversation {
+    pub fn is_voice(&self) -> bool {
+        self.kind == "voice"
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.state == "running"
+    }
+
+    pub fn title(&self) -> SharedString {
+        match self
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+        {
+            Some(title) => SharedString::from(title.to_owned()),
+            None if self.is_voice() => "Voice call".into(),
+            None => "Typed question".into(),
+        }
+    }
+
+    pub fn session_id(&self) -> acp::SessionId {
+        acp::SessionId::new(self.id.clone())
+    }
+}
+
+#[derive(Deserialize)]
+struct DispatchConversations {
+    conversations: Vec<DispatchConversation>,
+    #[serde(default)]
+    total: usize,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DispatchReply {
@@ -95,6 +157,8 @@ pub fn init(cx: &mut App) {
             token: None,
             machines: Vec::new(),
             status: HubStatus::Off,
+            conversations: Vec::new(),
+            conversation_total: 0,
             imported_to: None,
             _sync: None,
             _settings_subscription: subscription,
@@ -149,6 +213,73 @@ impl HubSync {
             &self.machines,
             machine.as_deref(),
         )
+    }
+
+    /// Dispatch's saved conversations, newest first.
+    pub fn conversations(&self) -> &[DispatchConversation] {
+        &self.conversations
+    }
+
+    /// How many conversations the hub has, including ones not listed.
+    pub fn conversation_total(&self) -> usize {
+        self.conversation_total
+    }
+
+    /// Where Dispatch's saved conversations open: the hub serves them as if
+    /// Dispatch were an agent on a machine of its own.
+    pub fn dispatch_route(&self) -> Option<HubRoute> {
+        if !matches!(self.status, HubStatus::Connected { .. }) {
+            return None;
+        }
+        Some(HubRoute {
+            address: self.address()?.to_owned(),
+            token: self.token.clone()?,
+            machine: agent_servers::DISPATCH_MACHINE.to_owned(),
+        })
+    }
+
+    /// Lists Dispatch's conversations again now, e.g. after asking it
+    /// something, instead of waiting for the next check.
+    pub fn reload_conversations(&self, cx: &mut Context<Self>) {
+        let request = self.request::<DispatchConversations>(
+            vec![(
+                agent_servers::DISPATCH_CONVERSATIONS_METHOD,
+                json!({ "limit": CONVERSATIONS_LIMIT }),
+            )],
+            Duration::from_secs(10),
+            cx,
+        );
+        let address = self.address().map(str::to_owned);
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            this.update(cx, |this, cx| {
+                if this.address() == address.as_deref() {
+                    this.apply_conversations(result, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_conversations(
+        &mut self,
+        result: Result<DispatchConversations>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(listed) => {
+                if listed.conversations != self.conversations
+                    || listed.total != self.conversation_total
+                {
+                    self.conversations = listed.conversations;
+                    self.conversation_total = listed.total;
+                    cx.notify();
+                }
+            }
+            // A hub from before saved conversations has no such method.
+            Err(error) => log::debug!("listing Dispatch conversations: {error:#}"),
+        }
     }
 
     pub(crate) fn address(&self) -> Option<&str> {
@@ -247,6 +378,8 @@ impl HubSync {
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.settings = HubSettings::get_global(cx).clone();
         self._sync = None;
+        self.conversations.clear();
+        self.conversation_total = 0;
         let Some(address) = self
             .settings
             .address
@@ -290,6 +423,7 @@ impl HubSync {
                     ],
                 )
                 .await;
+                let connected = result.is_ok();
                 let keep_going = this
                     .update(cx, |this, cx| {
                         this.apply(&address, &token, result, cx);
@@ -298,7 +432,32 @@ impl HubSync {
                 if !keep_going {
                     return;
                 }
-                cx.background_executor().timer(SYNC_INTERVAL).await;
+                let mut interval = SYNC_INTERVAL;
+                if connected {
+                    let listed = agent_servers::call_hub(
+                        &address,
+                        &token,
+                        vec![(
+                            agent_servers::DISPATCH_CONVERSATIONS_METHOD,
+                            json!({ "limit": CONVERSATIONS_LIMIT }),
+                        )],
+                    )
+                    .await
+                    .and_then(|mut results| {
+                        let listed = results.pop().context("The hub returned no response.")?;
+                        Ok(serde_json::from_value::<DispatchConversations>(listed)?)
+                    });
+                    let live = this
+                        .update(cx, |this, cx| {
+                            this.apply_conversations(listed, cx);
+                            this.conversations.iter().any(DispatchConversation::is_live)
+                        })
+                        .unwrap_or(false);
+                    if live {
+                        interval = LIVE_SYNC_INTERVAL;
+                    }
+                }
+                cx.background_executor().timer(interval).await;
             }
         }));
     }
@@ -463,6 +622,35 @@ fn add_hub_sessions(sessions: Vec<HubSession>, cx: &mut App) {
     });
 }
 
+/// Opens a thread the hub runs, adding it to the thread list first if the
+/// app hasn't seen it yet, e.g. from a step in a Dispatch conversation.
+pub(crate) fn open_hub_thread(
+    session_id: acp::SessionId,
+    workspace: gpui::WeakEntity<workspace::Workspace>,
+    window: &mut gpui::Window,
+    cx: &mut App,
+) {
+    let Some(hub) = HubSync::try_global(cx) else {
+        return;
+    };
+    let request = hub.read(cx).sync_session(session_id, cx);
+    window
+        .spawn(cx, async move |cx| match request.await {
+            Ok(metadata) => {
+                cx.update(|window, cx| {
+                    crate::forward::open_thread(metadata, workspace.upgrade(), window, cx)
+                })
+                .ok();
+            }
+            Err(error) => {
+                workspace
+                    .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                    .ok();
+            }
+        })
+        .detach();
+}
+
 /// Waits until the hub has said which machines it serves, for at most a few
 /// seconds, so an agent starting at app launch picks the right place to run.
 pub async fn wait_until_settled(hub: &Entity<HubSync>, cx: &mut AsyncApp) {
@@ -481,6 +669,39 @@ mod tests {
     use gpui::TestAppContext;
 
     use super::*;
+
+    #[test]
+    fn dispatch_conversations_read_the_hub_listing() {
+        let listed: DispatchConversations = serde_json::from_value(json!({
+            "conversations": [
+                {"id":"dispatch-call-1","title":null,"kind":"voice","state":"running","summary":"","createdAt":1,"updatedAt":2},
+                {"id":"dispatch-typed-2","title":"Is it done?","kind":"typed","state":"idle","summary":"1 thread","createdAt":3,"updatedAt":4},
+            ],
+            "total": 9,
+        }))
+        .expect("the hub's listing parses");
+        assert_eq!(listed.total, 9);
+        let [call, typed] = listed.conversations.as_slice() else {
+            panic!("two conversations");
+        };
+        assert!(call.is_voice() && call.is_live());
+        assert_eq!(
+            call.title().as_ref(),
+            "Voice call",
+            "untitled calls get a name"
+        );
+        assert!(!typed.is_voice() && !typed.is_live());
+        assert_eq!(typed.title().as_ref(), "Is it done?");
+        assert_eq!(typed.session_id().to_string(), "dispatch-typed-2");
+        assert!(crate::Agent::from(project::AgentId("dispatch".into())).is_dispatch());
+        assert_eq!(
+            crate::Agent::from(project::AgentId("dispatch".into()))
+                .label()
+                .as_ref(),
+            "Dispatch"
+        );
+        assert!(!crate::Agent::from(project::AgentId("codex-acp".into())).is_dispatch());
+    }
 
     #[test]
     fn dispatch_reply_can_omit_the_thread() {

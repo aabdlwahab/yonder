@@ -20,6 +20,7 @@ mod favorite_models;
 mod forward;
 mod guests;
 pub mod hub_sync;
+pub use ask_dispatch::AskDispatch;
 pub use forward::set_thread_opener;
 mod inline_assistant;
 mod inline_prompt_editor;
@@ -567,9 +568,16 @@ impl Agent {
         matches!(self, Self::NativeAgent)
     }
 
+    /// Dispatch's saved conversations, which open from the hub. The panel
+    /// never picks Dispatch for new threads or reopens it at launch.
+    pub fn is_dispatch(&self) -> bool {
+        matches!(self, Self::Custom { id } if agent_servers::is_dispatch(id))
+    }
+
     pub fn label(&self) -> SharedString {
         match self {
             Self::NativeAgent => "Yonder Agent".into(),
+            Self::Custom { id } if agent_servers::is_dispatch(id) => "Dispatch".into(),
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),

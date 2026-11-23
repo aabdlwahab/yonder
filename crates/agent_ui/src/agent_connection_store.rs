@@ -317,7 +317,9 @@ impl AgentConnectionStore {
         let store = store.read(cx);
         self.entries.retain(|key, _| match key {
             Agent::NativeAgent => true,
-            Agent::Custom { id } => store.external_agents.contains_key(id),
+            Agent::Custom { id } => {
+                store.external_agents.contains_key(id) || agent_servers::is_dispatch(id)
+            }
             #[cfg(any(test, feature = "test-support"))]
             Agent::Stub => true,
         });
@@ -335,6 +337,17 @@ impl AgentConnectionStore {
     ) -> Task<Result<Rc<dyn acp_thread::AgentConnection>>> {
         let project = self.project.clone();
         let hub = crate::hub_sync::HubSync::try_global(cx);
+        if agent_servers::is_dispatch(&server.agent_id()) {
+            // Dispatch's conversations live on the hub whatever the project.
+            let route = hub.and_then(|hub| hub.read(cx).dispatch_route());
+            let Some(route) = route else {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Connect to the Yonder hub to open Dispatch conversations."
+                )));
+            };
+            return Rc::new(agent_servers::HubAgentServer::new(server.agent_id(), route))
+                .connect(delegate, project, cx);
+        }
         let is_external = server
             .clone()
             .downcast::<agent_servers::CustomAgentServer>()

@@ -9934,6 +9934,8 @@ impl ThreadView {
         match status {
             ToolCallStatus::Failed => parts.push("failed".to_string()),
             ToolCallStatus::Rejected => parts.push("denied".to_string()),
+            // Dispatch's steps say what they did in their titles.
+            ToolCallStatus::Completed if dispatch_step(tool_call).is_some() => {}
             ToolCallStatus::Completed => {
                 let output = tool_call
                     .content()
@@ -12900,9 +12902,15 @@ impl ThreadView {
         let tool_verb = (!is_subagent_tool_call)
             .then(|| tool_verb(tool_call))
             .flatten();
-        let tool_argument = tool_verb
-            .filter(|_| !use_card_layout)
-            .map(|verb| tool_argument_text(tool_call.label.read(cx).source(), verb));
+        let dispatch_step = dispatch_step(tool_call);
+        let tool_argument =
+            tool_verb
+                .as_ref()
+                .filter(|_| !use_card_layout)
+                .map(|verb| match &dispatch_step {
+                    Some(step) => step.target.clone(),
+                    None => tool_argument_text(tool_call.label.read(cx).source(), verb),
+                });
         let tool_meta = tool_argument
             .is_some()
             .then(|| self.tool_call_meta(tool_call, cx))
@@ -13046,11 +13054,17 @@ impl ThreadView {
             } else {
                 h_flex()
                     .w_full()
-                    .child(match &tool_argument {
-                        Some(argument) => {
+                    .child(match (&tool_argument, dispatch_step) {
+                        (Some(argument), Some(step)) => self.render_dispatch_step_target(
+                            argument.clone(),
+                            step.session_id,
+                            entry_ix,
+                            cx,
+                        ),
+                        (Some(argument), None) => {
                             render_tool_argument(argument.clone(), self.tool_name_font_size(), cx)
                         }
-                        None => self
+                        (None, _) => self
                             .render_markdown(
                                 tool_call.label.clone(),
                                 agent_tool_label_markdown_style(window, cx),
@@ -13072,6 +13086,46 @@ impl ThreadView {
             .when(!is_edit && tool_meta.is_none(), |this| {
                 this.child(gradient_overlay)
             })
+    }
+
+    /// What a Dispatch step acted on. A thread opens on click.
+    fn render_dispatch_step_target(
+        &self,
+        target: String,
+        session_id: Option<acp_v2::SessionId>,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let font_size = self.tool_name_font_size();
+        let Some(session_id) = session_id else {
+            return div()
+                .min_w_0()
+                .truncate()
+                .text_size(font_size)
+                .text_color(cx.theme().colors().text_muted)
+                .child(target)
+                .into_any_element();
+        };
+        div()
+            .id(("dispatch-step-thread", entry_ix))
+            .min_w_0()
+            .truncate()
+            .text_size(font_size)
+            .text_color(cx.theme().colors().text)
+            .cursor_pointer()
+            .hover(|style| style.underline())
+            .tooltip(Tooltip::text("Open Thread"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                crate::hub_sync::open_hub_thread(
+                    session_id.clone(),
+                    this.workspace.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .child(target)
+            .into_any_element()
     }
 
     fn open_tool_call_location(
@@ -16179,9 +16233,36 @@ fn render_timeline_step(
         .into_any_element()
 }
 
+/// A step in one of Dispatch's saved conversations. The hub names its verb,
+/// what it acted on and, when that's a thread, which one.
+struct DispatchStep {
+    verb: SharedString,
+    target: String,
+    session_id: Option<acp_v2::SessionId>,
+}
+
+fn dispatch_step(tool_call: &ToolCall) -> Option<DispatchStep> {
+    let step = tool_call.meta.as_ref()?.get("yonder")?;
+    Some(DispatchStep {
+        verb: step.get("verb")?.as_str()?.to_owned().into(),
+        target: step
+            .get("target")
+            .and_then(|target| target.as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        session_id: step
+            .get("sessionId")
+            .and_then(|id| id.as_str())
+            .map(|id| acp_v2::SessionId::new(id.to_owned())),
+    })
+}
+
 /// The verb a tool call shows in front of its target.
-fn tool_verb(tool_call: &ToolCall) -> Option<&'static str> {
-    Some(match tool_call.kind() {
+fn tool_verb(tool_call: &ToolCall) -> Option<SharedString> {
+    if let Some(step) = dispatch_step(tool_call) {
+        return Some(step.verb);
+    }
+    let verb: &'static str = match tool_call.kind() {
         acp_v2::ToolKind::Read => "Read",
         acp_v2::ToolKind::Edit => "Edit",
         acp_v2::ToolKind::Delete => "Delete",
@@ -16191,7 +16272,8 @@ fn tool_verb(tool_call: &ToolCall) -> Option<&'static str> {
         acp_v2::ToolKind::Fetch => "Fetch",
         acp_v2::ToolKind::Think => "Think",
         _ => return None,
-    })
+    };
+    Some(verb.into())
 }
 
 /// A tool's target from its title, without the verb the title often repeats.

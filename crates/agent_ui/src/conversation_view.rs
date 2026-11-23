@@ -1755,7 +1755,7 @@ impl ConversationView {
             .agent_server_store
             .read(cx)
             .agent_display_name(&agent_id.clone())
-            .unwrap_or_else(|| agent_id.0.clone());
+            .unwrap_or_else(|| Agent::from(agent_id.clone()).label());
 
         let agent_icon = self.agent.logo();
         let agent_icon_from_external_svg = self
@@ -2542,7 +2542,7 @@ impl ConversationView {
                         .agent_server_store
                         .read(cx)
                         .agent_display_name(&self.agent.agent_id())
-                        .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
+                        .unwrap_or_else(|| Agent::from(self.agent.agent_id()).label());
 
                     thread_view.update(cx, |thread_view, cx| {
                         let has_slash_completions = {

@@ -14,6 +14,7 @@ use askpass::EncryptedPassword;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
+use editor::{Editor, EditorEvent};
 use futures::channel::oneshot;
 use gpui::{
     Action, App, AsyncApp, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
@@ -44,6 +45,8 @@ use workspace::{
     notifications::{DetachAndPromptErr, NotificationId},
 };
 use zed_actions::OpenRemote;
+
+mod dispatch_section;
 
 actions!(
     fleet_panel,
@@ -1096,6 +1099,12 @@ pub struct FleetPanel {
     observed_clients: HashMap<EntityId, [Subscription; 2]>,
     /// The route each machine was last seen on, to tell when it moves.
     last_routes: HashMap<String, ConnectionRoute>,
+    show_all_conversations: bool,
+    conversation_filter: Entity<Editor>,
+    /// Re-renders every second while a Dispatch conversation is going.
+    live_tick: Option<Task<()>>,
+    _hub_subscription: Option<Subscription>,
+    _filter_subscription: Subscription,
 }
 
 impl FleetPanel {
@@ -1117,6 +1126,16 @@ impl FleetPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let conversation_filter = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search conversations…", window, cx);
+            editor
+        });
+        let filter_subscription = cx.subscribe(&conversation_filter, |_, _, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.notify();
+            }
+        });
         let mut panel = Self {
             workspace,
             app_state,
@@ -1152,6 +1171,11 @@ impl FleetPanel {
                 .map(|store| cx.observe(&store, |_, _, cx| cx.notify())),
             observed_clients: HashMap::default(),
             last_routes: HashMap::default(),
+            show_all_conversations: false,
+            conversation_filter,
+            live_tick: None,
+            _hub_subscription: Self::observe_hub(cx),
+            _filter_subscription: filter_subscription,
         };
         panel.refresh_recent_projects(cx);
         panel
@@ -1677,6 +1701,7 @@ impl Render for FleetPanel {
                 .or_insert(status);
         }
 
+        let dispatch_section = self.render_dispatch_section(window, cx);
         let mut list = v_flex()
             .id("fleet-panel-list")
             .size_full()
@@ -1691,7 +1716,8 @@ impl Render for FleetPanel {
                     .flatten()
                     .is_some_and(|workspace| workspace.read(cx).multi_workspace_enabled(cx)),
                 |list| list.child(self.render_active_threads(window, cx)),
-            );
+            )
+            .children(dispatch_section);
 
         for (machine_index, machine) in machines.into_iter().enumerate() {
             let is_local = machine.key == LOCAL_MACHINE_KEY;

@@ -6367,12 +6367,14 @@ dependencies = [
 name = "fleet_panel"
 version = "0.1.0"
 dependencies = [
+ "agent_servers",
  "agent_ui",
  "anyhow",
  "askpass",
  "chrono",
  "collections",
  "db",
+ "editor",
  "futures 0.3.34",
  "gpui",
  "log",

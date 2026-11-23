@@ -13,12 +13,14 @@ path = "src/fleet_panel.rs"
 doctest = false
 
 [dependencies]
+agent_servers.workspace = true
 agent_ui.workspace = true
 anyhow.workspace = true
 askpass.workspace = true
 chrono.workspace = true
 collections.workspace = true
 db.workspace = true
+editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
