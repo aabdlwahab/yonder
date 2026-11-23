@@ -360,7 +360,12 @@ impl Relay {
             .into_iter()
             .map(|(role, _, text)| json!({ "role": role, "text": text }))
             .collect();
-        Some(json!({ "id": id, "messages": messages, "order": "newest_first" }))
+        Some(json!({
+            "id": id,
+            "title": session.meta.title.as_deref().map(|text| tail(text, 160)),
+            "messages": messages,
+            "order": "newest_first",
+        }))
     }
 
     pub fn dispatch_has_session(&self, id: &str) -> bool {

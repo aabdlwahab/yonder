@@ -5,6 +5,7 @@
 
 mod client;
 mod dispatch;
+mod dispatch_web;
 mod headless;
 mod machines;
 mod registry;
@@ -58,6 +59,8 @@ enum Command {
         /// Enable Dispatch with the path to a signed-in Codex CLI.
         #[arg(long)]
         dispatch_codex: Option<PathBuf>,
+        #[command(flatten)]
+        dispatch_web: dispatch_web::Options,
     },
     /// List every session the hub knows.
     List,
@@ -111,11 +114,19 @@ fn main() {
             listen,
             local_name,
             dispatch_codex,
+            dispatch_web,
         } => {
             run_headless(move |app_state, cx| {
                 let local_name = local_name.unwrap_or_else(host_name);
                 let listen = listen.unwrap_or_else(default_listen);
-                server::serve(app_state, listen, local_name, dispatch_codex, cx)
+                server::serve(
+                    app_state,
+                    listen,
+                    local_name,
+                    dispatch_codex,
+                    dispatch_web,
+                    cx,
+                )
             });
             Ok(())
         }
