@@ -10,7 +10,12 @@ use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Job {
-    Server,
+    /// The machine server. `prefixed` when it was started as
+    /// `yonder server …`, so it starts its daemon the same way; a copy the
+    /// app uploaded under the server's own name isn't.
+    Server {
+        prefixed: bool,
+    },
     Hub,
 }
 
@@ -23,10 +28,25 @@ pub fn job_from_args(args: &[OsString]) -> Option<(Job, Vec<OsString>)> {
     if Path::new(program).file_stem() == Some(OsStr::new("yonder-hub")) {
         return Some((Job::Hub, with_program("yonder hub", rest)));
     }
+    // A copy the app uploads as a machine's server (`zed-remote-server-…`)
+    // only ever does the server's job, with the server's own arguments.
+    if Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with("zed-remote-server"))
+    {
+        return Some((
+            Job::Server { prefixed: false },
+            with_program("yonder server", rest),
+        ));
+    }
     let (first, rest) = rest.split_first()?;
     match first.to_str()? {
         "hub" => Some((Job::Hub, with_program("yonder hub", rest))),
-        "server" => Some((Job::Server, with_program("yonder server", rest))),
+        "server" => Some((
+            Job::Server { prefixed: true },
+            with_program("yonder server", rest),
+        )),
         _ => None,
     }
 }
@@ -46,7 +66,8 @@ pub fn run_job(job: Job, args: Vec<OsString>) -> ! {
         }
         // The server starts its daemon from this program again, so it puts
         // `server` back in front of the daemon's arguments.
-        Job::Server => run_server(args, vec![OsString::from("server")]),
+        Job::Server { prefixed: true } => run_server(args, vec![OsString::from("server")]),
+        Job::Server { prefixed: false } => run_server(args, Vec::new()),
     }
 }
 
@@ -79,13 +100,23 @@ mod tests {
         assert_eq!(
             job_from_args(&args(&["yonder", "server", "proxy", "--identifier", "x"])),
             Some((
-                Job::Server,
+                Job::Server { prefixed: true },
                 args(&["yonder server", "proxy", "--identifier", "x"])
             ))
         );
         assert_eq!(
             job_from_args(&args(&["/home/a/.local/bin/yonder-hub", "serve"])),
             Some((Job::Hub, args(&["yonder hub", "serve"])))
+        );
+        assert_eq!(
+            job_from_args(&args(&[
+                "/home/a/.zed_server/zed-remote-server-stable-1.30.0+stable.abc",
+                "version"
+            ])),
+            Some((
+                Job::Server { prefixed: false },
+                args(&["yonder server", "version"])
+            ))
         );
     }
 
@@ -94,6 +125,9 @@ mod tests {
         assert_eq!(job_from_args(&args(&["yonder"])), None);
         assert_eq!(job_from_args(&args(&["yonder", "src/main.rs"])), None);
         assert_eq!(job_from_args(&args(&["yonder", "proxy"])), None);
-        assert_eq!(job_from_args(&args(&["yonder", "--askpass", "/tmp/s"])), None);
+        assert_eq!(
+            job_from_args(&args(&["yonder", "--askpass", "/tmp/s"])),
+            None
+        );
     }
 }

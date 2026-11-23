@@ -4,11 +4,18 @@
 #
 # The app is signed for this Mac only (ad-hoc), which is enough to run it here
 # but not to hand it to someone else.
+#
+# With -l <ssh host>, the app also carries the `yonder` program for Linux
+# machines, built on that Linux machine from the same commit (see
+# script/build-yonder-headless). Yonder installs it on your machines from
+# Settings > Machines. If the host has ~/.config/yonder/build-env.sh, it's
+# sourced first, to put cargo and the musl tools on PATH.
 
 set -euo pipefail
 
 skip_build=false
 open_app=true
+linux_host="${YONDER_LINUX_BUILD_HOST:-}"
 
 help_info() {
   echo "
@@ -16,16 +23,19 @@ Usage: ${0##*/} [options]
 Build Yonder in release mode and install it into /Applications.
 
 Options:
-  -s    Skip the build and package the existing target/release binaries.
-  -n    Don't open Yonder after installing.
+  -s         Skip the build and package the existing target/release binaries.
+  -n         Don't open Yonder after installing.
+  -l HOST    Build the program for Linux machines on HOST over SSH and put it
+             in the app (default: \$YONDER_LINUX_BUILD_HOST).
   -h    Display this help and exit.
   "
 }
 
-while getopts 'snh' flag; do
+while getopts 'snhl:' flag; do
   case "${flag}" in
     s) skip_build=true ;;
     n) open_app=false ;;
+    l) linux_host="${OPTARG}" ;;
     h)
       help_info
       exit 0
@@ -61,6 +71,33 @@ if [[ ! -f target/release/yonder.commit ]]; then
   echo "target/release/yonder wasn't built by this script; run it without -s." >&2
   exit 1
 fi
+
+# The programs for other machines, by platform, as the app carries them.
+machines="target/release/machines"
+if [[ -n "${linux_host}" ]]; then
+  commit=$(cat target/release/yonder.commit)
+  if ! git diff --quiet HEAD -- || [[ "$(git rev-parse HEAD)" != "${commit}" ]]; then
+    echo "Note: the Linux program is built from commit ${commit}; uncommitted changes aren't in it." >&2
+  fi
+  echo "Building the Linux program on ${linux_host}"
+  remote_dir=".cache/yonder-build"
+  git archive --format=tar "${commit}" | gzip -1 | ssh -o BatchMode=yes "${linux_host}" "
+    set -e
+    d=\$HOME/${remote_dir}
+    rm -rf \$d/src && mkdir -p \$d/src
+    tar -xzf - -C \$d/src
+    if [ -f \$HOME/.config/yonder/build-env.sh ]; then . \$HOME/.config/yonder/build-env.sh; fi
+    cd \$d/src
+    if ! CARGO_TARGET_DIR=\$d/target ZED_COMMIT_SHA=${commit} script/build-yonder-headless x86_64 > \$d/build.log 2>&1; then
+      tail -30 \$d/build.log
+      exit 1
+    fi"
+  rm -rf "${machines}/linux-x86_64"
+  mkdir -p "${machines}/linux-x86_64"
+  scp -q -o BatchMode=yes "${linux_host}:${remote_dir}/target/yonder-headless/yonder-linux-x86_64.gz" \
+    "${machines}/linux-x86_64/yonder.gz"
+  echo "${commit}" > "${machines}/linux-x86_64/yonder.version"
+fi
 # Stable versions carry the commit, and so does the server's file name on each
 # machine, so every build gets a server of its own.
 full_version="${version}+stable.$(cat target/release/yonder.commit)"
@@ -74,6 +111,13 @@ cp target/release/cli "${app}/Contents/MacOS/cli"
 # app doesn't need it.
 strip -x "${app}/Contents/MacOS/yonder" "${app}/Contents/MacOS/cli"
 cp crates/zed/resources/Document.icns "${app}/Contents/Resources/Document.icns"
+carries_machines=false
+if [[ -d "${machines}" ]] && [[ "$(cat "${machines}"/*/yonder.version 2>/dev/null | sort -u)" == "$(cat target/release/yonder.commit)" ]]; then
+  cp -R "${machines}" "${app}/Contents/Resources/machines"
+  carries_machines=true
+elif [[ -d "${machines}" ]]; then
+  echo "Leaving out ${machines}: it's from a different commit. Run with -l to rebuild it." >&2
+fi
 
 iconset_dir=$(mktemp -d)
 iconset="${iconset_dir}/Yonder.iconset"
@@ -147,8 +191,10 @@ if [[ ! -e "${data_dir}/db/0-stable/db.sqlite" && -e "${data_dir}/db/0-dev/db.sq
 fi
 
 # Remote machines run a server whose file name carries the channel and version.
-# Reuse the server Yonder Dev uploads when there's none for this version yet.
+# Without a program in the app, reuse the server Yonder Dev uploads when
+# there's none for this version yet.
 for platform_dir in "${data_dir}"/remote_servers/yonder/*/; do
+  [[ "${carries_machines}" = false ]] || break
   [[ -d "${platform_dir}" ]] || continue
   stable_server="${platform_dir}zed-remote-server-stable-${full_version}.gz"
   dev_server="${platform_dir}zed-remote-server-dev-build.gz"

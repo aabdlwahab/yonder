@@ -5,7 +5,10 @@
 #
 #   script/build-yonder-headless [x86_64|aarch64]   (default: this machine's)
 #
-# Writes target/yonder-headless/yonder-linux-<arch> and a .gz copy. Install it
+# Writes target/yonder-headless/yonder-linux-<arch> and a .gz copy (under
+# $CARGO_TARGET_DIR when set). Set ZED_COMMIT_SHA to the app's commit when
+# building from a copy of the source without git, so `yonder server version`
+# matches the app that carries this program. Install it
 # on a machine as ~/.local/bin/yonder; a `yonder-hub` link to it keeps the
 # hub's old name working.
 #
@@ -48,10 +51,11 @@ fi
 cargo --config .cargo/bundle-config.toml "${build[@]}" --release \
     --package yonder_headless --bin yonder-headless --target "$triple"
 
-out=target/yonder-headless
+target_dir=${CARGO_TARGET_DIR:-target}
+out="$target_dir/yonder-headless"
 mkdir -p "$out"
 binary="$out/yonder-linux-$arch"
-cp "target/$triple/release/yonder-headless" "$binary"
+cp "$target_dir/$triple/release/yonder-headless" "$binary"
 # The release profile keeps limited debug info for crash reports; the copy
 # that goes to machines doesn't need it.
 if command -v llvm-strip >/dev/null 2>&1; then

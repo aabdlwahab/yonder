@@ -17,9 +17,16 @@ fn main() {
         std::env::var("TARGET").unwrap()
     );
 
-    // Populate git sha environment variable if git is available
+    // Populate git sha environment variable: from the build's environment when
+    // given (the app's build passes its commit to the machine program built
+    // elsewhere from a copy of the source), else from git if available.
+    println!("cargo:rerun-if-env-changed=ZED_COMMIT_SHA");
     println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    if let Some(output) = Command::new("git")
+    if let Ok(git_sha) = std::env::var("ZED_COMMIT_SHA")
+        && !git_sha.trim().is_empty()
+    {
+        println!("cargo:rustc-env=ZED_COMMIT_SHA={}", git_sha.trim());
+    } else if let Some(output) = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
         .ok()

@@ -10508,6 +10508,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "machine_setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.34",
+ "paths",
+ "serde_json",
+ "settings",
+ "settings_json",
+ "util",
+]
+
+[[package]]
 name = "macro_rules_attribute"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16554,6 +16567,7 @@ dependencies = [
  "language_model",
  "language_models",
  "log",
+ "machine_setup",
  "menu",
  "paths",
  "picker",

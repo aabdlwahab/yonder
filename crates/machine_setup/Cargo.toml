@@ -1,0 +1,23 @@
+[package]
+name = "machine_setup"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Installs the yonder program on machines and gives them jobs, such as the hub"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/machine_setup.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+paths.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+settings_json.workspace = true
+util.workspace = true

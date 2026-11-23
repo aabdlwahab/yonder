@@ -14,6 +14,9 @@ use ui::{
 use crate::SettingsWindow;
 use crate::pages::AgentAccountsPage;
 
+mod roles;
+use roles::{Action, Confirm, MachineStatus};
+
 pub(crate) fn render_machines_page(
     settings_window: &SettingsWindow,
     _window: &mut Window,
@@ -206,6 +209,15 @@ pub(crate) struct MachinesPage {
     hub_token: Option<Entity<Editor>>,
     hub_message: Option<SharedString>,
     hub_task: Option<Task<()>>,
+    /// What each machine has, by its primary host (or `this-computer`).
+    statuses: HashMap<String, MachineStatus>,
+    /// The last install or hub change on each machine, and how it went.
+    actions: HashMap<String, Action>,
+    confirming: HashMap<String, Confirm>,
+    role_tasks: HashMap<String, Task<()>>,
+    roles_checked: bool,
+    /// The machine list the hub was last given, to notice changes.
+    synced_machines: Option<Vec<SshConnection>>,
     _settings_subscription: Subscription,
     _accounts_subscription: Option<Subscription>,
 }
@@ -274,7 +286,16 @@ impl MachinesPage {
             hub_token: None,
             hub_message: None,
             hub_task: None,
-            _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+            statuses: HashMap::default(),
+            actions: HashMap::default(),
+            confirming: HashMap::default(),
+            role_tasks: HashMap::default(),
+            roles_checked: false,
+            synced_machines: None,
+            _settings_subscription: cx.observe_global::<SettingsStore>(|this, cx| {
+                this.machines_changed(cx);
+                cx.notify()
+            }),
             _accounts_subscription: accounts
                 .map(|accounts| cx.observe(&accounts, |_, _, cx| cx.notify())),
         }
@@ -916,6 +937,7 @@ impl MachinesPage {
                     .color(Color::Warning),
                 )
             })
+            .child(self.render_role_section(machine_setup::Target::Ssh(connection.clone()), cx))
             .when_some(self.accounts.clone(), |this, accounts| {
                 this.child(accounts.update(cx, |accounts, cx| {
                     accounts.render_machine_agents(connection, cx)
@@ -1029,7 +1051,9 @@ impl MachinesPage {
 
 impl Render for MachinesPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_roles_checked(cx);
         let hub = self.render_hub(window, cx).into_any_element();
+        let this_computer = self.render_this_computer(cx);
         let connections = configured_connections(cx);
         if self
             .editing
@@ -1079,13 +1103,18 @@ impl Render for MachinesPage {
                             ),
                     )
                     .end_slot(
-                        Label::new(if address_count == 1 {
-                            "1 address".to_string()
-                        } else {
-                            format!("{address_count} addresses")
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        h_flex()
+                            .gap_3()
+                            .child(self.render_role_chip(&connection.host))
+                            .child(
+                                Label::new(if address_count == 1 {
+                                    "1 address".to_string()
+                                } else {
+                                    format!("{address_count} addresses")
+                                })
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
                     ),
             );
             if let Some(editor) = self.editing.as_ref().filter(|_| expanded) {
@@ -1128,6 +1157,7 @@ impl Render for MachinesPage {
                 this.child(self.render_new_machine(form, cx))
             })
             .child(list)
+            .child(this_computer)
             .child(hub)
     }
 }

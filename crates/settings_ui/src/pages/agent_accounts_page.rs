@@ -13,6 +13,7 @@ use ui::{Divider, Indicator, Tooltip, prelude::*};
 use util::command::{Stdio, new_command};
 
 use crate::SettingsWindow;
+use machine_setup::{shell_quote, ssh_args};
 
 const CLAUDE_AGENT: &str = "claude-acp";
 const CODEX_AGENT: &str = "codex-acp";
@@ -256,37 +257,6 @@ pub(crate) fn parse_status_output(output: &str) -> MachineReport {
         }
     }
     report
-}
-
-/// Single-quotes `text` for a POSIX shell.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-/// Arguments for `ssh` that run `command` on one address of `machine`.
-pub(crate) fn ssh_args(machine: &SshConnection, address: usize, command: &str) -> Vec<String> {
-    let mut args = vec![
-        "-o".to_string(),
-        "BatchMode=yes".to_string(),
-        "-o".to_string(),
-        "ConnectTimeout=5".to_string(),
-    ];
-    args.extend(machine.args.iter().cloned());
-    let (host, port) = if address == 0 {
-        (machine.host.clone(), machine.port)
-    } else {
-        let secondary = &machine.secondary_hosts[address - 1];
-        args.extend(["-o".to_string(), format!("HostKeyAlias={}", machine.host)]);
-        (secondary.host.clone(), secondary.port.or(machine.port))
-    };
-    if let Some(port) = port {
-        args.extend(["-p".to_string(), port.to_string()]);
-    }
-    if let Some(user) = &machine.username {
-        args.extend(["-l".to_string(), user.clone()]);
-    }
-    args.extend(["--".to_string(), host, command.to_string()]);
-    args
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
