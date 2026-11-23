@@ -21,10 +21,12 @@ if git rev-parse -q --verify "${remote}/gh-pages" >/dev/null; then
 else
   git worktree add -q --detach "${work}"
   git -C "${work}" checkout -q --orphan gh-pages-new
+  trap 'git worktree remove --force "${work}" 2>/dev/null || rm -rf "${work}"; git branch -D gh-pages-new >/dev/null 2>&1 || true' EXIT
 fi
 
 # Replace everything on the branch with site/ from HEAD.
-git -C "${work}" rm -rq --ignore-unmatch .
+git -C "${work}" read-tree --empty
+find "${work}" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 git archive HEAD site | tar -x -C "${work}" --strip-components=1
 
 git -C "${work}" add -A
