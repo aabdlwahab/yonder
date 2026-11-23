@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Yonder
 
 Yonder is a native desktop editor for working on code that lives on other machines. Your laptop runs only the editor UI. Projects, language servers, terminals and builds stay on the remote machines and run there directly over SSH. They are not in containers.

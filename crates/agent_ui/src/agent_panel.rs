@@ -6536,6 +6536,9 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .when(agent_servers::HubSettings::get_global(cx).enabled, |this| {
+                            this.child(crate::ask_dispatch::toolbar_button())
+                        })
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),

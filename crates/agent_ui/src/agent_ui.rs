@@ -4,6 +4,7 @@ mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
+mod ask_dispatch;
 mod buffer_codegen;
 mod completion_provider;
 mod config_options;
@@ -722,6 +723,7 @@ pub fn init(
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
     hub_sync::init(cx);
+    ask_dispatch::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
