@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Publishes site/ to https://aabdlwahab.github.io/yonder/.
+#
+# GitHub Pages serves the gh-pages branch, which holds only the site's files.
+# It's published from a branch rather than by a workflow because Actions are
+# off for this repository; turning them on would also start upstream Zed's
+# workflows. This copies site/ as it is in HEAD (not uncommitted edits) onto
+# gh-pages, commits, and pushes.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+remote="${1:-origin}"
+commit=$(git rev-parse --short HEAD)
+work=$(mktemp -d)
+trap 'git worktree remove --force "${work}" 2>/dev/null || rm -rf "${work}"' EXIT
+
+git fetch -q "${remote}" gh-pages 2>/dev/null || true
+if git rev-parse -q --verify "${remote}/gh-pages" >/dev/null; then
+  git worktree add -q --detach "${work}" "${remote}/gh-pages"
+else
+  git worktree add -q --detach "${work}"
+  git -C "${work}" checkout -q --orphan gh-pages-new
+fi
+
+# Replace everything on the branch with site/ from HEAD.
+git -C "${work}" rm -rq --ignore-unmatch .
+git archive HEAD site | tar -x -C "${work}" --strip-components=1
+
+git -C "${work}" add -A
+if git -C "${work}" diff --cached --quiet; then
+  echo "The published site already matches site/ in ${commit}."
+  exit 0
+fi
+git -C "${work}" commit -q -m "Publish the site from ${commit}"
+git -C "${work}" push -q "${remote}" HEAD:refs/heads/gh-pages
+echo "Published site/ from ${commit}. GitHub Pages updates in a minute or two."
