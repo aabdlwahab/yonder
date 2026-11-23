@@ -324,6 +324,43 @@ impl AgentConnectionStore {
         cx.notify();
     }
 
+    /// Connects to the agent, through the Yonder hub when the project is on a
+    /// machine the hub serves, so the thread keeps running with the laptop
+    /// shut. Only external agents (Claude, Codex) can run there.
+    fn connect(
+        &self,
+        server: Rc<dyn AgentServer>,
+        delegate: AgentServerDelegate,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Rc<dyn acp_thread::AgentConnection>>> {
+        let project = self.project.clone();
+        let hub = crate::hub_sync::HubSync::try_global(cx);
+        let is_external = server
+            .clone()
+            .downcast::<agent_servers::CustomAgentServer>()
+            .is_some();
+        let is_remote = project.read(cx).remote_connection_options(cx).is_some();
+        let Some(hub) = hub.filter(|_| is_external && is_remote) else {
+            return server.connect(delegate, project, cx);
+        };
+        cx.spawn(async move |_, cx| {
+            crate::hub_sync::wait_until_settled(&hub, cx).await;
+            let connect = cx.update(|cx| match hub.read(cx).route(project.read(cx), cx) {
+                Some(route) => {
+                    log::info!(
+                        "running {} on the hub for {}",
+                        server.agent_id(),
+                        route.machine
+                    );
+                    Rc::new(agent_servers::HubAgentServer::new(server.agent_id(), route))
+                        .connect(delegate, project, cx)
+                }
+                None => server.connect(delegate, project, cx),
+            });
+            connect.await
+        })
+    }
+
     fn start_connection(
         &self,
         server: Rc<dyn AgentServer>,
@@ -344,8 +381,7 @@ impl AgentConnectionStore {
         );
 
         let shutdown = self.shutdown.as_ref().map(watch::Sender::receiver);
-        let connect_task =
-            shutdown.map(|shutdown| (server.connect(delegate, self.project.clone(), cx), shutdown));
+        let connect_task = shutdown.map(|shutdown| (self.connect(server, delegate, cx), shutdown));
         let connect_task = cx.spawn(async move |this, cx| {
             let owner_released = || LoadError::Other("Agent connection owner was released".into());
             let Some((connect_task, mut shutdown)) = connect_task else {

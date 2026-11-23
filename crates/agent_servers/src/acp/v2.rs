@@ -224,6 +224,34 @@ struct StdioStartup {
 }
 
 impl AcpV2Connection {
+    /// Speaks ACP over existing line streams instead of a process, e.g. a
+    /// websocket to the Yonder hub, which relays to the real agent.
+    pub async fn over_lines(
+        agent_id: AgentId,
+        agent_server_store: WeakEntity<AgentServerStore>,
+        incoming: futures::stream::BoxStream<'static, std::io::Result<String>>,
+        outgoing: std::pin::Pin<Box<dyn futures::Sink<String, Error = std::io::Error> + Send>>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let info = cx.update(|cx| {
+            acp::Implementation::new("zed", release_channel::AppVersion::global(cx).to_string())
+                .title(
+                    release_channel::ReleaseChannel::try_global(cx)
+                        .map(|channel| channel.display_name().to_owned()),
+                )
+        });
+        Self::connect(
+            agent_id,
+            agent_server_store,
+            Lines::new(outgoing, incoming),
+            info,
+            AcpDebugLog::default(),
+            None,
+            cx,
+        )
+        .await
+    }
+
     pub async fn stdio(
         agent_id: AgentId,
         project: Entity<Project>,

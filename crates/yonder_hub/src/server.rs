@@ -85,12 +85,14 @@ pub fn serve(
         let saved = registry.load()?;
         log::info!("restored {} sessions", saved.len());
         relay.restore(saved);
+        let machines = Machines::new(app_state, local_name.clone());
+        relay.set_machines(cx.update(|cx| machines.names(cx)));
 
         let (events, mut event_rx) = mpsc::unbounded::<Event>();
         let hub = Rc::new(RefCell::new(Hub {
             relay,
             registry,
-            machines: Machines::new(app_state, local_name.clone()),
+            machines,
             clients: HashMap::default(),
             agents: HashMap::default(),
             dispatch,

@@ -1,6 +1,7 @@
 mod acp;
 mod claude_session;
 mod custom;
+mod hub;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
@@ -30,6 +31,10 @@ pub use acp::{
     v2_terminal_client_builder,
 };
 pub use claude_session::copy_claude_session;
+pub use hub::{
+    HubAgentServer, HubBoard, HubRoute, HubSettings, HubStatus, call_hub, machine_name,
+    read_hub_token, route_for, write_hub_token,
+};
 
 pub struct AgentServerDelegate {
     store: Entity<AgentServerStore>,

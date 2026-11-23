@@ -190,7 +190,7 @@ pub fn run(hub: &HubAddress, machine: &str, agent: &str, cwd: &str, prompt: &str
 
 pub fn follow(hub: &HubAddress, session: &str) -> Result<()> {
     smol::block_on(async {
-        let (mut connection, meta) = attach(hub, session).await?;
+        let (mut connection, meta) = attach(hub, session, true).await?;
         eprintln!(
             "following {} ({} on {}); Ctrl-C to stop",
             meta.id, meta.agent, meta.machine
@@ -205,16 +205,14 @@ pub fn follow(hub: &HubAddress, session: &str) -> Result<()> {
 
 pub fn send(hub: &HubAddress, session: &str, text: &str) -> Result<()> {
     smol::block_on(async {
-        let (mut connection, meta) = attach(hub, session).await?;
-        // The history replay is already in the backlog; skip it.
-        connection.backlog.clear();
+        let (mut connection, meta) = attach(hub, session, false).await?;
         prompt_and_stream(&mut connection, &meta.id, text).await
     })
 }
 
 pub fn approve(hub: &HubAddress, session: &str, option: Option<&str>) -> Result<()> {
     smol::block_on(async {
-        let (mut connection, meta) = attach(hub, session).await?;
+        let (mut connection, meta) = attach(hub, session, false).await?;
         let mut request = None;
         while let Some(message) = connection
             .next_message_within(Duration::from_secs(2))
@@ -283,8 +281,13 @@ async fn sessions(hub: &HubAddress) -> Result<Vec<SessionMeta>> {
     )?)
 }
 
-/// Finds a session by id or id prefix and attaches to it.
-async fn attach(hub: &HubAddress, session: &str) -> Result<(Connection, SessionMeta)> {
+/// Finds a session by id or id prefix and attaches to it, with its history
+/// replayed first when `history` is set.
+async fn attach(
+    hub: &HubAddress,
+    session: &str,
+    history: bool,
+) -> Result<(Connection, SessionMeta)> {
     let matches: Vec<SessionMeta> = sessions(hub)
         .await?
         .into_iter()
@@ -296,12 +299,11 @@ async fn attach(hub: &HubAddress, session: &str) -> Result<(Connection, SessionM
         _ => bail!("{session} matches more than one session; give more of the id"),
     };
     let mut connection = Connection::open(hub, &agent_path(&meta.machine, &meta.agent)).await?;
-    connection
-        .request(
-            "session/resume",
-            json!({ "sessionId": meta.id, "cwd": meta.cwd, "mcpServers": [] }),
-        )
-        .await?;
+    let mut params = json!({ "sessionId": meta.id, "cwd": meta.cwd, "mcpServers": [] });
+    if history {
+        params["replayFrom"] = json!({ "type": "start" });
+    }
+    connection.request("session/resume", params).await?;
     Ok((connection, meta))
 }
 

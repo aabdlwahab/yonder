@@ -78,6 +78,18 @@ impl Machines {
         task
     }
 
+    /// The hub's own machine, then every machine in `ssh_connections`.
+    pub fn names(&self, cx: &App) -> Vec<String> {
+        let mut names = vec![self.local_name.clone()];
+        for connection in RemoteSettings::get_global(cx).ssh_connections() {
+            let name = connection.nickname.unwrap_or(connection.host);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
     /// Forgets a machine's project, so the next agent start reconnects.
     pub fn forget(&mut self, machine: &str) {
         self.projects.remove(machine);

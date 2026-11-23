@@ -825,6 +825,10 @@ pub struct ConversationView {
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     claude_resume_task: Option<Task<()>>,
+    /// Reconnects a thread that runs on the Yonder hub after the connection
+    /// drops, e.g. when the laptop sleeps.
+    hub_retry: Option<Task<()>>,
+    hub_retry_attempt: u32,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
     /// causes mermaid diagrams to re-render).
@@ -1157,6 +1161,8 @@ impl ConversationView {
             notification_subscriptions: HashMap::default(),
             auth_task: None,
             claude_resume_task: None,
+            hub_retry: None,
+            hub_retry_attempt: 0,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
@@ -1192,6 +1198,10 @@ impl ConversationView {
         }
 
         self.server_state = state;
+        if matches!(&self.server_state, ServerState::Connected(_)) {
+            self.hub_retry = None;
+            self.hub_retry_attempt = 0;
+        }
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
@@ -1859,6 +1869,35 @@ impl ConversationView {
         }
         self.emit_load_error_telemetry(&err);
         self.set_server_state(ServerState::LoadError { error: err }, cx);
+        self.schedule_hub_reconnect(window, cx);
+    }
+
+    /// Threads on the hub keep running while the app is away, so instead of
+    /// waiting for a click on Reconnect, try again with growing pauses. The
+    /// hub replays what happened meanwhile.
+    fn schedule_hub_reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hub_retry.is_some() {
+            return;
+        }
+        let Some(hub) = crate::hub_sync::HubSync::try_global(cx) else {
+            return;
+        };
+        if hub.read(cx).route(self.project.read(cx), cx).is_none() {
+            return;
+        }
+        let delay = Duration::from_secs((2_u64 << self.hub_retry_attempt.min(4)).min(30));
+        self.hub_retry_attempt += 1;
+        log::info!("reconnecting to the hub in {}s", delay.as_secs());
+        self.hub_retry = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update_in(cx, |this, window, cx| {
+                this.hub_retry = None;
+                if matches!(this.server_state, ServerState::LoadError { .. }) {
+                    this.retry_connection(window, cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     fn handle_agent_servers_updated(
