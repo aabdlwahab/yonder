@@ -15,6 +15,8 @@
 //!   `replayFrom`) gets it exactly once: from the hub's log when the hub has
 //!   one, otherwise from the agent, which the hub then logs.
 
+use std::path::Path;
+
 use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -226,12 +228,40 @@ impl Relay {
                     "agent": meta.agent,
                     "project": meta.cwd,
                     "state": dispatch_state(session),
+                    "createdAt": meta.created_at,
                     "updatedAt": meta.updated_at,
                     "lastText": meta.last_text,
                 })
             })
             .collect();
         json!({ "sessions": sessions, "total": total })
+    }
+
+    pub fn latest_project_session(&self, project: &str) -> Option<&SessionMeta> {
+        let normalize = |name: &str| {
+            name.split(|character: char| !character.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        };
+        let name = normalize(project);
+        if name.is_empty() {
+            return None;
+        }
+        self.sessions
+            .values()
+            .map(|session| &session.meta)
+            .filter(|session| {
+                if project.contains('/') {
+                    session.cwd.trim_end_matches('/') == project.trim_end_matches('/')
+                } else {
+                    Path::new(&session.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|directory| normalize(directory) == name)
+                }
+            })
+            .max_by_key(|meta| (meta.created_at, meta.updated_at, meta.id.as_str()))
     }
 
     pub fn dispatch_session_now(&self, id: &str) -> Option<Value> {
@@ -514,8 +544,8 @@ impl Relay {
                         )];
                     }
                 };
-                let imported = self.import(sessions);
-                if imported > 0 {
+                let (imported, corrected) = self.import(sessions);
+                if imported > 0 || corrected {
                     outputs.push(Output::SaveSessions);
                 }
                 json!({ "imported": imported })
@@ -531,16 +561,25 @@ impl Relay {
         outputs
     }
 
-    /// Registers sessions the hub doesn't know yet, such as a Mac's existing
-    /// threads. Returns how many were new.
-    fn import(&mut self, sessions: Vec<ImportedSession>) -> usize {
+    /// Registers client sessions and recovers creation times for older imports.
+    fn import(&mut self, sessions: Vec<ImportedSession>) -> (usize, bool) {
         let now = (self.clock)();
         let mut imported = 0;
+        let mut corrected = false;
         for session in sessions {
-            if self.sessions.contains_key(&session.id) {
+            if let Some(existing) = self.sessions.get_mut(&session.id) {
+                if existing.meta.machine == session.machine
+                    && existing.meta.agent == session.agent
+                    && let Some(created_at) = session.created_at
+                    && created_at < existing.meta.created_at
+                {
+                    existing.meta.created_at = created_at;
+                    corrected = true;
+                }
                 continue;
             }
-            let updated_at = session.updated_at.unwrap_or(now);
+            let updated_at = session.updated_at.or(session.created_at).unwrap_or(now);
+            let created_at = session.created_at.unwrap_or(updated_at).min(updated_at);
             self.sessions.insert(
                 session.id.clone(),
                 Session {
@@ -552,7 +591,7 @@ impl Relay {
                         title: session.title,
                         state: "idle".to_string(),
                         last_text: String::new(),
-                        created_at: updated_at,
+                        created_at,
                         updated_at,
                     },
                     setup: None,
@@ -565,7 +604,7 @@ impl Relay {
             );
             imported += 1;
         }
-        imported
+        (imported, corrected)
     }
 
     fn client_request(
@@ -1044,6 +1083,8 @@ struct ImportedSession {
     #[serde(default)]
     title: Option<String>,
     #[serde(default, deserialize_with = "deserialize_timestamp")]
+    created_at: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
     updated_at: Option<u64>,
 }
 
@@ -1309,6 +1350,50 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"_yonder/dispatch/ask","params":{"prompt":" "}}"#,
         );
         assert_eq!(parse(&outputs[0])["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn dispatch_opens_the_newest_project_thread_even_after_an_older_thread_is_updated() {
+        let mut relay = Relay::new(|| 100);
+        let project = "/home/a/gamma-qwen";
+        let thread = |id: &str, cwd: &str, created_at, updated_at| ImportedSession {
+            id: id.to_string(),
+            machine: "gpu-06".into(),
+            agent: "codex-acp".into(),
+            cwd: cwd.to_string(),
+            title: None,
+            created_at,
+            updated_at: Some(updated_at),
+        };
+        relay.import(vec![thread("older", project, None, 90)]);
+        let (imported, corrected) = relay.import(vec![
+            thread("older", project, Some(10), 95),
+            thread("newest", project, Some(20), 30),
+            thread("other", "/home/a/gamma-qwen-tools", Some(40), 50),
+        ]);
+        assert_eq!((imported, corrected), (2, true));
+        assert_eq!(relay.sessions["older"].meta.updated_at, 90);
+        assert_eq!(
+            relay.dispatch_sessions(SessionFilter::All, 1)["sessions"][0]["id"],
+            "older"
+        );
+
+        for prompt in [
+            "Open the latest Gamma Qwen thread",
+            "open newest gamma-qwen session!",
+            "open the latest /home/a/gamma-qwen thread",
+        ] {
+            assert_eq!(
+                crate::dispatch::open_latest_project_thread(&relay, prompt)
+                    .and_then(|reply| reply.open_session_id)
+                    .as_deref(),
+                Some("newest")
+            );
+        }
+        assert!(
+            crate::dispatch::open_latest_project_thread(&relay, "open the latest missing thread")
+                .is_none()
+        );
     }
 
     #[test]

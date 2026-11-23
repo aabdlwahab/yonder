@@ -210,6 +210,10 @@ fn start_dispatch(
             .ok();
         return;
     };
+    if let Some(reply) = dispatch::open_latest_project_thread(&hub.borrow().relay, &prompt) {
+        tx.unbounded_send(result_response(&id, json!(reply))).ok();
+        return;
+    }
     cx.spawn(async move |cx| {
         let ask = dispatch.ask(&prompt, |name, arguments| {
             dispatch::call_tool(&hub.borrow().relay, name, arguments)

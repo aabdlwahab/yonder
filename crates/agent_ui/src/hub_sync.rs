@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use agent_client_protocol::v2::schema as acp;
 use agent_servers::{HubBoard, HubRoute, HubSettings, HubStatus};
+use anyhow::{Context as _, Result, anyhow, bail};
 use chrono::{TimeZone as _, Utc};
+use futures::future::{Either, select};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Global, Task};
 use project::{AgentId, Project, WorktreePaths};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use settings::{Settings as _, SettingsStore};
 use util::path_list::PathList;
@@ -51,6 +53,34 @@ struct HubSession {
     created_at: i64,
     #[serde(default)]
     updated_at: i64,
+}
+
+#[derive(Deserialize)]
+struct HubSessions {
+    sessions: Vec<HubSession>,
+}
+
+impl HubSessions {
+    fn import_session(self, session_id: &acp::SessionId, cx: &mut App) -> Result<ThreadMetadata> {
+        let requested_id = session_id.to_string();
+        let session = self
+            .sessions
+            .into_iter()
+            .find(|session| session.id == requested_id)
+            .context("That thread is no longer listed on the Yonder hub.")?;
+        let machine = session.machine.clone();
+        add_hub_sessions(vec![session], cx);
+        ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry_by_session(session_id).cloned())
+            .with_context(|| format!("Add {machine} in Settings → Machines to open this thread."))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DispatchReply {
+    pub text: gpui::SharedString,
+    pub open_session_id: Option<acp::SessionId>,
 }
 
 pub fn init(cx: &mut App) {
@@ -119,6 +149,82 @@ impl HubSync {
             &self.machines,
             machine.as_deref(),
         )
+    }
+
+    pub(crate) fn address(&self) -> Option<&str> {
+        self.settings
+            .address
+            .as_deref()
+            .filter(|_| self.settings.enabled)
+    }
+
+    pub(crate) fn ask_dispatch(&self, prompt: String, cx: &App) -> Task<Result<DispatchReply>> {
+        let sessions = self.importable_sessions(cx);
+        let mut calls = Vec::new();
+        if !sessions.is_empty() {
+            calls.push(("_yonder/hub/import", json!({ "sessions": sessions })));
+        }
+        calls.push(("_yonder/dispatch/ask", json!({ "prompt": prompt })));
+        // Give the hub time to return its own error if the 90-second turn times out.
+        self.request(calls, Duration::from_secs(100), cx)
+    }
+
+    pub(crate) fn sync_session(
+        &self,
+        session_id: acp::SessionId,
+        cx: &App,
+    ) -> Task<Result<ThreadMetadata>> {
+        let existing = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry_by_session(&session_id).cloned());
+        if let Some(existing) = existing {
+            return Task::ready(Ok(existing));
+        }
+
+        let address = self.address().map(str::to_owned);
+        let request = self.request::<HubSessions>(
+            vec![("_yonder/hub/sessions", json!({}))],
+            Duration::from_secs(10),
+            cx,
+        );
+        cx.spawn(async move |cx| {
+            let response = request.await?;
+            cx.update(|cx| {
+                let hub = HubSync::try_global(cx).context("The Yonder hub is unavailable.")?;
+                if hub.read(cx).address() != address.as_deref() {
+                    bail!("The Yonder hub changed. Ask Dispatch again.");
+                }
+                response.import_session(&session_id, cx)
+            })
+        })
+    }
+
+    fn request<Response: DeserializeOwned + Send + 'static>(
+        &self,
+        calls: Vec<(&'static str, Value)>,
+        timeout: Duration,
+        cx: &App,
+    ) -> Task<Result<Response>> {
+        let (Some(address), Some(token)) = (self.address(), self.token.as_ref()) else {
+            return Task::ready(Err(anyhow!("Connect to the Yonder hub first.")));
+        };
+        if !matches!(self.status, HubStatus::Connected { .. }) {
+            return Task::ready(Err(anyhow!("Connect to the Yonder hub first.")));
+        }
+        let address = address.to_owned();
+        let token = token.clone();
+        let executor = cx.background_executor().clone();
+        cx.background_spawn(async move {
+            let request = agent_servers::call_hub(&address, &token, calls);
+            futures::pin_mut!(request);
+            match select(request, executor.timer(timeout)).await {
+                Either::Left((result, _)) => {
+                    let response = result?.pop().context("The hub returned no response.")?;
+                    serde_json::from_value(response)
+                        .context("The hub returned an invalid response.")
+                }
+                Either::Right(_) => bail!("The request to the Yonder hub timed out."),
+            }
+        })
     }
 
     /// Saves the hub's token in the Keychain and reconnects.
@@ -243,13 +349,11 @@ impl HubSync {
         add_hub_sessions(sessions, cx);
     }
 
-    /// Hands the app's threads on served machines to the hub, so it (and
-    /// Dispatch) list them. The hub ignores ones it already knows.
-    fn import_threads(&self, address: String, token: String, cx: &mut Context<Self>) {
+    fn importable_sessions(&self, cx: &App) -> Vec<Value> {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
-            return;
+            return Vec::new();
         };
-        let sessions: Vec<Value> = store
+        store
             .read(cx)
             .entries()
             .filter(|thread| !thread.archived && thread.agent_id != *agent::ZED_AGENT_ID)
@@ -269,10 +373,15 @@ impl HubSync {
                     "agent": thread.agent_id.to_string(),
                     "cwd": cwd.to_string_lossy(),
                     "title": thread.title().map(|title| title.to_string()),
+                    "createdAt": thread.created_at.map(|created_at| created_at.timestamp()),
                     "updatedAt": thread.updated_at.timestamp(),
                 }))
             })
-            .collect();
+            .collect()
+    }
+
+    fn import_threads(&self, address: String, token: String, cx: &mut Context<Self>) {
+        let sessions = self.importable_sessions(cx);
         if sessions.is_empty() {
             return;
         }
@@ -364,5 +473,56 @@ pub async fn wait_until_settled(hub: &Entity<HubSync>, cx: &mut AsyncApp) {
         cx.background_executor()
             .timer(Duration::from_millis(250))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    #[test]
+    fn dispatch_reply_can_omit_the_thread() {
+        let reply: DispatchReply = serde_json::from_value(json!({ "text": "No running threads." }))
+            .expect("a reply can contain only text");
+        assert_eq!(reply.text.as_ref(), "No running threads.");
+        assert!(reply.open_session_id.is_none());
+    }
+
+    #[gpui::test]
+    fn dispatch_imports_only_the_requested_session(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut settings = SettingsStore::test(cx);
+            settings
+                .set_user_settings(
+                    r#"{ "ssh_connections": [{ "host": "gpu.example.test", "nickname": "gpu" }] }"#,
+                    cx,
+                )
+                .expect("SSH connection settings should parse");
+            cx.set_global(settings);
+            ThreadMetadataStore::init_global(cx);
+
+            let reply: DispatchReply = serde_json::from_value(json!({
+                "text": "I found the thread.", "openSessionId": "requested"
+            }))
+            .expect("a reply can name a thread by its session ID");
+            let requested_id = reply.open_session_id.expect("reply should include a session ID");
+            let sessions: HubSessions = serde_json::from_value(json!({
+                "sessions": [
+                    { "id": "other", "machine": "gpu", "agent": "codex-acp", "cwd": "/other", "title": "Build" },
+                    { "id": "requested", "machine": "gpu", "agent": "codex-acp", "cwd": "/project", "title": "Build" }
+                ]
+            }))
+            .expect("the hub session list should parse");
+            let metadata = sessions.import_session(&requested_id, cx).expect("thread should import");
+            assert_eq!(metadata.session_id.as_ref(), Some(&requested_id));
+            assert_eq!(
+                metadata.remote_connection.as_ref().and_then(agent_servers::machine_name).as_deref(),
+                Some("gpu")
+            );
+            let store = ThreadMetadataStore::global(cx);
+            assert!(store.read(cx).entry_by_session(&acp::SessionId::new("other")).is_none());
+        });
     }
 }
