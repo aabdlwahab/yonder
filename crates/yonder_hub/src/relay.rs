@@ -11,8 +11,9 @@
 //!   attached to the session.
 //! - Requests from the agent (approvals) go to every attached client and the
 //!   first answer wins. With nobody attached they wait for the next client.
-//! - Resuming a session the hub already runs replays its log, so a client that
-//!   attaches late sees the whole thread.
+//! - A client that asks for history (`session/load`, or `session/resume` with
+//!   `replayFrom`) gets it exactly once: from the hub's log when the hub has
+//!   one, otherwise from the agent, which the hub then logs.
 
 use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
@@ -133,8 +134,8 @@ enum RouteKind {
     New {
         cwd: String,
     },
-    /// `replay`: whether the hub replays its own log (`session/resume`) or the
-    /// agent replays the history itself (`session/load`).
+    /// `replay`: whether the hub replays its own log after the agent's answer.
+    /// When it doesn't, either nobody asked for history or the agent replays it.
     Resume {
         session: String,
         replay: bool,
@@ -148,6 +149,7 @@ pub struct Relay {
     agents: HashMap<AgentKey, Agent>,
     sessions: HashMap<String, Session>,
     routes: HashMap<String, Route>,
+    machines: Vec<String>,
 }
 
 impl Relay {
@@ -159,7 +161,13 @@ impl Relay {
             agents: HashMap::default(),
             sessions: HashMap::default(),
             routes: HashMap::default(),
+            machines: Vec::new(),
         }
+    }
+
+    /// The machines clients can start agents on.
+    pub fn set_machines(&mut self, machines: Vec<String>) {
+        self.machines = machines;
     }
 
     /// Sessions saved before a restart. The agents don't know them until a
@@ -456,6 +464,7 @@ impl Relay {
         id: Value,
         params: Option<&Value>,
     ) -> Vec<Output> {
+        let mut outputs = Vec::new();
         let result = match method {
             "initialize" => json!({
                 "protocolVersion": 2,
@@ -486,6 +495,31 @@ impl Relay {
                     ),
                 )];
             }
+            "_yonder/hub/machines" => json!({ "machines": self.machines }),
+            "_yonder/hub/import" => {
+                let sessions = params
+                    .and_then(|params| params.get("sessions"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let sessions = match serde_json::from_value::<Vec<ImportedSession>>(sessions) {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        return vec![Output::ToClient(
+                            client,
+                            error_response_with_code(
+                                &id,
+                                -32602,
+                                &format!("invalid sessions: {error}"),
+                            ),
+                        )];
+                    }
+                };
+                let imported = self.import(sessions);
+                if imported > 0 {
+                    outputs.push(Output::SaveSessions);
+                }
+                json!({ "imported": imported })
+            }
             _ => {
                 return vec![Output::ToClient(
                     client,
@@ -493,7 +527,45 @@ impl Relay {
                 )];
             }
         };
-        vec![Output::ToClient(client, result_response(&id, result))]
+        outputs.push(Output::ToClient(client, result_response(&id, result)));
+        outputs
+    }
+
+    /// Registers sessions the hub doesn't know yet, such as a Mac's existing
+    /// threads. Returns how many were new.
+    fn import(&mut self, sessions: Vec<ImportedSession>) -> usize {
+        let now = (self.clock)();
+        let mut imported = 0;
+        for session in sessions {
+            if self.sessions.contains_key(&session.id) {
+                continue;
+            }
+            let updated_at = session.updated_at.unwrap_or(now);
+            self.sessions.insert(
+                session.id.clone(),
+                Session {
+                    meta: SessionMeta {
+                        id: session.id,
+                        machine: session.machine,
+                        agent: session.agent,
+                        cwd: session.cwd,
+                        title: session.title,
+                        state: "idle".to_string(),
+                        last_text: String::new(),
+                        created_at: updated_at,
+                        updated_at,
+                    },
+                    setup: None,
+                    log: Vec::new(),
+                    live: false,
+                    attached: HashSet::default(),
+                    message_id: None,
+                    message_text: String::new(),
+                },
+            );
+            imported += 1;
+        }
+        imported
     }
 
     fn client_request(
@@ -555,12 +627,16 @@ impl Relay {
                     .to_string(),
             },
             ("session/resume" | "session/load", Some(session_id)) => {
+                let load = method == "session/load";
+                let wants_history = load
+                    || message
+                        .pointer("/params/replayFrom")
+                        .is_some_and(|replay_from| !replay_from.is_null());
                 if let Some(session) = self.sessions.get(session_id)
                     && session.live
                 {
-                    return self.attach_live(client, session_id.clone(), &id);
+                    return self.attach_live(client, session_id.clone(), &id, wants_history);
                 }
-                let replay = method == "session/resume";
                 let cwd = message
                     .pointer("/params/cwd")
                     .and_then(Value::as_str)
@@ -589,10 +665,21 @@ impl Relay {
                         message_id: None,
                         message_text: String::new(),
                     });
-                if !replay {
-                    // The agent replays the history itself.
+                let replay = if load {
+                    // `session/load` always makes the agent replay the history.
                     session.log.clear();
-                }
+                    false
+                } else if wants_history && !session.log.is_empty() {
+                    // The hub replays its own log, so the agent mustn't as well.
+                    if let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) {
+                        params.remove("replayFrom");
+                    }
+                    true
+                } else {
+                    // Either no history was asked for, or the hub has none (an
+                    // imported session) and the agent's replay gets logged.
+                    false
+                };
                 self.attach(client, session_id);
                 RouteKind::Resume {
                     session: session_id.clone(),
@@ -881,18 +968,29 @@ impl Relay {
             .collect()
     }
 
-    /// Attaches a client to a session the agent already runs: the log, then
-    /// the setup answer, then any approvals still waiting.
-    fn attach_live(&mut self, client: ClientId, session_id: String, id: &Value) -> Vec<Output> {
+    /// Attaches a client to a session the agent already runs: the log if the
+    /// client asked for history, then the setup answer, then any approvals
+    /// still waiting.
+    fn attach_live(
+        &mut self,
+        client: ClientId,
+        session_id: String,
+        id: &Value,
+        wants_history: bool,
+    ) -> Vec<Output> {
         self.attach(client, &session_id);
         let Some(session) = self.sessions.get(&session_id) else {
             return Vec::new();
         };
-        let mut outputs: Vec<Output> = session
-            .log
-            .iter()
-            .map(|line| Output::ToClient(client, line.clone()))
-            .collect();
+        let mut outputs: Vec<Output> = Vec::new();
+        if wants_history {
+            outputs.extend(
+                session
+                    .log
+                    .iter()
+                    .map(|line| Output::ToClient(client, line.clone())),
+            );
+        }
         let setup = session.setup.clone().unwrap_or_else(|| json!({}));
         outputs.push(Output::ToClient(client, result_response(id, setup)));
         let key = AgentKey {
@@ -933,6 +1031,81 @@ impl Relay {
         self.next_request += 1;
         format!("hub-{}", self.next_request)
     }
+}
+
+/// A session a client already has, registered with `_yonder/hub/import`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportedSession {
+    id: String,
+    machine: String,
+    agent: String,
+    cwd: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_timestamp")]
+    updated_at: Option<u64>,
+}
+
+/// ACP gives times as RFC 3339 strings; the hub keeps Unix seconds. Either is
+/// accepted.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(text)) => parse_rfc3339(&text),
+        _ => None,
+    })
+}
+
+/// Unix seconds from an RFC 3339 time such as `2026-10-01T10:20:30.5+02:00`.
+fn parse_rfc3339(text: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| -> Option<i64> { text.get(range)?.parse().ok() };
+    let separator = |index: usize, allowed: &[u8]| {
+        text.as_bytes()
+            .get(index)
+            .is_some_and(|byte| allowed.contains(byte))
+    };
+    if !(separator(4, b"-")
+        && separator(7, b"-")
+        && separator(10, b"Tt ")
+        && separator(13, b":")
+        && separator(16, b":"))
+    {
+        return None;
+    }
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let mut rest = text.get(19..)?;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        rest = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    let offset = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.as_bytes().first()? {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let (hours, minutes) = rest.get(1..)?.split_once(':')?;
+            sign * (hours.parse::<i64>().ok()? * 3600 + minutes.parse::<i64>().ok()? * 60)
+        }
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 in the proleptic Gregorian calendar.
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(seconds).ok()
 }
 
 /// Updates a session's listing from one `session/update`. Returns whether the
@@ -1231,8 +1404,9 @@ mod tests {
         relay.agent_line(&key(), &second);
         let outputs = relay.client_message(
             2,
-            r#"{"jsonrpc":"2.0","id":9,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x"}}"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x","replayFrom":{"type":"start"}}}"#,
         );
+        assert_eq!(outputs.len(), 3);
         assert_eq!(outputs[0], Output::ToClient(2, first));
         assert_eq!(outputs[1], Output::ToClient(2, second));
         let response = parse(&outputs[2]);
@@ -1300,39 +1474,166 @@ mod tests {
         assert_eq!(session.cwd, "/home/a/api");
     }
 
+    fn restored_meta() -> SessionMeta {
+        SessionMeta {
+            id: "s1".into(),
+            machine: "gpu-07".into(),
+            agent: "claude-acp".into(),
+            cwd: "/x".into(),
+            title: None,
+            state: "idle".into(),
+            last_text: String::new(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    fn old_update() -> String {
+        update(
+            "agent_message_chunk",
+            json!({"content":{"type":"text","text":"old"}}),
+        )
+    }
+
+    /// The client messages the relay sends for one agent line, in order.
+    fn to_client(outputs: &[Output], client: ClientId) -> Vec<String> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                Output::ToClient(to, line) if *to == client => Some(line.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn restored_session_is_resumed_through_the_agent_then_replayed() {
         let mut relay = ready_relay(&[1]);
-        let old = update(
-            "agent_message_chunk",
-            json!({"content":{"type":"text","text":"old"}}),
-        );
-        relay.restore(vec![(
-            SessionMeta {
-                id: "s1".into(),
-                machine: "gpu-07".into(),
-                agent: "claude-acp".into(),
-                cwd: "/x".into(),
-                title: None,
-                state: "idle".into(),
-                last_text: String::new(),
-                created_at: 1,
-                updated_at: 1,
-            },
-            vec![old.clone()],
-        )]);
+        relay.restore(vec![(restored_meta(), vec![old_update()])]);
         let outputs = relay.client_message(
             1,
-            r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x","replayFrom":{"type":"start"}}}"#,
         );
         let forwarded = parse(&outputs[0]);
         assert_eq!(forwarded["method"], "session/resume");
+        assert!(
+            forwarded["params"].get("replayFrom").is_none(),
+            "the hub replays its own log, so the agent mustn't replay too"
+        );
         let outputs = relay.agent_line(
             &key(),
             &json!({"jsonrpc":"2.0","id":forwarded["id"],"result":{}}).to_string(),
         );
-        assert_eq!(outputs[0], Output::ToClient(1, old));
-        assert_eq!(parse(outputs.last().unwrap())["id"], 2);
+        let sent = to_client(&outputs, 1);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], old_update());
+        assert_eq!(serde_json::from_str::<Value>(&sent[1]).unwrap()["id"], 2);
+    }
+
+    #[test]
+    fn restored_session_resumed_without_replay_from_replays_nothing() {
+        let mut relay = ready_relay(&[1]);
+        relay.restore(vec![(restored_meta(), vec![old_update()])]);
+        let request = r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x"}}"#;
+        let outputs = relay.client_message(1, request);
+        let forwarded = parse(&outputs[0]);
+        assert_eq!(forwarded["params"], json!({"sessionId":"s1","cwd":"/x"}));
+        let outputs = relay.agent_line(
+            &key(),
+            &json!({"jsonrpc":"2.0","id":forwarded["id"],"result":{}}).to_string(),
+        );
+        let sent = to_client(&outputs, 1);
+        assert_eq!(sent.len(), 1, "only the response: {sent:?}");
+        assert_eq!(serde_json::from_str::<Value>(&sent[0]).unwrap()["id"], 2);
+
+        // The log is kept for a later client that does ask for history.
+        relay.client_connected(2, Endpoint::Agent(key()));
+        let outputs = relay.client_message(
+            2,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x","replayFrom":{"type":"start"}}}"#,
+        );
+        assert_eq!(outputs[0], Output::ToClient(2, old_update()));
+    }
+
+    #[test]
+    fn session_without_a_hub_log_is_replayed_by_the_agent_and_logged() {
+        let mut relay = ready_relay(&[1]);
+        relay.client_connected(9, Endpoint::Hub);
+        relay.client_message(
+            9,
+            &json!({"jsonrpc":"2.0","id":1,"method":"_yonder/hub/import","params":{"sessions":[
+                {"id":"s1","machine":"gpu-07","agent":"claude-acp","cwd":"/x"}
+            ]}})
+            .to_string(),
+        );
+        let outputs = relay.client_message(
+            1,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x","replayFrom":{"type":"start"}}}"#,
+        );
+        let forwarded = parse(&outputs[0]);
+        assert_eq!(forwarded["params"]["replayFrom"], json!({"type":"start"}));
+
+        // The agent replays the history before answering.
+        let outputs = relay.agent_line(&key(), &old_update());
+        assert!(outputs.contains(&Output::ToClient(1, old_update())));
+        assert!(outputs.contains(&Output::AppendLog {
+            session: "s1".into(),
+            line: old_update(),
+        }));
+        let outputs = relay.agent_line(
+            &key(),
+            &json!({"jsonrpc":"2.0","id":forwarded["id"],"result":{}}).to_string(),
+        );
+        let sent = to_client(&outputs, 1);
+        assert_eq!(sent.len(), 1, "the hub doesn't replay it again: {sent:?}");
+        assert_eq!(serde_json::from_str::<Value>(&sent[0]).unwrap()["id"], 2);
+    }
+
+    #[test]
+    fn live_session_replays_only_when_asked() {
+        let mut relay = with_session(ready_relay(&[1, 2]), 1);
+        let line = old_update();
+        relay.agent_line(&key(), &line);
+
+        let outputs = relay.client_message(
+            2,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"s1","cwd":"/x"}}"#,
+        );
+        assert_eq!(outputs.len(), 1, "only the setup: {outputs:?}");
+        let response = parse(&outputs[0]);
+        assert_eq!(response["id"], 3);
+        assert_eq!(response["result"]["sessionId"], "s1");
+
+        let outputs = relay.client_message(
+            2,
+            r#"{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"s1","cwd":"/x"}}"#,
+        );
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], Output::ToClient(2, line));
+        assert_eq!(parse(&outputs[1])["id"], 4);
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, Output::ToAgent(..))),
+            "a live session is answered by the hub"
+        );
+    }
+
+    #[test]
+    fn loading_a_restored_session_lets_the_agent_replay() {
+        let mut relay = ready_relay(&[1]);
+        relay.restore(vec![(restored_meta(), vec![old_update()])]);
+        let outputs = relay.client_message(
+            1,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"s1","cwd":"/x"}}"#,
+        );
+        let forwarded = parse(&outputs[0]);
+        assert_eq!(forwarded["method"], "session/load");
+        let outputs = relay.agent_line(
+            &key(),
+            &json!({"jsonrpc":"2.0","id":forwarded["id"],"result":{}}).to_string(),
+        );
+        assert_eq!(to_client(&outputs, 1).len(), 1);
     }
 
     #[test]
@@ -1346,6 +1647,83 @@ mod tests {
         let response = parse(&outputs[0]);
         assert_eq!(response["result"]["sessions"][0]["id"], "s1");
         assert_eq!(response["result"]["sessions"][0]["machine"], "gpu-07");
+    }
+
+    #[test]
+    fn hub_endpoint_lists_machines() {
+        let mut relay = Relay::new(|| 100);
+        relay.set_machines(vec!["gpu-06".into(), "gpu-07".into()]);
+        relay.client_connected(9, Endpoint::Hub);
+        let outputs = relay.client_message(
+            9,
+            r#"{"jsonrpc":"2.0","id":1,"method":"_yonder/hub/machines"}"#,
+        );
+        assert_eq!(
+            parse(&outputs[0])["result"],
+            json!({"machines":["gpu-06","gpu-07"]})
+        );
+    }
+
+    #[test]
+    fn hub_endpoint_imports_only_new_sessions() {
+        let mut relay = with_session(ready_relay(&[1]), 1);
+        relay.client_connected(9, Endpoint::Hub);
+        let outputs = relay.client_message(
+            9,
+            &json!({"jsonrpc":"2.0","id":1,"method":"_yonder/hub/import","params":{"sessions":[
+                {"id":"s1","machine":"other","agent":"codex-acp","cwd":"/elsewhere"},
+                {"id":"s2","machine":"gpu-06","agent":"codex-acp","cwd":"/y","title":"Old thread","updatedAt":"2026-10-01T10:20:30+02:00"},
+                {"id":"s3","machine":"gpu-07","agent":"claude-acp","cwd":"/z","updatedAt":50},
+            ]}})
+            .to_string(),
+        );
+        assert_eq!(outputs[0], Output::SaveSessions);
+        assert_eq!(parse(&outputs[1])["result"], json!({"imported": 2}));
+
+        let sessions = relay.sessions();
+        let find = |id: &str| sessions.iter().find(|session| session.id == id).unwrap();
+        assert_eq!(
+            find("s1").machine,
+            "gpu-07",
+            "known sessions are left alone"
+        );
+        assert_eq!(find("s1").cwd, "/home/a/api");
+        assert_eq!(find("s2").title.as_deref(), Some("Old thread"));
+        assert_eq!(find("s2").updated_at, 1_790_842_830);
+        assert_eq!(find("s2").state, "idle");
+        assert_eq!(find("s3").updated_at, 50);
+        assert!(!relay.sessions["s2"].live);
+
+        let outputs = relay.client_message(
+            9,
+            r#"{"jsonrpc":"2.0","id":2,"method":"_yonder/hub/import","params":{"sessions":[{"id":"s2","machine":"gpu-06","agent":"codex-acp","cwd":"/y"}]}}"#,
+        );
+        assert_eq!(outputs.len(), 1, "nothing new, nothing to save");
+        assert_eq!(parse(&outputs[0])["result"], json!({"imported": 0}));
+
+        let outputs = relay.client_message(
+            9,
+            r#"{"jsonrpc":"2.0","id":3,"method":"_yonder/hub/import","params":{"sessions":[{"id":"s4"}]}}"#,
+        );
+        assert_eq!(parse(&outputs[0])["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn rfc3339_times_become_unix_seconds() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339("2026-10-01T08:20:30.123Z"),
+            Some(1_790_842_830)
+        );
+        assert_eq!(
+            parse_rfc3339("2026-10-01T10:20:30+02:00"),
+            Some(1_790_842_830)
+        );
+        assert_eq!(
+            parse_rfc3339("2024-02-29T00:00:00-01:30"),
+            Some(1_709_170_200)
+        );
+        assert_eq!(parse_rfc3339("yesterday"), None);
     }
 
     #[test]

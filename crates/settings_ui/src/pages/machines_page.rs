@@ -3,7 +3,9 @@ use editor::Editor;
 use fs::Fs;
 use gpui::{Entity, Focusable as _, ReadGlobal as _, Subscription, Task, prelude::*};
 use remote::{AddressCheck, SshConnectionOptions};
-use settings::{SettingsStore, SshConnection, SshSecondaryHost, update_settings_file};
+use settings::{
+    Settings as _, SettingsStore, SshConnection, SshSecondaryHost, update_settings_file,
+};
 use std::sync::Arc;
 use ui::{
     Checkbox, Divider, Indicator, ListItem, ListItemSpacing, ToggleState, Tooltip, prelude::*,
@@ -199,6 +201,11 @@ pub(crate) struct MachinesPage {
     /// rows move.
     checks: HashMap<String, CheckState>,
     check_tasks: Vec<Task<()>>,
+    /// The Hub row's inputs, made on first render because editors need a window.
+    hub_address: Option<Entity<Editor>>,
+    hub_token: Option<Entity<Editor>>,
+    hub_message: Option<SharedString>,
+    hub_task: Option<Task<()>>,
     _settings_subscription: Subscription,
     _accounts_subscription: Option<Subscription>,
 }
@@ -263,6 +270,10 @@ impl MachinesPage {
             adding: None,
             checks: HashMap::default(),
             check_tasks: Vec::new(),
+            hub_address: None,
+            hub_token: None,
+            hub_message: None,
+            hub_task: None,
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
             _accounts_subscription: accounts
                 .map(|accounts| cx.observe(&accounts, |_, _, cx| cx.notify())),
@@ -563,6 +574,156 @@ impl MachinesPage {
             .gap_1p5()
             .child(Indicator::dot().color(color))
             .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
+    }
+
+    fn render_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = agent_servers::HubSettings::get_global(cx).clone();
+        let address = self
+            .hub_address
+            .get_or_insert_with(|| {
+                text_input(
+                    "100.80.18.21:7766",
+                    settings.address.as_deref().unwrap_or_default(),
+                    window,
+                    cx,
+                )
+            })
+            .clone();
+        let token = self
+            .hub_token
+            .get_or_insert_with(|| {
+                let editor = text_input("Paste the hub's token to change it", "", window, cx);
+                editor.update(cx, |editor, cx| editor.set_masked(true, cx));
+                editor
+            })
+            .clone();
+
+        let (color, status): (Color, SharedString) = match agent_servers::HubBoard::status(cx) {
+            agent_servers::HubStatus::Off => (Color::Muted, "Off: threads run in this app".into()),
+            agent_servers::HubStatus::Connecting => (Color::Muted, "Connecting…".into()),
+            agent_servers::HubStatus::NoToken => (Color::Warning, "Needs the hub's token".into()),
+            agent_servers::HubStatus::Connected { machines, sessions } => (
+                Color::Success,
+                format!(
+                    "Connected · runs threads for {} · {sessions} sessions",
+                    if machines.is_empty() {
+                        "no machines".to_string()
+                    } else {
+                        machines.join(", ")
+                    }
+                )
+                .into(),
+            ),
+            agent_servers::HubStatus::Failed(error) => (Color::Error, error),
+        };
+
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .child(Label::new("Hub"))
+                            .child(
+                                Label::new(
+                                    "An always-on server that runs agent threads for the machines it serves, so they keep working with the laptop shut.",
+                                )
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .flex_none()
+                            .child(Indicator::dot().color(color))
+                            .child(Label::new(status).size(LabelSize::Small).color(Color::Muted)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_end()
+                    .child(div().w_56().child(field("Address", &address, cx)))
+                    .child(div().flex_1().child(field("Token", &token, cx)))
+                    .child(
+                        Button::new("hub-save", "Save")
+                            .tab_index(0_isize)
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| this.save_hub(window, cx))),
+                    )
+                    .child(
+                        Button::new("hub-check", "Check")
+                            .tab_index(0_isize)
+                            .style(ButtonStyle::OutlinedGhost)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.hub_message = None;
+                                agent_servers::HubBoard::refresh(cx);
+                            })),
+                    ),
+            )
+            .when(settings.address.is_some(), |this| {
+                let enabled = settings.enabled;
+                this.child(
+                    Checkbox::new("hub-enabled", ToggleState::from(enabled))
+                        .label("Run threads on the hub for the machines it serves")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            update_settings_file(this.fs.clone(), cx, move |settings, _| {
+                                settings.remote.hub.get_or_insert_default().enabled = Some(!enabled);
+                            });
+                        })),
+                )
+            })
+            .when_some(self.hub_message.clone(), |this, message| {
+                this.child(Label::new(message).size(LabelSize::Small).color(Color::Muted))
+            })
+    }
+
+    /// Saves the address to settings and the token to the Keychain.
+    fn save_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(address), Some(token)) = (self.hub_address.clone(), self.hub_token.clone())
+        else {
+            return;
+        };
+        let address = editor_text(&address, cx).trim().to_string();
+        let token_text = editor_text(&token, cx).trim().to_string();
+        if address.is_empty() {
+            self.hub_message = Some("Enter the hub's address first.".into());
+            cx.notify();
+            return;
+        }
+        let saved_address = address.clone();
+        update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            let hub = settings.remote.hub.get_or_insert_default();
+            hub.address = Some(saved_address);
+            hub.enabled.get_or_insert(true);
+        });
+        token.update(cx, |editor, cx| editor.set_text("", window, cx));
+        if token_text.is_empty() {
+            self.hub_message = Some("Saved.".into());
+            cx.notify();
+            return;
+        }
+        self.hub_message = Some("Saving the token…".into());
+        cx.notify();
+        self.hub_task = Some(cx.spawn(async move |this, cx| {
+            let result = agent_servers::write_hub_token(&address, &token_text, cx).await;
+            this.update(cx, |this, cx| {
+                this.hub_message = Some(match &result {
+                    Ok(()) => "Saved. The token is in your Keychain.".into(),
+                    Err(error) => format!("Couldn't save the token: {error:#}").into(),
+                });
+                agent_servers::HubBoard::refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn render_new_machine(
@@ -867,7 +1028,8 @@ impl MachinesPage {
 }
 
 impl Render for MachinesPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hub = self.render_hub(window, cx).into_any_element();
         let connections = configured_connections(cx);
         if self
             .editing
@@ -966,6 +1128,7 @@ impl Render for MachinesPage {
                 this.child(self.render_new_machine(form, cx))
             })
             .child(list)
+            .child(hub)
     }
 }
 

@@ -1434,6 +1434,20 @@ pub struct RemoteSettingsContent {
     ///
     /// Default: null (auto-detect)
     pub dev_container_use_buildkit: Option<bool>,
+    /// The Yonder hub that runs agent threads for remote machines, so they keep
+    /// working with the laptop shut.
+    pub hub: Option<HubSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]
+pub struct HubSettingsContent {
+    /// The hub's address on the tailnet, as `host:port`.
+    pub address: Option<String>,
+    /// Whether threads on the machines the hub serves run on the hub.
+    ///
+    /// Default: true when an address is set
+    pub enabled: Option<bool>,
 }
 
 #[with_fallible_options]

@@ -380,6 +380,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-channel 2.5.0",
+ "async-tungstenite",
  "base64 0.22.1",
  "chrono",
  "client",
@@ -401,6 +402,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "smol",
  "task",
  "tempfile",
  "terminal",
@@ -16517,6 +16519,7 @@ name = "settings_ui"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "agent_servers",
  "agent_settings",
  "agent_skills",
  "anyhow",
