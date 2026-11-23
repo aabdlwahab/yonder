@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Yonder — a native editor for code on other machines</title>
+    <meta
+      name="description"
+      content="Yonder is a native desktop editor built on Zed. Your projects, terminals and agents run on your machines over SSH, keep running with the laptop shut, and answer you from your phone."
+    />
+    <meta property="og:title" content="Yonder" />
+    <meta property="og:description" content="A native editor for code on other machines. Built on Zed." />
+    <meta property="og:image" content="https://aabdlwahab.github.io/yonder/assets/icon-512.png" />
+    <!-- Apply the saved theme before first paint, so a light-theme reader never
+         sees a dark flash. -->
+    <script>
+      (function () {
+        var theme = null;
+        try { theme = localStorage.getItem("yonder-theme"); } catch (error) {}
+        if (theme !== "light" && theme !== "dark") {
+          theme = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+    <link rel="stylesheet" href="assets/site.css" />
+    <link rel="icon" type="image/svg+xml" href="assets/mark.svg" />
+    <link rel="apple-touch-icon" href="assets/icon-180.png" />
+  </head>
+  <body>
+    <!-- ========================= HEADER ========================= -->
+    <header class="hdr">
+      <div class="wrap hdr-in">
+        <a class="lockup" href="#top" aria-label="Yonder home">
+          <span class="mark" aria-hidden="true">
+            <svg width="28" height="28" viewBox="0 0 32 32">
+              <rect width="32" height="32" rx="8" fill="#1b2340" />
+              <path d="M9.5 9.5 L16 17.6 M20.6 13.2 L16 17.6 V24.5" fill="none" stroke="#f2efe6" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+              <circle cx="23.2" cy="9.4" r="2.6" fill="#f2b544" />
+            </svg>
+          </span>
+          <span class="lockup-txt">
+            <span class="wordmark">Yonder</span>
+            <span class="sublabel">editor · remote machines</span>
+          </span>
+        </a>
+        <nav class="nav" aria-label="Sections">
+          <a href="#machines">Machines</a>
+          <a href="#agents">Agents</a>
+          <a href="#hub">Hub</a>
+          <a href="#dispatch">Dispatch</a>
+          <a href="#program">One program</a>
+          <a href="#get">Get it</a>
+        </nav>
+        <div class="hdr-right">
+          <button class="icon-btn" id="theme" type="button" aria-label="Switch between light and dark">
+            <svg class="i-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>
+            <svg class="i-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+          </button>
+          <a class="btn btn-ghost hdr-cta" href="https://github.com/aabdlwahab/yonder">GitHub</a>
+          <a class="btn btn-primary hdr-cta" href="#get">Get Yonder</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <!-- ========================= HERO ========================= -->
+      <section class="hero">
+        <div class="wrap">
+          <p class="eyebrow">a native editor for code on other machines</p>
+          <h1>Your code lives over there. Work on it from here<span class="dot">.</span></h1>
+          <p class="lede">
+            Yonder is a native desktop editor built on <a href="https://zed.dev">Zed</a>. Your laptop
+            draws the window. Projects, language servers, terminals, builds and coding agents run
+            on your machines over SSH, keep running when you close the laptop, and find you on your
+            phone when they need you.
+          </p>
+          <div class="hero-ctas">
+            <a class="btn btn-primary" href="#get">Get Yonder</a>
+            <a class="btn btn-ghost" href="https://github.com/aabdlwahab/yonder">Source on GitHub</a>
+          </div>
+          <p class="hero-note">
+            Open source under GPL-3.0. A macOS app, for Linux and macOS machines. No account, no
+            telemetry, no Yonder cloud: everything runs on machines you already have.
+          </p>
+
+          <!-- An illustration of the app, not a screenshot. Decorative; the text
+               around it says the same things. -->
+          <div class="app" aria-hidden="true">
+            <div class="app-scroll">
+              <div class="app-inner">
+                <div class="app-bar">
+                  <span class="app-dots"><i></i><i></i><i></i></span>
+                  <span class="app-crumb">build-box · <b>api</b> · src/jobs/retry.rs</span>
+                </div>
+                <div class="app-body">
+                  <aside class="fleet">
+                    <div class="fleet-h">Active</div>
+                    <div class="fleet-row"><svg class="ic" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4" fill="#f2b544"/></svg>Retry backoff<span class="pill wait">needs you</span></div>
+                    <div class="fleet-row"><svg class="ic" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4" fill="#4cc38a"/></svg>Train eval sweep<span class="pill run">running</span></div>
+                    <div class="fleet-h">Machines</div>
+                    <div class="fleet-row machine"><svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor"><rect x="1.5" y="2" width="9" height="3" rx="1"/><rect x="1.5" y="7" width="9" height="3" rx="1"/></svg>build-box</div>
+                    <div class="fleet-row proj on">api</div>
+                    <div class="fleet-row proj">web</div>
+                    <div class="fleet-row proj">infra</div>
+                    <div class="fleet-row machine"><svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor"><rect x="1.5" y="2" width="9" height="3" rx="1"/><rect x="1.5" y="7" width="9" height="3" rx="1"/></svg>gpu-a</div>
+                    <div class="fleet-row proj">trainer</div>
+                    <div class="fleet-row proj">datasets</div>
+                    <div class="fleet-row machine"><svg class="ic" viewBox="0 0 12 12" fill="none" stroke="currentColor"><rect x="1.5" y="2.5" width="9" height="6" rx="1"/><path d="M4 10.5h4"/></svg>This Mac</div>
+                    <div class="fleet-row proj">notes</div>
+                  </aside>
+                  <div class="editor">
+                    <div class="tabs"><span class="tab on">retry.rs</span><span class="tab">queue.rs</span><span class="tab">Cargo.toml</span></div>
+                    <div class="code">
+                      <div class="ln"><span>18</span><span><span class="c">/// Waits longer after each failure, up to a minute.</span></span></div>
+                      <div class="ln"><span>19</span><span><span class="k">pub fn</span> <span class="f">backoff</span>(attempt: <span class="t">u32</span>) -&gt; <span class="t">Duration</span> {</span></div>
+                      <div class="ln"><span>20</span><span>    <span class="k">let</span> base = <span class="t">Duration</span>::<span class="f">from_millis</span>(<span class="t">250</span>);</span></div>
+                      <div class="ln"><span>21</span><span>    <span class="k">let</span> step = base * <span class="t">2</span>.<span class="f">pow</span>(attempt.<span class="f">min</span>(<span class="t">8</span>));</span></div>
+                      <div class="ln"><span>22</span><span>    step.<span class="f">min</span>(<span class="t">Duration</span>::<span class="f">from_secs</span>(<span class="t">60</span>))</span></div>
+                      <div class="ln"><span>23</span><span>}</span></div>
+                      <div class="ln"><span>24</span><span></span></div>
+                      <div class="ln"><span>25</span><span><span class="k">#[test]</span></span></div>
+                      <div class="ln"><span>26</span><span><span class="k">fn</span> <span class="f">backoff_stops_growing</span>() {</span></div>
+                      <div class="ln"><span>27</span><span>    <span class="f">assert_eq!</span>(<span class="f">backoff</span>(<span class="t">20</span>), <span class="t">Duration</span>::<span class="f">from_secs</span>(<span class="t">60</span>));</span></div>
+                      <div class="ln"><span>28</span><span>}</span></div>
+                    </div>
+                  </div>
+                  <aside class="thread">
+                    <div class="thread-h"><b>Retry backoff</b><span>Claude Code · build-box</span></div>
+                    <div class="msgs">
+                      <div class="you">Cap the backoff at a minute and add a test.</div>
+                      <div class="step"><span class="ok">✓</span><span><b>Edited</b> src/jobs/retry.rs</span></div>
+                      <div class="ans">Capped at 60 s and added <code style="background:none;padding:0;color:#e7e4da">backoff_stops_growing</code>. I'd like to run the tests.</div>
+                      <div class="approve">
+                        <div class="approve-h">Claude Code wants to run</div>
+                        <pre>cargo test -p jobs backoff</pre>
+                        <div class="approve-btns"><span>Approve once</span><span>Reject</span></div>
+                      </div>
+                    </div>
+                    <div class="composer">Reply to this thread…</div>
+                  </aside>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p class="app-cap">The fleet panel on the left, the editor in the middle, an agent thread on the right. Illustration.</p>
+        </div>
+      </section>
+
+      <!-- ========================= MACHINES ========================= -->
+      <section class="sec tint" id="machines">
+        <div class="wrap">
+          <p class="eyebrow">machines, then projects</p>
+          <h2>Every machine you work on, in one sidebar.</h2>
+          <p class="lede">
+            The fleet panel lists your SSH machines, and under each one the projects you have opened
+            there. Pick a project and it opens in the same window. Nothing runs in a container: the
+            project is a folder on the machine, and its language servers, terminals and builds run
+            there directly.
+          </p>
+          <div class="cards">
+            <article class="card">
+              <div class="card-n">01</div>
+              <h3>Switching is instant</h3>
+              <p>Each window keeps four projects open, so going back to one of them doesn't reconnect. Resting the pointer on a project opens its SSH connection before you click.</p>
+              <div class="keys"><kbd>ctrl</kbd><kbd>cmd</kbd><kbd>K</kbd></div>
+            </article>
+            <article class="card">
+              <div class="card-n">02</div>
+              <h3>Any address that answers</h3>
+              <p>Give a machine several addresses, like its office IP and its Tailscale name. Yonder tries them in order, and when you change networks it moves to the one that works.</p>
+            </article>
+            <article class="card">
+              <div class="card-n">03</div>
+              <h3>What needs you, first</h3>
+              <p>An Active group at the top shows threads that are waiting for an approval, then the ones that are running, then the ones with something new to read.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= AGENTS ========================= -->
+      <section class="sec" id="agents">
+        <div class="wrap">
+          <p class="eyebrow">agents where the code is</p>
+          <h2>Claude Code and Codex, on every machine.</h2>
+          <p class="lede">
+            Agent threads run on the machine that holds the project, so they read and build the real
+            code. Each machine can have several Claude accounts signed in, and a thread can move
+            between accounts and agents without losing what was said.
+          </p>
+          <div class="rows">
+            <div class="row"><span class="badge">CONTINUE</span><p><b>Continue as another account.</b> Hit a usage limit and pick up the same conversation under another Claude account.</p></div>
+            <div class="row"><span class="badge">HAND OFF</span><p><b>Hand a thread to another agent.</b> Codex gets the conversation so far and carries on.</p></div>
+            <div class="row"><span class="badge">FORK</span><p><b>Fork from any message.</b> Forks run side by side, each in its own git worktree, so they don't step on each other.</p></div>
+            <div class="row"><span class="badge">FORWARD</span><p><b>Forward a message</b> to a new thread or to one that is already running.</p></div>
+            <div class="row"><span class="badge">GUESTS</span><p><b>Tag another agent into a thread</b> with <code>@</code>. Guests start read-only, and their answers come back to the thread's own agent with your next message.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= HUB ========================= -->
+      <section class="sec tint" id="hub">
+        <div class="wrap">
+          <p class="eyebrow">close the laptop</p>
+          <h2>Threads keep going without you.</h2>
+          <p class="lede">
+            Pick one always-on machine as the <b>hub</b>. It owns your agent threads: it starts the
+            agents on each machine, keeps every thread's history, and holds approvals until you
+            answer. The Mac app and your phone are both windows onto it, so you can close one and
+            carry on in the other.
+          </p>
+          <div class="cards">
+            <article class="card">
+              <div class="card-n">01</div>
+              <h3>Turns finish anyway</h3>
+              <p>A long refactor or test run keeps going after you close the laptop. Open Yonder again and the thread is where the agent left it.</p>
+            </article>
+            <article class="card">
+              <div class="card-n">02</div>
+              <h3>Approvals wait for you</h3>
+              <p>When an agent asks to run something, the hub holds the question, and the first answer from the app, the phone or the command line wins.</p>
+            </article>
+            <article class="card">
+              <div class="card-n">03</div>
+              <h3>Restarts lose nothing</h3>
+              <p>The hub keeps each thread's log on disk. After a restart, threads resume with their history and the agent remembers the conversation.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= DISPATCH ========================= -->
+      <section class="sec" id="dispatch">
+        <div class="wrap cols">
+          <div>
+            <p class="eyebrow">talk to all of it</p>
+            <h2>Ask Dispatch.</h2>
+            <p class="lede">
+              Dispatch is an assistant that knows every thread on every machine. Ask it from the Mac,
+              or talk to it from your phone. It answers out loud, and it can pass a message to any
+              thread's agent for you.
+            </p>
+            <ul class="list">
+              <li><b>What's happening?</b> It lists threads, reads them, and tells you what each agent is doing right now.</li>
+              <li><b>Tell the trainer thread to stop after this epoch.</b> Messages go straight to that thread's agent, or wait their turn if it's busy.</li>
+              <li><b>Approvals only on your word.</b> Dispatch reads the exact command back, and nothing runs until you say approve.</li>
+              <li><b>On your Home Screen.</b> The phone page installs as an app, with notifications when a thread needs you, a long turn finishes, or an agent stops.</li>
+            </ul>
+            <p class="ps">
+              The phone page is served by your hub, only inside your Tailscale network, and a phone
+              has to be paired before it can see anything.
+            </p>
+          </div>
+          <div class="phone" aria-hidden="true">
+            <div class="phone-screen">
+              <div class="phone-top"><span>9:41</span><span>Dispatch</span></div>
+              <div class="note">
+                <div class="note-h"><span>YONDER</span><span>now</span></div>
+                <b>Retry backoff needs you</b><br />Claude Code wants to run cargo test -p jobs backoff
+              </div>
+              <div class="note">
+                <div class="note-h"><span>YONDER</span><span>4 min ago</span></div>
+                <b>Train eval sweep finished</b><br />All six runs done. Best was lr 3e-4.
+              </div>
+              <div class="orb-wrap"><div class="orb"></div></div>
+              <div class="said">You said: <b>“What's waiting for me?”</b></div>
+              <div class="said">“One thing: Claude on build-box wants to run the backoff tests. Should I approve it?”</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= ONE PROGRAM ========================= -->
+      <section class="sec tint" id="program">
+        <div class="wrap">
+          <p class="eyebrow">one program on every machine</p>
+          <h2>The same <code style="font-size:0.9em">yonder</code> does every job.</h2>
+          <p class="lede">
+            The app, the server each machine runs, and the hub are one program. On a Mac it is the
+            app itself. Servers get a single static Linux file that runs on any distribution, with
+            no display libraries and nothing to install first.
+          </p>
+          <div class="rows">
+            <div class="row"><span class="badge ok">APP</span><p><b>Yonder.app</b> on your Mac: the editor, the fleet panel and the agent panel.</p></div>
+            <div class="row"><span class="badge ok">MACHINE</span><p><b><code>yonder server</code></b>: what the app starts over SSH on each machine your code lives on.</p></div>
+            <div class="row"><span class="badge ok">HUB</span><p><b><code>yonder hub serve</code></b>: the always-on machine that owns threads, runs Dispatch and serves the phone page.</p></div>
+          </div>
+          <div class="term">
+            <div class="term-h"><span>the hub from any terminal</span><button class="copy" type="button" data-copy="hub-cli">Copy</button></div>
+            <pre id="hub-cli"><span class="p">$ </span>yonder hub list
+<span class="p">$ </span>yonder hub run --machine gpu-a --agent codex-acp --cwd ~/trainer "Summarise the last eval"
+<span class="p">$ </span>yonder hub follow 3f2a91c0
+<span class="p">$ </span>yonder hub approve 3f2a91c0</pre>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= PRIVATE BY DEFAULT ========================= -->
+      <section class="sec" id="private">
+        <div class="wrap">
+          <p class="eyebrow">yours, end to end</p>
+          <h2>Nothing goes anywhere you didn't send it.</h2>
+          <div class="cards">
+            <article class="card">
+              <div class="card-n">01</div>
+              <h3>No phoning home</h3>
+              <p>Telemetry and crash-report uploads are off whatever the settings say. Update checks and Zed sign-in are disabled.</p>
+            </article>
+            <article class="card">
+              <div class="card-n">02</div>
+              <h3>Your machines, your accounts</h3>
+              <p>Agents use the Claude and Codex sign-ins already on each machine. There is no Yonder service in the middle.</p>
+            </article>
+            <article class="card">
+              <div class="card-n">03</div>
+              <h3>Beside Zed, not instead of it</h3>
+              <p>Yonder has its own name, settings and data folders, so it installs next to Zed without sharing anything.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================= GET IT ========================= -->
+      <section class="sec tint" id="get">
+        <div class="wrap">
+          <p class="eyebrow">get yonder</p>
+          <h2>Build it on your Mac.</h2>
+          <p class="lede">
+            There are no release downloads yet, so Yonder is built from source. It builds like Zed:
+            follow Zed's <a href="https://github.com/aabdlwahab/yonder/blob/main/docs/src/development/macos.md">macOS guide</a>
+            for the toolchain, then run the install script. The release build takes about twenty
+            minutes.
+          </p>
+          <div class="get-grid">
+            <div class="get">
+              <h3>The Mac app</h3>
+              <p>Builds Yonder in release mode, signs it for this Mac, and installs <code>/Applications/Yonder.app</code>.</p>
+              <div class="term">
+                <div class="term-h"><span>on your Mac</span><button class="copy" type="button" data-copy="get-mac">Copy</button></div>
+                <pre id="get-mac"><span class="p">$ </span>git clone https://github.com/aabdlwahab/yonder.git
+<span class="p">$ </span>cd yonder
+<span class="p">$ </span>script/install-mac</pre>
+              </div>
+            </div>
+            <div class="get">
+              <h3>The program for Linux machines</h3>
+              <p>Builds the static <code>yonder</code> program on a Linux machine. <code>-l</code> builds it there over SSH and puts it inside the app.</p>
+              <div class="term">
+                <div class="term-h"><span>on your Mac</span><button class="copy" type="button" data-copy="get-linux">Copy</button></div>
+                <pre id="get-linux"><span class="cm"># build-box: any Linux machine with Rust and zig</span>
+<span class="p">$ </span>script/install-mac -l build-box</pre>
+              </div>
+            </div>
+          </div>
+          <p class="ps">
+            Then add your machines in <b>Settings → Machines</b>, or as <code>ssh_connections</code> in
+            your settings file. The app installs its server on each machine the first time you open a
+            project there. Yonder isn't signed with an Apple Developer ID, so it only runs on the Mac
+            that built it.
+          </p>
+        </div>
+      </section>
+
+      <!-- ========================= FOOTER ========================= -->
+      <footer class="foot">
+        <div class="wrap">
+          <span class="mark" aria-hidden="true">
+            <svg width="52" height="52" viewBox="0 0 32 32">
+              <rect width="32" height="32" rx="8" fill="#232c4d" />
+              <path d="M9.5 9.5 L16 17.6 M20.6 13.2 L16 17.6 V24.5" fill="none" stroke="#f2efe6" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+              <circle cx="23.2" cy="9.4" r="2.6" fill="#f2b544" />
+            </svg>
+          </span>
+          <h2>Work on every machine from one window.</h2>
+          <p class="lede">Your projects stay where they run. Your agents keep working when you leave. Yonder brings both to the window in front of you.</p>
+          <div class="hero-ctas">
+            <a class="btn btn-primary" href="#get">Get Yonder</a>
+            <a class="btn btn-ghost" href="https://github.com/aabdlwahab/yonder">Source on GitHub</a>
+            <a class="btn btn-ghost" href="#top">Back to top</a>
+          </div>
+          <div class="foot-meta">
+            <span>Yonder · GPL-3.0-or-later</span>
+            <span>Built on <a href="https://github.com/zed-industries/zed">Zed</a>. Not affiliated with or endorsed by Zed Industries.</span>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <script src="assets/site.js"></script>
+  </body>
+</html>
