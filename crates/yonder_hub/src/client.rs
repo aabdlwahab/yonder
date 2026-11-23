@@ -10,6 +10,7 @@ use async_tungstenite::tungstenite::Message;
 use futures::{FutureExt, StreamExt as _};
 use serde_json::{Value, json};
 
+use crate::dispatch::{ASK_METHOD, DispatchReply};
 use crate::relay::SessionMeta;
 
 type Socket = async_tungstenite::WebSocketStream<smol::net::TcpStream>;
@@ -151,6 +152,21 @@ pub fn list(hub: &HubAddress) -> Result<()> {
             if !last.is_empty() {
                 println!("          {}", truncate(last, 100));
             }
+        }
+        Ok(())
+    })
+}
+
+pub fn dispatch(hub: &HubAddress, question: &str) -> Result<()> {
+    smol::block_on(async {
+        let mut connection = Connection::open(hub, "/hub").await?;
+        let result = connection
+            .request(ASK_METHOD, json!({ "prompt": question }))
+            .await?;
+        let reply: DispatchReply = serde_json::from_value(result)?;
+        println!("{}", reply.text);
+        if let Some(session_id) = reply.open_session_id {
+            println!("Open thread: {session_id}");
         }
         Ok(())
     })

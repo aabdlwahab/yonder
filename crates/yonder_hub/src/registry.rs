@@ -70,6 +70,10 @@ impl Registry {
         read_or_create_token(&self.dir.join("token"))
     }
 
+    pub fn dispatch_dir(&self) -> PathBuf {
+        self.dir.join("dispatch")
+    }
+
     fn log_path(&self, session: &str) -> PathBuf {
         let name: String = session
             .chars()

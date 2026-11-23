@@ -4,6 +4,7 @@
 //! machine.
 
 mod client;
+mod dispatch;
 mod headless;
 mod machines;
 mod registry;
@@ -54,9 +55,14 @@ enum Command {
         /// host name.
         #[arg(long)]
         local_name: Option<String>,
+        /// Enable Dispatch with the path to a signed-in Codex CLI.
+        #[arg(long)]
+        dispatch_codex: Option<PathBuf>,
     },
     /// List every session the hub knows.
     List,
+    /// Ask Dispatch about the hub's agent threads.
+    Dispatch { question: String },
     /// Start a new thread and stream it until the turn ends.
     Run {
         #[arg(long)]
@@ -101,11 +107,15 @@ fn main() {
         .init();
 
     let result = match cli.command {
-        Command::Serve { listen, local_name } => {
+        Command::Serve {
+            listen,
+            local_name,
+            dispatch_codex,
+        } => {
             run_headless(move |app_state, cx| {
                 let local_name = local_name.unwrap_or_else(host_name);
                 let listen = listen.unwrap_or_else(default_listen);
-                server::serve(app_state, listen, local_name, cx)
+                server::serve(app_state, listen, local_name, dispatch_codex, cx)
             });
             Ok(())
         }
@@ -138,6 +148,7 @@ fn main() {
         }
         command => hub_address(cli.hub, cli.token).and_then(|hub| match command {
             Command::List => client::list(&hub),
+            Command::Dispatch { question } => client::dispatch(&hub, &question),
             Command::Run {
                 machine,
                 agent,
