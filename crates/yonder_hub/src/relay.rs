@@ -14,6 +14,8 @@
 //! - A client that asks for history (`session/load`, or `session/resume` with
 //!   `replayFrom`) gets it exactly once: from the hub's log when the hub has
 //!   one, otherwise from the agent, which the hub then logs.
+//! - Dispatch's saved conversations answer at `/acp/hub/dispatch` with no agent
+//!   process behind them: clients open them like threads and ask follow-ups.
 
 use std::path::Path;
 
@@ -22,7 +24,7 @@ use collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::dispatch::{ASK_METHOD, MAX_PROMPT_BYTES, SessionFilter};
+use crate::dispatch::{ASK_METHOD, CONVERSATIONS_METHOD, MAX_PROMPT_BYTES, SessionFilter};
 
 pub type ClientId = u64;
 
@@ -50,6 +52,15 @@ pub enum Output {
     AskDispatch {
         client: ClientId,
         id: Value,
+        prompt: String,
+    },
+    /// Something to tell the phone about.
+    Notify(Notice),
+    /// A follow-up asked in a saved Dispatch conversation.
+    ContinueDispatch {
+        client: ClientId,
+        id: Value,
+        session: String,
         prompt: String,
     },
     SaveSessions,
@@ -81,6 +92,35 @@ pub struct SessionMeta {
 }
 
 const LAST_TEXT_CHARS: usize = 400;
+/// Turns shorter than this end while you're likely still watching, so they
+/// don't notify.
+const DONE_NOTICE_AFTER_SECS: u64 = 60;
+
+/// What a phone notification is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NoticeKind {
+    /// A thread waits for an approval.
+    Approval,
+    /// A turn that ran a while ended.
+    Done,
+    /// The agent exited mid-turn.
+    Stopped,
+}
+
+/// A notification for the phone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub session: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// Dispatch's own conversations are saved as hub sessions of this agent, on
+/// no real machine, so they replay like any thread.
+pub const DISPATCH_MACHINE: &str = "hub";
+pub const DISPATCH_AGENT: &str = "dispatch";
 
 struct Client {
     endpoint: Endpoint,
@@ -120,6 +160,8 @@ struct Session {
     attached: HashSet<ClientId>,
     message_id: Option<String>,
     message_text: String,
+    /// When the current turn started, to tell long turns from short ones.
+    turn_started: Option<u64>,
 }
 
 enum Route {
@@ -176,7 +218,11 @@ impl Relay {
     /// Sessions saved before a restart. The agents don't know them until a
     /// client resumes them.
     pub fn restore(&mut self, sessions: Vec<(SessionMeta, Vec<String>)>) {
-        for (meta, log) in sessions {
+        for (mut meta, log) in sessions {
+            // A Dispatch conversation can't still be going after a restart.
+            if meta.agent == DISPATCH_AGENT && meta.state == "running" {
+                meta.state = "idle".to_owned();
+            }
             self.sessions.insert(
                 meta.id.clone(),
                 Session {
@@ -187,6 +233,7 @@ impl Relay {
                     attached: HashSet::default(),
                     message_id: None,
                     message_text: String::new(),
+                    turn_started: None,
                 },
             );
         }
@@ -207,6 +254,7 @@ impl Relay {
         let mut sessions: Vec<_> = self
             .sessions
             .values()
+            .filter(|session| session.meta.agent != DISPATCH_AGENT)
             .filter(|session| filter.matches(dispatch_state(session)))
             .collect();
         sessions.sort_unstable_by_key(|session| {
@@ -252,6 +300,7 @@ impl Relay {
         self.sessions
             .values()
             .map(|session| &session.meta)
+            .filter(|session| session.agent != DISPATCH_AGENT)
             .filter(|session| {
                 if project.contains('/') {
                     session.cwd.trim_end_matches('/') == project.trim_end_matches('/')
@@ -351,6 +400,273 @@ impl Relay {
 
     pub fn dispatch_has_session(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
+    }
+
+    pub fn dispatch_title(&self, id: &str) -> Option<&str> {
+        self.sessions.get(id)?.meta.title.as_deref()
+    }
+
+    /// Dispatch's saved conversations, newest first.
+    pub fn dispatch_conversations(&self, limit: usize) -> Value {
+        let mut conversations: Vec<_> = self
+            .sessions
+            .values()
+            .map(|session| &session.meta)
+            .filter(|meta| meta.agent == DISPATCH_AGENT)
+            .collect();
+        conversations
+            .sort_unstable_by_key(|meta| std::cmp::Reverse((meta.created_at, meta.id.as_str())));
+        let total = conversations.len();
+        let conversations: Vec<_> = conversations
+            .into_iter()
+            .take(limit)
+            .map(|meta| {
+                let summary = self
+                    .sessions
+                    .get(&meta.id)
+                    .map(|session| conversation_summary(&session.log))
+                    .unwrap_or_default();
+                json!({
+                    "id": meta.id,
+                    "title": meta.title,
+                    "kind": if meta.id.starts_with("dispatch-call-") { "voice" } else { "typed" },
+                    "state": meta.state,
+                    "summary": summary,
+                    "createdAt": meta.created_at,
+                    "updatedAt": meta.updated_at,
+                })
+            })
+            .collect();
+        json!({ "conversations": conversations, "total": total })
+    }
+
+    /// How many threads wait for an approval, for the phone's app badge.
+    pub fn waiting_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.live && session.meta.state == "waiting")
+            .count()
+    }
+
+    /// How many messages a saved Dispatch conversation has, so a follow-up's
+    /// messages get new ids.
+    pub fn dispatch_message_count(&self, id: &str) -> u64 {
+        let Some(session) = self.sessions.get(id) else {
+            return 0;
+        };
+        let ids: HashSet<String> = session
+            .log
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|message| {
+                message
+                    .pointer("/params/update/messageId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        ids.len() as u64
+    }
+
+    /// Starts saving a Dispatch conversation as a session of its own.
+    pub fn dispatch_conversation_start(&mut self, id: &str, title: &str) -> Vec<Output> {
+        let now = (self.clock)();
+        self.sessions.insert(
+            id.to_owned(),
+            Session {
+                meta: SessionMeta {
+                    id: id.to_owned(),
+                    machine: DISPATCH_MACHINE.to_owned(),
+                    agent: DISPATCH_AGENT.to_owned(),
+                    cwd: String::new(),
+                    title: Some(title.to_owned()),
+                    state: "running".to_owned(),
+                    last_text: String::new(),
+                    created_at: now,
+                    updated_at: now,
+                },
+                setup: None,
+                log: Vec::new(),
+                live: false,
+                attached: HashSet::default(),
+                message_id: None,
+                message_text: String::new(),
+                turn_started: None,
+            },
+        );
+        vec![Output::SaveSessions]
+    }
+
+    /// Adds one ACP session update to a saved Dispatch conversation.
+    pub fn dispatch_conversation_record(&mut self, id: &str, update: Value) -> Vec<Output> {
+        let now = (self.clock)();
+        let Some(session) = self.sessions.get_mut(id) else {
+            return Vec::new();
+        };
+        let line = session_update_line(id, &update);
+        session.log.push(line.clone());
+        let mut clients: Vec<ClientId> = session.attached.iter().copied().collect();
+        clients.sort_unstable();
+        let mut outputs: Vec<Output> = clients
+            .into_iter()
+            .map(|client| Output::ToClient(client, line.clone()))
+            .collect();
+        outputs.push(Output::AppendLog {
+            session: id.to_owned(),
+            line,
+        });
+        if apply_update(session, &update, now) {
+            outputs.push(Output::SaveSessions);
+        }
+        outputs
+    }
+
+    /// A thread's recent messages, tool calls and notes, oldest first, for
+    /// reading on the phone.
+    pub fn dispatch_timeline(&self, id: &str, limit: usize) -> Option<Value> {
+        let session = self.sessions.get(id)?;
+        let mut entries: Vec<TimelineEntry> = Vec::new();
+        let mut tools: HashMap<String, usize> = HashMap::default();
+        let mut remaining_chars = 24_000_usize;
+        let mut after_turn_boundary = false;
+        for line in session.log.iter().rev().take(4_096) {
+            if remaining_chars == 0 {
+                break;
+            }
+            let Ok(message) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(update) = message.pointer("/params/update") else {
+                continue;
+            };
+            match update["sessionUpdate"].as_str() {
+                Some("state_update") if update["state"] == "idle" => after_turn_boundary = true,
+                Some(
+                    kind @ ("user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk"),
+                ) => {
+                    let Some(text) = update.pointer("/content/text").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let role = match kind {
+                        "user_message_chunk" => "user",
+                        "agent_message_chunk" => "assistant",
+                        _ => "thought",
+                    };
+                    let message_id = update["messageId"].as_str();
+                    let continues = !after_turn_boundary
+                        && matches!(
+                            entries.last(),
+                            Some(TimelineEntry::Message { role: last_role, id: last_id, .. })
+                                if *last_role == role && last_id.as_deref() == message_id
+                        );
+                    if !continues {
+                        if entries.len() == limit {
+                            break;
+                        }
+                        entries.push(TimelineEntry::Message {
+                            role,
+                            id: message_id.map(str::to_owned),
+                            text: String::new(),
+                        });
+                    }
+                    after_turn_boundary = false;
+                    if let Some(TimelineEntry::Message { text: existing, .. }) = entries.last_mut()
+                    {
+                        let available = remaining_chars
+                            .min(2_000_usize.saturating_sub(existing.chars().count()));
+                        let chunk = tail(text, available);
+                        remaining_chars -= chunk.chars().count();
+                        existing.insert_str(0, &chunk);
+                    }
+                }
+                Some("tool_call" | "tool_call_update") => {
+                    let Some(call_id) = update["toolCallId"].as_str() else {
+                        continue;
+                    };
+                    let index = match tools.get(call_id) {
+                        Some(index) => *index,
+                        None => {
+                            if entries.len() == limit {
+                                break;
+                            }
+                            entries.push(TimelineEntry::Tool {
+                                title: None,
+                                kind: None,
+                                status: None,
+                                text: None,
+                            });
+                            tools.insert(call_id.to_owned(), entries.len() - 1);
+                            entries.len() - 1
+                        }
+                    };
+                    after_turn_boundary = false;
+                    // Updates are read newest first, so the first value seen
+                    // for a field is its latest.
+                    if let Some(TimelineEntry::Tool {
+                        title,
+                        kind,
+                        status,
+                        text,
+                    }) = entries.get_mut(index)
+                    {
+                        if status.is_none() {
+                            *status = update["status"].as_str().map(str::to_owned);
+                        }
+                        if title.is_none() {
+                            *title = update["title"].as_str().map(|value| tail(value, 300));
+                        }
+                        if kind.is_none() {
+                            *kind = update["kind"].as_str().map(str::to_owned);
+                        }
+                        if text.is_none()
+                            && let Some(output) = tool_text(update)
+                        {
+                            let output = tail(&output, remaining_chars.min(1_500));
+                            remaining_chars -= output.chars().count();
+                            *text = Some(output);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        entries.reverse();
+        let entries: Vec<Value> = entries
+            .into_iter()
+            .map(|entry| match entry {
+                TimelineEntry::Message { role, text, .. } => {
+                    json!({ "type": "message", "role": role, "text": text })
+                }
+                TimelineEntry::Tool {
+                    title,
+                    kind,
+                    status,
+                    text,
+                } => json!({
+                    "type": "tool",
+                    "title": title,
+                    "kind": kind,
+                    "status": status,
+                    "text": text,
+                }),
+            })
+            .collect();
+        let pending = self
+            .pending_approval(id)
+            .map(|(_, pending, request)| describe_approval(pending, &request));
+        Some(json!({
+            "id": id,
+            "title": session.meta.title.as_deref().map(|text| tail(text, 160)),
+            "state": dispatch_state(session),
+            "machine": session.meta.machine,
+            "agent": session.meta.agent,
+            "pendingApproval": pending,
+            "entries": entries,
+            "order": "oldest_first",
+        }))
     }
 
     /// The agent that runs a session and the session's project directory.
@@ -463,6 +779,12 @@ impl Relay {
             .and_then(Value::as_str)
             .map(str::to_string);
         let id = message.get("id").cloned();
+        if let Endpoint::Agent(agent) = &endpoint
+            && agent.machine == DISPATCH_MACHINE
+            && agent.agent == DISPATCH_AGENT
+        {
+            return self.conversation_message(client, method.as_deref(), id, &message);
+        }
         match (endpoint, method.as_deref(), id) {
             (Endpoint::Hub, Some(method), Some(id)) => {
                 self.hub_request(client, method, id, message.get("params"))
@@ -509,9 +831,24 @@ impl Relay {
                 outputs.push(Output::ToClient(client, error_response(&id, reason)));
             }
         }
+        let now = (self.clock)();
         for session in self.sessions.values_mut() {
             if session.meta.machine == key.machine && session.meta.agent == key.agent {
+                let mid_turn =
+                    session.live && matches!(session.meta.state.as_str(), "running" | "waiting");
                 session.live = false;
+                session.turn_started = None;
+                if mid_turn {
+                    session.meta.state = "idle".to_owned();
+                    session.meta.updated_at = now;
+                    outputs.push(Output::SaveSessions);
+                    outputs.push(Output::Notify(Notice {
+                        kind: NoticeKind::Stopped,
+                        session: session.meta.id.clone(),
+                        title: format!("{} stopped", thread_name(&session.meta)),
+                        body: format!("The agent on {} exited before the turn ended.", key.machine),
+                    }));
+                }
             }
         }
         let failed: Vec<String> = self
@@ -584,6 +921,13 @@ impl Relay {
                 )];
             }
             "_yonder/hub/machines" => json!({ "machines": self.machines }),
+            CONVERSATIONS_METHOD => {
+                let limit = params
+                    .and_then(|params| params.get("limit"))
+                    .and_then(Value::as_u64)
+                    .map_or(50, |limit| limit.clamp(1, 200));
+                self.dispatch_conversations(limit as usize)
+            }
             "_yonder/hub/import" => {
                 let sessions = params
                     .and_then(|params| params.get("sessions"))
@@ -617,6 +961,123 @@ impl Relay {
         };
         outputs.push(Output::ToClient(client, result_response(&id, result)));
         outputs
+    }
+
+    /// Dispatch's saved conversations, served as if Dispatch were an agent:
+    /// apps open one like any thread, follow it live and ask follow-ups in
+    /// it. Nothing else (new sessions, modes, cancelling) applies.
+    fn conversation_message(
+        &mut self,
+        client: ClientId,
+        method: Option<&str>,
+        id: Option<Value>,
+        message: &Value,
+    ) -> Vec<Output> {
+        let (Some(method), Some(id)) = (method, id) else {
+            // A Dispatch answer can't be stopped halfway, so `session/cancel`
+            // and other notifications have nothing to do.
+            return Vec::new();
+        };
+        let fail = |code: i64, text: &str| {
+            vec![Output::ToClient(
+                client,
+                error_response_with_code(&id, code, text),
+            )]
+        };
+        let requested = message
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let conversation = requested.clone().filter(|session| {
+            self.sessions
+                .get(session)
+                .is_some_and(|session| session.meta.agent == DISPATCH_AGENT)
+        });
+        match method {
+            "initialize" => vec![Output::ToClient(
+                client,
+                result_response(
+                    &id,
+                    json!({
+                        "protocolVersion": 2,
+                        "info": { "name": "yonder-dispatch", "title": "Dispatch", "version": env!("CARGO_PKG_VERSION") },
+                        "capabilities": { "session": {} },
+                    }),
+                ),
+            )],
+            "session/resume" | "session/load" => {
+                let Some(session_id) = conversation else {
+                    return fail(-32002, "That Dispatch conversation isn't on this hub");
+                };
+                let wants_history = method == "session/load"
+                    || message
+                        .pointer("/params/replayFrom")
+                        .is_some_and(|replay_from| !replay_from.is_null());
+                self.attach(client, &session_id);
+                let Some(session) = self.sessions.get(&session_id) else {
+                    return Vec::new();
+                };
+                let mut outputs: Vec<Output> = Vec::new();
+                if wants_history {
+                    outputs.extend(
+                        session
+                            .log
+                            .iter()
+                            .map(|line| Output::ToClient(client, line.clone())),
+                    );
+                }
+                let state = if session.meta.state == "running" {
+                    "running"
+                } else {
+                    "idle"
+                };
+                outputs.push(Output::ToClient(
+                    client,
+                    session_update_line(
+                        &session_id,
+                        &json!({ "sessionUpdate": "state_update", "state": state }),
+                    ),
+                ));
+                outputs.push(Output::ToClient(client, result_response(&id, json!({}))));
+                outputs
+            }
+            "session/prompt" => {
+                let Some(session_id) = conversation else {
+                    return fail(-32002, "That Dispatch conversation isn't on this hub");
+                };
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| session.meta.state == "running")
+                {
+                    return fail(-32000, "Dispatch is still answering in this conversation");
+                }
+                let prompt = prompt_text(message.pointer("/params/prompt"));
+                if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+                    return fail(
+                        -32602,
+                        "Dispatch requires a nonempty prompt of at most 8192 bytes",
+                    );
+                }
+                self.attach(client, &session_id);
+                vec![Output::ContinueDispatch {
+                    client,
+                    id,
+                    session: session_id,
+                    prompt,
+                }]
+            }
+            "session/close" => {
+                if let Some(session_id) = requested {
+                    self.detach(client, &session_id);
+                }
+                vec![Output::ToClient(client, result_response(&id, json!({})))]
+            }
+            _ => fail(
+                -32601,
+                "Dispatch conversations can be read and continued, nothing else",
+            ),
+        }
     }
 
     /// Registers client sessions and recovers creation times for older imports.
@@ -658,6 +1119,7 @@ impl Relay {
                     attached: HashSet::default(),
                     message_id: None,
                     message_text: String::new(),
+                    turn_started: None,
                 },
             );
             imported += 1;
@@ -761,6 +1223,7 @@ impl Relay {
                         attached: HashSet::default(),
                         message_id: None,
                         message_text: String::new(),
+                        turn_started: None,
                     });
                 let replay = if load {
                     // `session/load` always makes the agent replay the history.
@@ -927,6 +1390,7 @@ impl Relay {
                                     attached: HashSet::default(),
                                     message_id: None,
                                     message_text: String::new(),
+                                    turn_started: None,
                                 },
                             );
                             self.attach(client, session_id);
@@ -997,6 +1461,25 @@ impl Relay {
             session.meta.state = "waiting".to_string();
             session.meta.updated_at = (self.clock)();
             outputs.push(Output::SaveSessions);
+            let name = thread_name(&session.meta);
+            let agent = agent_label(&key.agent);
+            let pending = PendingRequest {
+                id: Value::Null,
+                session: None,
+                line: String::new(),
+            };
+            let approval = describe_approval(&pending, message);
+            let body = match (approval["command"].as_str(), approval["title"].as_str()) {
+                (Some(command), _) => format!("{agent} wants to run {command}"),
+                (None, Some(title)) => format!("{agent} asks to {title}"),
+                (None, None) => format!("{agent} is waiting for your approval."),
+            };
+            outputs.push(Output::Notify(Notice {
+                kind: NoticeKind::Approval,
+                session: session_id,
+                title: format!("{name} needs you"),
+                body: one_line(&body, 180),
+            }));
         }
         outputs
     }
@@ -1028,10 +1511,15 @@ impl Relay {
                 session: session_id.clone(),
                 line: line.to_string(),
             });
+            let now = (self.clock)();
+            let before = session.meta.state.clone();
             if let Some(update) = message.pointer("/params/update")
-                && apply_update(session, update, (self.clock)())
+                && apply_update(session, update, now)
             {
                 outputs.push(Output::SaveSessions);
+            }
+            if let Some(notice) = turn_notice(session, &before, now) {
+                outputs.push(Output::Notify(notice));
             }
         }
         let mut recipients = self.recipients(key, session_id.as_deref());
@@ -1128,6 +1616,54 @@ impl Relay {
         self.next_request += 1;
         format!("hub-{}", self.next_request)
     }
+}
+
+enum TimelineEntry {
+    Message {
+        role: &'static str,
+        id: Option<String>,
+        text: String,
+    },
+    Tool {
+        title: Option<String>,
+        kind: Option<String>,
+        status: Option<String>,
+        text: Option<String>,
+    },
+}
+
+/// The readable part of a tool call: its text content, or its raw output.
+fn tool_text(update: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    for item in update["content"].as_array().into_iter().flatten() {
+        match item["type"].as_str() {
+            Some("content") => {
+                if let Some(text) = item.pointer("/content/text").and_then(Value::as_str) {
+                    parts.push(text.to_owned());
+                }
+            }
+            Some("diff") => {
+                if let Some(path) = item["path"].as_str() {
+                    parts.push(format!("Edited {path}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        let output = &update["rawOutput"];
+        for key in ["formatted_output", "output", "stdout", "aggregated_output"] {
+            if let Some(text) = output[key].as_str() {
+                parts.push(text.to_owned());
+                break;
+            }
+        }
+        if let Some(text) = output.as_str() {
+            parts.push(text.to_owned());
+        }
+    }
+    let text = parts.join("\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// A session a client already has, registered with `_yonder/hub/import`.
@@ -1344,6 +1880,134 @@ pub(crate) fn approval_tool_call(request: &Value) -> &Value {
     params
         .pointer("/subject/toolCall")
         .unwrap_or(&params["toolCall"])
+}
+
+/// A notice when a long turn ends, and the start time of a new one.
+fn turn_notice(session: &mut Session, before: &str, now: u64) -> Option<Notice> {
+    let after = session.meta.state.as_str();
+    if matches!(after, "running" | "waiting") {
+        session.turn_started.get_or_insert(now);
+        return None;
+    }
+    if after != "idle" || before == "idle" {
+        return None;
+    }
+    let started = session.turn_started.take()?;
+    if now.saturating_sub(started) < DONE_NOTICE_AFTER_SECS {
+        return None;
+    }
+    let last = one_line(&session.meta.last_text, 200);
+    Some(Notice {
+        kind: NoticeKind::Done,
+        session: session.meta.id.clone(),
+        title: format!("{} is done", thread_name(&session.meta)),
+        body: if last.is_empty() {
+            "The turn ended.".to_owned()
+        } else {
+            last
+        },
+    })
+}
+
+/// A thread's name for a notification.
+fn thread_name(meta: &SessionMeta) -> String {
+    match meta
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        Some(title) => one_line(title, 60),
+        None => format!("A thread on {}", meta.machine),
+    }
+}
+
+/// "Codex" for `codex-acp`, "Claude" for `claude-acp@work`.
+fn agent_label(agent: &str) -> String {
+    let name = agent.split('@').next().unwrap_or(agent);
+    match name {
+        "codex-acp" | "codex" => "Codex".to_owned(),
+        "claude-acp" | "claude" => "Claude".to_owned(),
+        name => name.to_owned(),
+    }
+}
+
+/// Text on one line, cut to `chars` with an ellipsis, keeping the start.
+fn one_line(text: &str, chars: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= chars {
+        line
+    } else {
+        format!("{}…", line.chars().take(chars - 1).collect::<String>())
+    }
+}
+
+fn session_update_line(session: &str, update: &Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": { "sessionId": session, "update": update },
+    })
+    .to_string()
+}
+
+/// The text of a prompt's content blocks. Links and resources are named,
+/// since Dispatch can't open files from the app.
+fn prompt_text(prompt: Option<&Value>) -> String {
+    let blocks = prompt
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let parts: Vec<&str> = blocks
+        .iter()
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => block["text"].as_str(),
+            Some("resource_link") => block["name"].as_str().or(block["uri"].as_str()),
+            Some("resource") => block.pointer("/resource/uri").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect();
+    parts.join("\n").trim().to_owned()
+}
+
+/// What a Dispatch conversation touched, e.g. "2 threads, 1 command".
+fn conversation_summary(log: &[String]) -> String {
+    let mut threads = HashSet::default();
+    let mut commands = HashSet::default();
+    let mut approvals = HashSet::default();
+    for message in log
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        let update = &message["params"]["update"];
+        if update["sessionUpdate"] != "tool_call" {
+            continue;
+        }
+        let call = update["toolCallId"].as_str().unwrap_or_default().to_owned();
+        let step = &update["_meta"]["yonder"];
+        if update["kind"] == "execute" {
+            commands.insert(call);
+        } else if matches!(step["verb"].as_str(), Some("Approved" | "Rejected")) {
+            approvals.insert(call);
+        }
+        if let Some(session) = step["sessionId"].as_str() {
+            threads.insert(session.to_owned());
+        }
+    }
+    let count = |count: usize, one: &str, many: &str| match count {
+        0 => None,
+        1 => Some(format!("1 {one}")),
+        count => Some(format!("{count} {many}")),
+    };
+    [
+        count(threads.len(), "thread", "threads"),
+        count(commands.len(), "command", "commands"),
+        count(approvals.len(), "approval", "approvals"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 pub(crate) fn tail(text: &str, chars: usize) -> String {
@@ -1717,6 +2381,289 @@ mod tests {
             .dispatch_answer_approval("s1", &approval, false)
             .unwrap();
         assert_eq!(parse(&outputs[0])["result"]["outcome"]["optionId"], "no");
+    }
+
+    #[test]
+    fn dispatch_conversations_are_saved_apart_and_read_with_their_steps() {
+        let mut relay = with_session(ready_relay(&[1]), 1);
+        assert_eq!(
+            relay.dispatch_conversation_start("dispatch-call-1", "Voice call"),
+            vec![Output::SaveSessions]
+        );
+        for update in [
+            json!({"sessionUpdate":"session_info_update","title":"What's running?"}),
+            json!({"sessionUpdate":"user_message_chunk","messageId":"message-1","content":{"type":"text","text":"What's running?"}}),
+            json!({"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Listed threads","kind":"search","status":"completed","content":[{"type":"content","content":{"type":"text","text":"1 of 1 threads"}}]}),
+            json!({"sessionUpdate":"agent_thought_chunk","messageId":"message-2","content":{"type":"text","text":"Nothing runs."}}),
+            json!({"sessionUpdate":"agent_message_chunk","messageId":"message-3","content":{"type":"text","text":"Nothing is running right now."}}),
+            json!({"sessionUpdate":"state_update","state":"idle"}),
+        ] {
+            relay.dispatch_conversation_record("dispatch-call-1", update);
+        }
+
+        assert_eq!(
+            relay.dispatch_sessions(SessionFilter::All, 50)["total"],
+            1,
+            "Dispatch's own tools don't list its conversations as threads"
+        );
+        let conversations = relay.dispatch_conversations(10)["conversations"].clone();
+        assert_eq!(conversations[0]["title"], "What's running?");
+        assert_eq!(conversations[0]["kind"], "voice");
+        assert_eq!(conversations[0]["state"], "idle");
+
+        let timeline = relay.dispatch_timeline("dispatch-call-1", 50).unwrap();
+        let shape: Vec<String> = timeline["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:{}",
+                    entry["type"].as_str().unwrap(),
+                    entry["role"].as_str().or(entry["title"].as_str()).unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "message:user",
+                "tool:Listed threads",
+                "message:thought",
+                "message:assistant"
+            ]
+        );
+        assert_eq!(timeline["entries"][1]["text"], "1 of 1 threads");
+
+        relay.agent_line(
+            &key(),
+            &update(
+                "tool_call",
+                json!({"toolCallId":"t1","title":"Run tests","kind":"execute","status":"pending"}),
+            ),
+        );
+        relay.agent_line(
+            &key(),
+            &update(
+                "tool_call_update",
+                json!({"toolCallId":"t1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"ok"}}]}),
+            ),
+        );
+        assert_eq!(
+            relay.dispatch_timeline("s1", 10).unwrap()["entries"],
+            json!([{"type":"tool","title":"Run tests","kind":"execute","status":"completed","text":"ok"}]),
+            "a tool call's updates merge into one step"
+        );
+    }
+
+    #[test]
+    fn phones_hear_about_approvals_long_turns_and_crashes() {
+        let now = std::rc::Rc::new(std::cell::Cell::new(1_000u64));
+        let mut relay = with_session(ready_relay(&[1]), 1);
+        relay.clock = Box::new({
+            let now = now.clone();
+            move || now.get()
+        });
+        let notices = |outputs: &[Output]| -> Vec<Notice> {
+            outputs
+                .iter()
+                .filter_map(|output| match output {
+                    Output::Notify(notice) => Some(notice.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let state = |state: &str| update("state_update", json!({ "state": state }));
+        relay.agent_line(
+            &key(),
+            &update("session_info_update", json!({"title": "Run tests"})),
+        );
+
+        relay.agent_line(&key(), &state("running"));
+        now.set(1_030);
+        let outputs = relay.agent_line(&key(), &state("idle"));
+        assert!(
+            notices(&outputs).is_empty(),
+            "a short turn ends while you're watching"
+        );
+
+        relay.agent_line(&key(), &state("running"));
+        relay.agent_line(
+            &key(),
+            &update(
+                "agent_message_chunk",
+                json!({"messageId": "m1", "content": {"type": "text", "text": "All   tests\npass."}}),
+            ),
+        );
+        let outputs = relay.agent_line(
+            &key(),
+            &json!({"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{
+                "sessionId":"s1",
+                "subject":{"type":"tool_call","toolCall":{"title":"Run tests","kind":"execute","rawInput":{"command":["bash","-lc","npm test"]}}},
+                "options":[]
+            }})
+            .to_string(),
+        );
+        let approval = notices(&outputs);
+        assert_eq!(approval.len(), 1);
+        assert_eq!(approval[0].kind, NoticeKind::Approval);
+        assert_eq!(approval[0].title, "Run tests needs you");
+        assert_eq!(
+            approval[0].body,
+            format!("{} wants to run npm test", agent_label(&key().agent))
+        );
+        assert_eq!(relay.waiting_count(), 1);
+        let pending = relay.dispatch_timeline("s1", 10).unwrap()["pendingApproval"].clone();
+        assert_eq!(
+            pending["command"], "npm test",
+            "the phone can show and answer it"
+        );
+        assert_eq!(pending["approvalId"], "perm-1");
+
+        now.set(1_200);
+        let done = notices(&relay.agent_line(&key(), &state("idle")));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].kind, NoticeKind::Done);
+        assert_eq!(done[0].title, "Run tests is done");
+        assert_eq!(done[0].body, "All tests pass.");
+
+        relay.agent_line(&key(), &state("running"));
+        let stopped = notices(&relay.agent_gone(&key(), "the agent exited"));
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].kind, NoticeKind::Stopped);
+        assert_eq!(stopped[0].title, "Run tests stopped");
+        assert_eq!(relay.waiting_count(), 0);
+    }
+
+    #[test]
+    fn saved_conversations_open_like_threads_and_take_follow_ups() {
+        let mut relay = Relay::new(|| 100);
+        let conversation = "dispatch-typed-1";
+        relay.dispatch_conversation_start(conversation, "Typed question");
+        for update in [
+            json!({"sessionUpdate":"state_update","state":"running"}),
+            json!({"sessionUpdate":"user_message_chunk","messageId":"message-1","content":{"type":"text","text":"Is it done?"}}),
+            crate::dispatch::step(
+                "call-1",
+                "Read",
+                "API",
+                "read",
+                "completed",
+                Some("s1"),
+                "Tests pass.",
+            ),
+            crate::dispatch::step(
+                "call-2",
+                "Told",
+                "API",
+                "other",
+                "completed",
+                Some("s1"),
+                "",
+            ),
+            json!({"sessionUpdate":"tool_call","toolCallId":"cmd-1","title":"git log","kind":"execute","status":"completed"}),
+            json!({"sessionUpdate":"agent_message_chunk","messageId":"message-2","content":{"type":"text","text":"Yes."}}),
+            json!({"sessionUpdate":"state_update","state":"idle"}),
+        ] {
+            relay.dispatch_conversation_record(conversation, update);
+        }
+        assert_eq!(relay.dispatch_message_count(conversation), 2);
+        assert_eq!(
+            relay.dispatch_conversations(10)["conversations"][0]["summary"],
+            "1 thread, 1 command"
+        );
+
+        let dispatch = AgentKey {
+            machine: DISPATCH_MACHINE.into(),
+            agent: DISPATCH_AGENT.into(),
+        };
+        relay.client_connected(7, Endpoint::Agent(dispatch));
+        let request = |id: u64, method: &str, params: Value| {
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string()
+        };
+        let outputs = relay.client_message(7, &request(1, "initialize", json!({})));
+        assert_eq!(
+            parse(&outputs[0])["result"]["capabilities"]["session"],
+            json!({}),
+            "no agent process starts for Dispatch"
+        );
+
+        let outputs = relay.client_message(
+            7,
+            &request(
+                2,
+                "session/resume",
+                json!({"sessionId": conversation, "cwd": "/", "replayFrom": {"type": "start"}}),
+            ),
+        );
+        let lines: Vec<Value> = outputs.iter().map(parse).collect();
+        assert_eq!(
+            lines.len(),
+            9,
+            "seven logged updates, the state, then the answer"
+        );
+        assert_eq!(lines[7]["params"]["update"]["state"], "idle");
+        assert_eq!(lines[8]["id"], 2);
+
+        let outputs = relay.client_message(
+            7,
+            &request(3, "session/prompt", json!({"sessionId": conversation, "prompt": [{"type":"text","text":"  And gpu-07?  "}]})),
+        );
+        assert_eq!(
+            outputs,
+            vec![Output::ContinueDispatch {
+                client: 7,
+                id: json!(3),
+                session: conversation.into(),
+                prompt: "And gpu-07?".into(),
+            }]
+        );
+        let outputs = relay.dispatch_conversation_record(
+            conversation,
+            json!({"sessionUpdate":"state_update","state":"running"}),
+        );
+        assert_eq!(
+            parse(&outputs[0])["params"]["update"]["state"],
+            "running",
+            "the answer reaches the app following the conversation"
+        );
+        let outputs = relay.client_message(
+            7,
+            &request(
+                4,
+                "session/prompt",
+                json!({"sessionId": conversation, "prompt": [{"type":"text","text":"Hello?"}]}),
+            ),
+        );
+        assert!(
+            parse(&outputs[0])["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("still answering")
+        );
+        let outputs = relay.client_message(7, &request(5, "session/new", json!({"cwd": "/"})));
+        assert_eq!(parse(&outputs[0])["error"]["code"], -32601);
+        let outputs = relay.client_message(
+            7,
+            &request(6, "session/resume", json!({"sessionId": "s1", "cwd": "/"})),
+        );
+        assert!(
+            parse(&outputs[0])["error"].is_object(),
+            "only Dispatch conversations open here"
+        );
+
+        relay.restore(vec![(
+            SessionMeta {
+                state: "running".into(),
+                ..relay.sessions.get(conversation).unwrap().meta.clone()
+            },
+            Vec::new(),
+        )]);
+        assert_eq!(
+            relay.sessions.get(conversation).unwrap().meta.state,
+            "idle",
+            "no conversation is still going after a restart"
+        );
     }
 
     #[test]

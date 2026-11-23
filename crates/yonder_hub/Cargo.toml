@@ -20,6 +20,7 @@ agent_ui.workspace = true
 anyhow.workspace = true
 askpass.workspace = true
 async-tungstenite.workspace = true
+base64.workspace = true
 axum = { version = "0.6.20", default-features = false, features = ["json", "ws"] }
 clap.workspace = true
 client.workspace = true
@@ -54,6 +55,8 @@ settings.workspace = true
 shellexpand.workspace = true
 smol.workspace = true
 rand.workspace = true
+# Web Push encryption and signing; already in the tree through rustls.
+ring = "0.17"
 rustls = { workspace = true, features = ["ring"] }
 rustls-pemfile = "2.2"
 semver.workspace = true

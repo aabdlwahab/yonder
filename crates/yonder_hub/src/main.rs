@@ -8,6 +8,7 @@ mod dispatch;
 mod dispatch_web;
 mod headless;
 mod machines;
+mod push;
 mod registry;
 mod relay;
 mod server;

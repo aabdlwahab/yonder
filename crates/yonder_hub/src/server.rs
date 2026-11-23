@@ -1,7 +1,7 @@
 //! The running hub: a websocket listener for clients, agent processes, and
 //! the relay between them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
@@ -21,16 +21,23 @@ use collections::HashMap;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::future::{self, Either, select};
-use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
+use futures::{AsyncReadExt as _, FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, Task};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 
-use crate::dispatch::{self, Action, Consent, Dispatch, ToolResult, ToolStep, VoiceCall};
+use crate::dispatch::{
+    self, Action, CallEnd, Consent, Dispatch, Record, ToolResult, ToolStep, VoiceCall,
+};
 use crate::headless::AgentCliAppState;
 use crate::machines::Machines;
+use crate::push::{Push, Subscription};
 use crate::registry::Registry;
-use crate::relay::{AgentKey, ClientId, Endpoint, Output, Relay, error_response, result_response};
+use crate::relay::{
+    AgentKey, ClientId, Endpoint, Notice, NoticeKind, Output, Relay, error_response,
+    result_response,
+};
+use gpui::http_client::{AsyncBody, HttpClient as _, Method, Request as HttpRequest};
 
 pub const DEFAULT_PORT: u16 = 7766;
 
@@ -59,6 +66,31 @@ pub(crate) enum Event {
         id: Option<String>,
         reply: oneshot::Sender<Value>,
     },
+    /// Something the phone asked for: notifications, or acting on a thread.
+    Web {
+        request: WebRequest,
+        reply: oneshot::Sender<std::result::Result<Value, String>>,
+    },
+}
+
+pub(crate) enum WebRequest {
+    PushKey,
+    Subscribe(Subscription),
+    Unsubscribe {
+        endpoint: String,
+    },
+    TestPush {
+        endpoint: String,
+    },
+    Answer {
+        session: String,
+        approval: String,
+        approve: bool,
+    },
+    Reply {
+        session: String,
+        text: String,
+    },
 }
 
 struct RunningAgent {
@@ -82,6 +114,8 @@ struct Hub {
     /// Ids for Dispatch's own connections, counting down so they never meet
     /// the websocket ids counting up.
     next_internal_client: ClientId,
+    /// Notifications for phones, when phone Dispatch is set up.
+    push: Option<Rc<Push>>,
 }
 
 /// Starts the hub and runs until the process exits.
@@ -97,6 +131,14 @@ pub fn serve(
         let registry = Registry::open(Registry::default_dir())?;
         let token = registry.token()?;
         let dispatch = dispatch_codex.map(|codex| Dispatch::new(codex, registry.dispatch_dir()));
+        let push = match dispatch_web.load_push() {
+            Some(Ok(push)) => Some(Rc::new(push)),
+            Some(Err(error)) => {
+                log::error!("phone notifications are off: {error:#}");
+                None
+            }
+            None => None,
+        };
         let mut relay = Relay::new(now);
         let saved = registry.load()?;
         log::info!("restored {} sessions", saved.len());
@@ -116,6 +158,7 @@ pub fn serve(
             events: events.clone(),
             outbox: HashMap::default(),
             next_internal_client: ClientId::MAX,
+            push,
         }));
 
         let listener = smol::net::TcpListener::bind(&listen)
@@ -184,12 +227,27 @@ pub fn serve(
                     }
                     Event::DispatchSessions { id, reply } => {
                         let sessions = match id {
-                            Some(id) => {
-                                state.relay.dispatch_history(&id, 12).unwrap_or(Value::Null)
-                            }
-                            None => state
+                            Some(id) => state
                                 .relay
-                                .dispatch_sessions(dispatch::SessionFilter::All, 50),
+                                .dispatch_timeline(&id, 120)
+                                .unwrap_or(Value::Null),
+                            None => {
+                                let mut catalog = state
+                                    .relay
+                                    .dispatch_sessions(dispatch::SessionFilter::All, 50);
+                                let conversations = state.relay.dispatch_conversations(30);
+                                if let Some(catalog) = catalog.as_object_mut() {
+                                    catalog.insert(
+                                        "conversations".into(),
+                                        conversations["conversations"].clone(),
+                                    );
+                                    catalog.insert(
+                                        "conversationTotal".into(),
+                                        conversations["total"].clone(),
+                                    );
+                                }
+                                catalog
+                            }
                         };
                         reply.send(sessions).ok();
                         Vec::new()
@@ -197,6 +255,10 @@ pub fn serve(
                     Event::Voice(call) => {
                         start_dispatch_voice(hub.clone(), state.dispatch.clone(), call, cx);
                         Vec::new()
+                    }
+                    Event::Web { request, reply } => {
+                        drop(state);
+                        web_request(&hub, request, reply, cx)
                     }
                 }
             };
@@ -215,14 +277,32 @@ fn start_dispatch_voice(
     cx.spawn(async move |cx| {
         let result = match dispatch {
             Some(dispatch) => {
-                let tools = dispatch_tools(hub, dispatch.consent(), cx.clone());
-                dispatch
-                    .voice(&mut call, &tools, cx.background_executor())
-                    .await
+                let conversation = Conversation::new(hub.clone(), "call", cx.clone());
+                let tools =
+                    dispatch_tools(hub, dispatch.consent(), conversation.handle(), cx.clone());
+                let record = |record: Record<'_>| conversation.record(record);
+                let result = dispatch
+                    .voice(&mut call, &tools, &record, cx.background_executor())
+                    .await;
+                match &result {
+                    Ok(CallEnd::HungUp) => conversation.finish(Some(("Call ended", false))),
+                    Ok(CallEnd::Closed(reason)) => {
+                        let note = match reason {
+                            Some(reason) => format!("The voice session closed: {reason}"),
+                            None => "The voice session closed".to_owned(),
+                        };
+                        conversation.finish(Some((&note, true)));
+                    }
+                    Err(error) => {
+                        conversation.finish(Some((&format!("The call failed: {error:#}"), true)));
+                    }
+                }
+                result.map(|_| ())
             }
             None => Err(anyhow!("Dispatch is disabled on this hub")),
         };
         if let Err(error) = result {
+            log::warn!("Dispatch voice call failed: {error:#}");
             call.updates
                 .send(json!({ "type": "error", "message": format!("{error:#}") }))
                 .await
@@ -250,6 +330,13 @@ fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {
             Output::AskDispatch { client, id, prompt } => {
                 start_dispatch(hub.clone(), client, id, prompt, cx);
             }
+            Output::ContinueDispatch {
+                client,
+                id,
+                session,
+                prompt,
+            } => continue_dispatch(hub.clone(), client, id, session, prompt, cx),
+            Output::Notify(notice) => send_notice(hub, &notice, cx),
             Output::SaveSessions => save = true,
             Output::AppendLog { session, line } => {
                 if let Err(error) = hub.borrow().registry.append_log(&session, &line) {
@@ -264,6 +351,210 @@ fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {
             log::error!("saving sessions: {error:#}");
         }
     }
+}
+
+/// Answers the phone: notification settings, and approving or replying in a
+/// thread. An approval tapped on the phone is the user's own answer, so it
+/// skips Dispatch's read-back.
+fn web_request(
+    hub: &Rc<RefCell<Hub>>,
+    request: WebRequest,
+    reply: oneshot::Sender<std::result::Result<Value, String>>,
+    cx: &mut AsyncApp,
+) -> Vec<Output> {
+    let push = hub
+        .borrow()
+        .push
+        .clone()
+        .ok_or_else(|| "Notifications aren't set up on this hub.".to_owned());
+    let (result, outputs) = match request {
+        WebRequest::PushKey => (
+            push.map(|push| json!({ "key": push.public_key() })),
+            Vec::new(),
+        ),
+        WebRequest::Subscribe(subscription) => (
+            push.and_then(|push| {
+                push.subscribe(subscription)
+                    .map(|()| json!({ "subscribed": true }))
+                    .map_err(|error| format!("{error:#}"))
+            }),
+            Vec::new(),
+        ),
+        WebRequest::Unsubscribe { endpoint } => (
+            push.and_then(|push| {
+                push.unsubscribe(&endpoint)
+                    .map(|removed| json!({ "removed": removed }))
+                    .map_err(|error| format!("{error:#}"))
+            }),
+            Vec::new(),
+        ),
+        WebRequest::TestPush { endpoint } => {
+            let waiting = hub.borrow().relay.waiting_count();
+            let result = push.and_then(|push| {
+                let subscription = push
+                    .subscription(&endpoint)
+                    .ok_or_else(|| "Turn notifications on first.".to_owned())?;
+                let payload = json!({
+                    "title": "Dispatch notifications are on",
+                    "body": "Threads that need you or finish will show up here.",
+                    "tag": "test",
+                    "url": "/dispatch/",
+                    "waiting": waiting,
+                });
+                send_push(push, subscription, payload, "normal", cx);
+                Ok(json!({ "sent": true }))
+            });
+            (result, Vec::new())
+        }
+        WebRequest::Answer {
+            session,
+            approval,
+            approve,
+        } => {
+            let result = hub
+                .borrow_mut()
+                .relay
+                .dispatch_answer_approval(&session, &approval, approve);
+            match result {
+                Ok(outputs) => {
+                    let answered = if approve { "approved" } else { "rejected" };
+                    (Ok(json!({ "answered": answered })), outputs)
+                }
+                Err(error) => (Err(format!("{error:#}")), Vec::new()),
+            }
+        }
+        WebRequest::Reply { session, text } => {
+            let text = text.trim().to_owned();
+            let target = hub.borrow().relay.dispatch_target(&session);
+            let problem = match target {
+                _ if text.is_empty() || text.len() > dispatch::MAX_PROMPT_BYTES => {
+                    Some("Write a message of at most 8192 bytes.")
+                }
+                Some((key, _)) if key.agent != crate::relay::DISPATCH_AGENT => None,
+                _ => Some("That thread isn't on this hub."),
+            };
+            if let Some(problem) = problem {
+                (Err(problem.to_owned()), Vec::new())
+            } else {
+                // Goes through Dispatch's queue, so it waits for a busy
+                // thread's turn to end.
+                let hub = hub.clone();
+                cx.spawn(async move |cx| {
+                    let result =
+                        send_to_thread(hub, session, text, false, Rc::default(), cx.clone())
+                            .await
+                            .map(|result| result.data().clone())
+                            .map_err(|error| format!("{error:#}"));
+                    reply.send(result).ok();
+                })
+                .detach();
+                return Vec::new();
+            }
+        }
+    };
+    reply.send(result).ok();
+    outputs
+}
+
+/// Tells the phones that asked for it about a thread.
+fn send_notice(hub: &Rc<RefCell<Hub>>, notice: &Notice, cx: &mut AsyncApp) {
+    let (push, waiting) = {
+        let hub = hub.borrow();
+        (hub.push.clone(), hub.relay.waiting_count())
+    };
+    let Some(push) = push else {
+        return;
+    };
+    let kind = match notice.kind {
+        NoticeKind::Approval => "approval",
+        NoticeKind::Done => "done",
+        NoticeKind::Stopped => "stopped",
+    };
+    let payload = json!({
+        "title": notice.title,
+        "body": notice.body,
+        // A newer notice about the same thing replaces the older one.
+        "tag": format!("{kind}-{}", notice.session),
+        "url": format!("/dispatch/?thread={}", url_component(&notice.session)),
+        "waiting": waiting,
+    });
+    let urgency = if notice.kind == NoticeKind::Done {
+        "normal"
+    } else {
+        "high"
+    };
+    for subscription in push.subscribers(notice.kind) {
+        send_push(push.clone(), subscription, payload.clone(), urgency, cx);
+    }
+}
+
+fn send_push(
+    push: Rc<Push>,
+    subscription: Subscription,
+    payload: Value,
+    urgency: &'static str,
+    cx: &mut AsyncApp,
+) {
+    let message = match push.message(&subscription, payload.to_string().as_bytes()) {
+        Ok(message) => message,
+        Err(error) => {
+            log::warn!("preparing a phone notification: {error:#}");
+            return;
+        }
+    };
+    let http = cx.update(|cx| cx.http_client());
+    cx.spawn(async move |_| {
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(&message.endpoint)
+            // An approval still matters a day later; Apple drops it after that.
+            .header("TTL", "86400")
+            .header("Urgency", urgency)
+            .header("Content-Encoding", "aes128gcm")
+            .header("Content-Type", "application/octet-stream")
+            .header("Authorization", &message.authorization)
+            .body(AsyncBody::from(message.body));
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                log::warn!("building a phone notification: {error}");
+                return;
+            }
+        };
+        match http.send(request).await {
+            Ok(response) if response.status().is_success() => {}
+            // The phone unsubscribed or deleted the app.
+            Ok(response) if matches!(response.status().as_u16(), 404 | 410) => {
+                log::info!("a phone stopped taking notifications; forgetting it");
+                if let Err(error) = push.unsubscribe(&message.endpoint) {
+                    log::warn!("forgetting a phone: {error:#}");
+                }
+            }
+            Ok(mut response) => {
+                let mut text = String::new();
+                response.body_mut().read_to_string(&mut text).await.ok();
+                log::warn!(
+                    "the push service refused a notification ({}): {}",
+                    response.status(),
+                    crate::relay::tail(&text, 300)
+                );
+            }
+            Err(error) => log::warn!("sending a phone notification: {error:#}"),
+        }
+    })
+    .detach();
+}
+
+/// `text` as a URL query value.
+fn url_component(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 fn start_dispatch(
@@ -285,13 +576,30 @@ fn start_dispatch(
             .ok();
         return;
     };
-    if let Some(reply) = dispatch::open_latest_project_thread(&hub.borrow().relay, &prompt) {
+    let shortcut = dispatch::open_latest_project_thread(&hub.borrow().relay, &prompt);
+    if let Some(reply) = shortcut {
+        let conversation = Conversation::new(hub, "typed", cx.clone());
+        conversation.record(Record::Said {
+            role: "user",
+            text: &prompt,
+        });
+        conversation.record(Record::Said {
+            role: "assistant",
+            text: &reply.text,
+        });
+        conversation.finish(None);
         tx.unbounded_send(result_response(&id, json!(reply))).ok();
         return;
     }
     cx.spawn(async move |cx| {
-        let tools = dispatch_tools(hub, dispatch.consent(), cx.clone());
-        let ask = dispatch.ask(&prompt, &tools);
+        let conversation = Conversation::new(hub.clone(), "typed", cx.clone());
+        conversation.record(Record::Said {
+            role: "user",
+            text: &prompt,
+        });
+        let tools = dispatch_tools(hub, dispatch.consent(), conversation.handle(), cx.clone());
+        let record = |record: Record<'_>| conversation.record(record);
+        let ask = dispatch.ask(&prompt, None, &tools, &record);
         let timeout = cx.background_executor().timer(dispatch::ASK_TIMEOUT);
         let result = smol::future::race(ask, async move {
             timeout.await;
@@ -299,12 +607,289 @@ fn start_dispatch(
         })
         .await;
         let reply = match result {
-            Ok(reply) => result_response(&id, json!(reply)),
-            Err(error) => error_response(&id, &format!("{error:#}")),
+            Ok(reply) => {
+                conversation.record(Record::Said {
+                    role: "assistant",
+                    text: &reply.text,
+                });
+                conversation.finish(None);
+                result_response(&id, json!(reply))
+            }
+            Err(error) => {
+                conversation.finish(Some((
+                    &format!("Dispatch couldn't answer: {error:#}"),
+                    true,
+                )));
+                error_response(&id, &format!("{error:#}"))
+            }
         };
         tx.unbounded_send(reply).ok();
     })
     .detach();
+}
+
+/// Answers a follow-up asked in a saved conversation. The app gets the id of
+/// its message at once, then follows the answer as session updates.
+fn continue_dispatch(
+    hub: Rc<RefCell<Hub>>,
+    client: ClientId,
+    id: Value,
+    session: String,
+    prompt: String,
+    cx: &mut AsyncApp,
+) {
+    let (tx, dispatch) = {
+        let hub = hub.borrow();
+        let Some(tx) = hub.clients.get(&client) else {
+            return;
+        };
+        (tx.clone(), hub.dispatch.clone())
+    };
+    let Some(dispatch) = dispatch else {
+        tx.unbounded_send(error_response(&id, "Dispatch is disabled on this hub"))
+            .ok();
+        return;
+    };
+    let context = conversation_context(&hub.borrow().relay, &session);
+    let conversation = Conversation::continuing(hub.clone(), session, cx.clone());
+    conversation.running();
+    let message_id = conversation.message("user_message_chunk", &prompt);
+    tx.unbounded_send(result_response(&id, json!({ "messageId": message_id })))
+        .ok();
+    cx.spawn(async move |cx| {
+        let tools = dispatch_tools(hub, dispatch.consent(), conversation.handle(), cx.clone());
+        let record = |record: Record<'_>| conversation.record(record);
+        let ask = dispatch.ask(&prompt, context.as_deref(), &tools, &record);
+        let timeout = cx.background_executor().timer(dispatch::ASK_TIMEOUT);
+        let result = smol::future::race(ask, async move {
+            timeout.await;
+            Err(anyhow!("Dispatch timed out"))
+        })
+        .await;
+        match result {
+            Ok(reply) => {
+                conversation.record(Record::Said {
+                    role: "assistant",
+                    text: &reply.text,
+                });
+                conversation.finish(None);
+            }
+            Err(error) => conversation.finish(Some((
+                &format!("Dispatch couldn't answer: {error:#}"),
+                true,
+            ))),
+        }
+    })
+    .detach();
+}
+
+/// What was said and done so far in a saved conversation, for Dispatch to
+/// read before a follow-up. Its own thread may have moved on since, and a
+/// call ran in a separate voice session.
+fn conversation_context(relay: &Relay, session: &str) -> Option<String> {
+    let timeline = relay.dispatch_timeline(session, 60)?;
+    let lines: Vec<String> = timeline["entries"]
+        .as_array()?
+        .iter()
+        .filter_map(
+            |entry| match (entry["type"].as_str(), entry["role"].as_str()) {
+                (Some("message"), Some("user")) => {
+                    Some(format!("User: {}", entry["text"].as_str()?))
+                }
+                (Some("message"), Some("assistant")) => {
+                    Some(format!("Dispatch: {}", entry["text"].as_str()?))
+                }
+                (Some("tool"), _) => Some(format!("Step: {}", entry["title"].as_str()?)),
+                _ => None,
+            },
+        )
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let title = timeline["title"]
+        .as_str()
+        .unwrap_or("Dispatch conversation");
+    Some(format!(
+        "This continues an earlier conversation with the user, \"{title}\". What was said and done:\n{}",
+        crate::relay::tail(&lines.join("\n"), 6_000)
+    ))
+}
+
+/// The id of the conversation Dispatch is recording, once it has one. Steps
+/// that finish after their tool answered (a queued message going out) are
+/// added through it.
+type ConversationId = Rc<RefCell<Option<String>>>;
+
+/// Saves one Dispatch conversation, a typed question or a call, as a hub
+/// session while it happens. Nothing is saved until something happens, so a
+/// call that never connects leaves no empty conversation behind.
+struct Conversation {
+    hub: Rc<RefCell<Hub>>,
+    kind: &'static str,
+    id: ConversationId,
+    titled: Cell<bool>,
+    messages: Cell<u64>,
+    cx: AsyncApp,
+}
+
+impl Conversation {
+    fn new(hub: Rc<RefCell<Hub>>, kind: &'static str, cx: AsyncApp) -> Self {
+        Self {
+            hub,
+            kind,
+            id: Rc::new(RefCell::new(None)),
+            titled: Cell::new(false),
+            messages: Cell::new(0),
+            cx,
+        }
+    }
+
+    /// Adds to a saved conversation, after the messages it already has.
+    fn continuing(hub: Rc<RefCell<Hub>>, id: String, cx: AsyncApp) -> Self {
+        let messages = hub.borrow().relay.dispatch_message_count(&id);
+        let kind = if id.starts_with("dispatch-call-") {
+            "call"
+        } else {
+            "typed"
+        };
+        Self {
+            hub,
+            kind,
+            id: Rc::new(RefCell::new(Some(id))),
+            titled: Cell::new(true),
+            messages: Cell::new(messages),
+            cx,
+        }
+    }
+
+    fn handle(&self) -> ConversationId {
+        self.id.clone()
+    }
+
+    fn running(&self) {
+        self.update(json!({ "sessionUpdate": "state_update", "state": "running" }));
+    }
+
+    fn record(&self, record: Record<'_>) {
+        match record {
+            Record::Said { role, text } => {
+                if role == "user" && !self.titled.replace(true) {
+                    self.update(json!({ "sessionUpdate": "session_info_update", "title": conversation_title(text) }));
+                }
+                let kind = if role == "user" {
+                    "user_message_chunk"
+                } else {
+                    "agent_message_chunk"
+                };
+                self.message(kind, text);
+            }
+            Record::Notes(text) => {
+                self.message("agent_thought_chunk", text);
+            }
+            Record::Tool {
+                call_id,
+                name,
+                arguments,
+                result,
+            } => {
+                let update = dispatch::tool_call_update(
+                    &self.hub.borrow().relay,
+                    call_id,
+                    name,
+                    arguments,
+                    result,
+                );
+                self.update(update);
+            }
+            Record::Command(item) => self.update(dispatch::command_update(item)),
+        }
+    }
+
+    /// Ends the conversation, with a closing note on how it ended.
+    fn finish(&self, note: Option<(&str, bool)>) {
+        if self.id.borrow().is_none() {
+            return;
+        }
+        if let Some((text, failed)) = note {
+            self.update(json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "end",
+                "title": text,
+                "kind": "other",
+                "status": if failed { "failed" } else { "completed" },
+            }));
+        }
+        self.update(json!({ "sessionUpdate": "state_update", "state": "idle" }));
+    }
+
+    fn message(&self, kind: &str, text: &str) -> String {
+        let number = self.messages.get() + 1;
+        self.messages.set(number);
+        let message_id = format!("message-{number}");
+        self.update(json!({
+            "sessionUpdate": kind,
+            "messageId": message_id,
+            "content": { "type": "text", "text": text },
+        }));
+        message_id
+    }
+
+    fn update(&self, update: Value) {
+        let existing = self.id.borrow().clone();
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = format!(
+                    "dispatch-{}-{}-{:08x}",
+                    self.kind,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or_default(),
+                    rand::random::<u32>(),
+                );
+                let title = if self.kind == "call" {
+                    "Voice call"
+                } else {
+                    "Typed question"
+                };
+                let outputs = {
+                    let relay = &mut self.hub.borrow_mut().relay;
+                    let mut outputs = relay.dispatch_conversation_start(&id, title);
+                    // Apps following the conversation show it as working.
+                    outputs.extend(relay.dispatch_conversation_record(
+                        &id,
+                        json!({ "sessionUpdate": "state_update", "state": "running" }),
+                    ));
+                    outputs
+                };
+                self.apply(outputs);
+                *self.id.borrow_mut() = Some(id.clone());
+                id
+            }
+        };
+        let outputs = self
+            .hub
+            .borrow_mut()
+            .relay
+            .dispatch_conversation_record(&id, update);
+        self.apply(outputs);
+    }
+
+    fn apply(&self, outputs: Vec<Output>) {
+        let mut cx = self.cx.clone();
+        apply(&self.hub, outputs, &mut cx);
+    }
+}
+
+fn conversation_title(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= 80 {
+        line.to_owned()
+    } else {
+        format!("{}…", line.chars().take(79).collect::<String>())
+    }
 }
 
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -319,6 +904,7 @@ const REPLY_CHARS: usize = 2_000;
 fn dispatch_tools(
     hub: Rc<RefCell<Hub>>,
     consent: Rc<RefCell<Consent>>,
+    conversation: ConversationId,
     cx: AsyncApp,
 ) -> impl Fn(&str, Value) -> future::LocalBoxFuture<'static, Result<ToolResult>> {
     move |name: &str, arguments: Value| {
@@ -330,13 +916,20 @@ fn dispatch_tools(
         );
         match step {
             Ok(ToolStep::Done(result)) => future::ready(Ok(result)).boxed_local(),
-            Ok(ToolStep::Act(action)) => run_action(hub.clone(), action, cx.clone()).boxed_local(),
+            Ok(ToolStep::Act(action)) => {
+                run_action(hub.clone(), action, conversation.clone(), cx.clone()).boxed_local()
+            }
             Err(error) => future::ready(Err(error)).boxed_local(),
         }
     }
 }
 
-async fn run_action(hub: Rc<RefCell<Hub>>, action: Action, mut cx: AsyncApp) -> Result<ToolResult> {
+async fn run_action(
+    hub: Rc<RefCell<Hub>>,
+    action: Action,
+    conversation: ConversationId,
+    mut cx: AsyncApp,
+) -> Result<ToolResult> {
     match action {
         Action::AnswerApproval {
             session,
@@ -355,7 +948,7 @@ async fn run_action(hub: Rc<RefCell<Hub>>, action: Action, mut cx: AsyncApp) -> 
             session,
             text,
             wait_for_reply,
-        } => send_to_thread(hub, session, text, wait_for_reply, cx).await,
+        } => send_to_thread(hub, session, text, wait_for_reply, conversation, cx).await,
     }
 }
 
@@ -378,6 +971,7 @@ async fn send_to_thread(
     session: String,
     text: String,
     wait_for_reply: bool,
+    conversation: ConversationId,
     cx: AsyncApp,
 ) -> Result<ToolResult> {
     let (progress, mut updates) = mpsc::unbounded();
@@ -431,6 +1025,7 @@ async fn send_to_thread(
             Either::Right(_) => break,
         }
     }
+    record_late_delivery(&hub, &session, status, updates, conversation, &cx);
     let note = match (status, wait_for_reply) {
         ("queued", _) => {
             "The thread is busy. The message is queued and goes out when its current turn ends."
@@ -440,6 +1035,76 @@ async fn send_to_thread(
         _ => "The thread's agent is starting. The message goes out when it's ready.",
     };
     Ok(ToolResult::new(json!({ "status": status, "note": note })))
+}
+
+/// Delivery carries on after the tool answers. What happens later (a queued
+/// message going out, the thread's reply, a failure) goes into the
+/// conversation as steps of their own.
+fn record_late_delivery(
+    hub: &Rc<RefCell<Hub>>,
+    session: &str,
+    status: &'static str,
+    mut updates: mpsc::UnboundedReceiver<Delivery>,
+    conversation: ConversationId,
+    cx: &AsyncApp,
+) {
+    let hub = hub.clone();
+    let session = session.to_owned();
+    cx.spawn(async move |cx| {
+        let mut sent = status == "sent";
+        while let Some(update) = updates.next().await {
+            let thread = hub
+                .borrow()
+                .relay
+                .dispatch_title(&session)
+                .unwrap_or("the thread")
+                .to_owned();
+            let call_id = format!("late-{:08x}", rand::random::<u32>());
+            let step = match update {
+                Delivery::Queued => continue,
+                Delivery::Sent if sent => continue,
+                Delivery::Sent => {
+                    sent = true;
+                    dispatch::step(
+                        &call_id,
+                        "Sent",
+                        &format!("the queued message to {thread}"),
+                        "other",
+                        "completed",
+                        Some(&session),
+                        "",
+                    )
+                }
+                Delivery::Replied(reply) => dispatch::step(
+                    &call_id,
+                    "Got",
+                    &format!("a reply from {thread}"),
+                    "read",
+                    "completed",
+                    Some(&session),
+                    &reply,
+                ),
+                Delivery::Failed(error) => dispatch::step(
+                    &call_id,
+                    "Couldn't send",
+                    &format!("the message to {thread}"),
+                    "other",
+                    "failed",
+                    Some(&session),
+                    &error,
+                ),
+            };
+            let Some(id) = conversation.borrow().clone() else {
+                continue;
+            };
+            let outputs = hub
+                .borrow_mut()
+                .relay
+                .dispatch_conversation_record(&id, step);
+            apply(&hub, outputs, cx);
+        }
+    })
+    .detach();
 }
 
 async fn deliver_messages(hub: Rc<RefCell<Hub>>, session: String, cx: &mut AsyncApp) {

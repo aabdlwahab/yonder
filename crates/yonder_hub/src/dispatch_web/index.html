@@ -2,43 +2,180 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#161b22">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Dispatch">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>Dispatch · Yonder</title>
+  <link rel="manifest" href="/dispatch/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/dispatch/icon-180.png">
+  <link rel="icon" type="image/png" href="/dispatch/icon-192.png">
   <link rel="stylesheet" href="/dispatch/dispatch.css">
   <script src="/dispatch/dispatch.js" defer></script>
 </head>
-<body>
+<body data-view="loading">
   <main>
-    <header><span>Yonder</span><h1>Dispatch</h1></header>
-    <p id="status" role="status">Connecting to the hub…</p>
-    <form id="pair" hidden>
-      <label for="code">Hub pairing code</label>
-      <input id="code" type="password" required maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false">
-      <button type="submit">Pair phone</button>
-    </form>
-    <div id="dispatch" hidden>
-      <section class="call" aria-label="Voice call">
-        <button id="talk" type="button" class="talk">Talk to Dispatch</button>
-        <button id="play" type="button" hidden>Enable speaker</button>
-        <audio id="speaker" autoplay playsinline></audio>
-        <p id="activity" role="status" hidden></p>
-        <div id="transcript" role="log" aria-label="Call transcript"></div>
+    <header class="top">
+      <div class="brand">
+        <svg class="mark" viewBox="0 0 100 100" aria-hidden="true"><rect width="100" height="100" rx="24" fill="#141b33"/><path d="M30 26 L50 52 M68 36 L50 52 L50 78" fill="none" stroke="#f2efe6" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/><circle cx="74" cy="24" r="7" fill="#f4b54a"/></svg>
+        <h1 id="brand-name">Dispatch</h1>
+      </div>
+      <span id="hub" class="hub-chip"><span class="hub-dot" aria-hidden="true"></span><span id="hub-name"></span></span>
+      <span id="timer" class="timer" aria-label="Call length">0:00</span>
+      <button id="alerts-open" type="button" class="icon-button" aria-label="Notification settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
+      </button>
+    </header>
+
+    <p id="notice" class="notice" role="status" hidden></p>
+
+    <section id="notify-banner" class="banner" aria-labelledby="notify-banner-title" hidden>
+      <div class="banner-text">
+        <span class="banner-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></span>
+        <span>
+          <h2 id="notify-banner-title">Hear when a thread needs you</h2>
+          <span class="muted">Get a notification when an agent asks for approval or finishes its work, then act on it here.</span>
+        </span>
+      </div>
+      <div class="banner-actions">
+        <button id="notify-on" type="button" class="primary">Turn on notifications</button>
+        <button id="notify-later" type="button" class="quiet">Not now</button>
+      </div>
+    </section>
+
+    <section id="pair" class="pair" aria-labelledby="pair-title">
+      <div class="intro">
+        <h2 id="pair-title">Pair this phone</h2>
+        <p class="muted">Dispatch reads your hub’s threads and talks you through them. Pair once per browser.</p>
+      </div>
+      <form id="pair-form">
+        <label for="code">Pairing code</label>
+        <input id="code" type="password" required maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="64-character code">
+        <p class="hint">On the hub, run <code>cat ~/.config/yonder/dispatch-tls/pairing-code</code></p>
+        <button type="submit" class="primary">Pair</button>
+      </form>
+      <p class="footnote"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span id="pair-host"></span> · Tailscale only</p>
+    </section>
+
+    <section id="stage" class="stage" aria-label="Voice">
+      <button id="talk" type="button" class="orb" data-mode="idle" aria-label="Talk to Dispatch">
+        <span class="orb-halo cool" aria-hidden="true"></span>
+        <span class="orb-halo warm" aria-hidden="true"></span>
+        <span class="orb-body" aria-hidden="true"><canvas id="orb-canvas"></canvas></span>
+        <span class="orb-dot" aria-hidden="true"></span>
+      </button>
+      <p id="status" class="stage-status" role="status">Tap to talk</p>
+      <p id="caption" class="stage-caption">Ask what’s running, pass a message to a thread, or approve a command.</p>
+      <button id="play" type="button" class="link" hidden>Turn on the speaker</button>
+    </section>
+
+    <section id="threads" class="threads" aria-label="Threads">
+      <section id="group-waiting" class="group" aria-labelledby="waiting-heading" hidden>
+        <h2 id="waiting-heading">Needs you</h2>
+        <ul></ul>
       </section>
-      <section aria-labelledby="threads-heading">
-        <div class="section-heading">
-          <h2 id="threads-heading">Threads</h2>
-          <button id="refresh" type="button" class="secondary">Refresh</button>
-        </div>
-        <p id="catalog-status" role="status" hidden></p>
-        <div id="history" hidden>
-          <button id="back" type="button" class="secondary">← All threads</button>
-          <h3 id="thread-title" tabindex="-1"></h3>
-          <div id="messages"></div>
-        </div>
-        <ul id="sessions"></ul>
+      <section id="group-running" class="group" aria-labelledby="running-heading" hidden>
+        <h2 id="running-heading">Running</h2>
+        <ul></ul>
       </section>
+      <section id="group-done" class="group" aria-labelledby="done-heading" hidden>
+        <h2 id="done-heading">Just finished</h2>
+        <ul></ul>
+      </section>
+      <section id="group-calls" class="group" aria-labelledby="calls-heading" hidden>
+        <h2 id="calls-heading">Conversations</h2>
+        <ul class="stack"></ul>
+        <button id="show-calls" type="button" class="link" hidden></button>
+      </section>
+      <section id="group-earlier" class="group" aria-labelledby="earlier-heading" hidden>
+        <h2 id="earlier-heading">Earlier</h2>
+        <ul class="stack"></ul>
+        <button id="show-all" type="button" class="link" hidden></button>
+        <p id="threads-count" class="muted small center" hidden></p>
+      </section>
+      <p id="threads-empty" class="muted center" hidden>No threads on this hub yet.</p>
+    </section>
+
+    <section id="log" class="log" role="log" aria-label="Call transcript"></section>
+
+    <div id="controls" class="controls">
+      <button id="mute" type="button" class="round" aria-label="Mute" aria-pressed="false">
+        <svg class="mic-on" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        <svg class="mic-off" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9v2a3 3 0 0 0 5.1 2.1M15 9.3V6a3 3 0 0 0-5.7-1.3M5 11a7 7 0 0 0 11.5 5.4M19 11a7 7 0 0 1-.6 2.8M12 18v3M4 4l16 16"/></svg>
+      </button>
+      <button id="end" type="button" class="round danger" aria-label="End call">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
     </div>
+
+    <section id="thread" class="thread" aria-labelledby="thread-title">
+      <button id="back" type="button" class="back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+        Threads
+      </button>
+      <h2 id="thread-title" tabindex="-1"></h2>
+      <div id="thread-meta" class="tags"></div>
+      <div id="messages" class="messages" role="log" aria-label="Recent messages"></div>
+      <section id="approval" class="decide" aria-labelledby="approval-title" hidden>
+        <div class="decide-head">
+          <span class="decide-dot" aria-hidden="true"></span>
+          <h3 id="approval-title">Waiting for your approval</h3>
+        </div>
+        <code id="approval-command" class="decide-command"></code>
+        <p id="approval-where" class="muted small"></p>
+        <p id="approval-error" class="decide-error" role="alert" hidden></p>
+        <div class="decide-actions">
+          <button id="approval-reject" type="button" class="secondary">Reject</button>
+          <button id="approval-approve" type="button" class="primary">Approve once</button>
+        </div>
+      </section>
+      <form id="reply-form" class="reply" hidden>
+        <label for="reply-text" class="visually-hidden" id="reply-label">Reply to the thread</label>
+        <textarea id="reply-text" rows="1" maxlength="8000" placeholder="Reply…" autocomplete="off"></textarea>
+        <button id="reply-send" type="submit" class="send" aria-label="Send to the thread">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+      </form>
+      <p id="reply-note" class="muted small center" role="status"></p>
+      <button id="thread-talk" type="button" class="talk-pill">
+        <span class="mini-orb" aria-hidden="true"></span>
+        <span id="thread-talk-label">Talk to Dispatch</span>
+      </button>
+    </section>
+
+    <section id="alerts" class="alerts" aria-labelledby="alerts-title">
+      <button id="alerts-back" type="button" class="back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+        Dispatch
+      </button>
+      <h2 id="alerts-title" tabindex="-1">Notifications</h2>
+      <p id="alerts-status" class="alerts-status muted"></p>
+      <div id="alerts-kinds" class="group">
+        <h3 class="group-heading">Tell me when a thread</h3>
+        <ul class="stack switches">
+          <li class="switch-row">
+            <span class="row-text"><span id="kind-approval" class="row-title">Needs approval</span><span class="row-meta">An agent is waiting to run a command or edit files.</span></span>
+            <button type="button" class="switch" role="switch" aria-checked="true" aria-labelledby="kind-approval" data-kind="approval"><span></span></button>
+          </li>
+          <li class="switch-row">
+            <span class="row-text"><span id="kind-done" class="row-title">Finishes</span><span class="row-meta">A turn ends after running a minute or more, with its last line.</span></span>
+            <button type="button" class="switch" role="switch" aria-checked="true" aria-labelledby="kind-done" data-kind="done"><span></span></button>
+          </li>
+          <li class="switch-row">
+            <span class="row-text"><span id="kind-stopped" class="row-title">Stops with an error</span><span class="row-meta">The agent crashed or its machine went away mid-turn.</span></span>
+            <button type="button" class="switch" role="switch" aria-checked="true" aria-labelledby="kind-stopped" data-kind="stopped"><span></span></button>
+          </li>
+        </ul>
+      </div>
+      <button id="alerts-on" type="button" class="primary">Turn on notifications</button>
+      <button id="alerts-test" type="button" class="secondary">Send a test notification</button>
+      <button id="alerts-off" type="button" class="link danger-link">Turn off on this iPhone</button>
+      <p id="alerts-note" class="muted small"></p>
+    </section>
   </main>
+  <audio id="speaker" autoplay playsinline></audio>
 </body>
 </html>

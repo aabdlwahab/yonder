@@ -26,7 +26,8 @@ use tokio::time::{Instant, sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 
 use crate::dispatch::VoiceCall;
-use crate::server::Event;
+use crate::push::{Kinds, Push, Subscription};
+use crate::server::{Event, WebRequest};
 
 const MAX_OFFER_BYTES: usize = 32 * 1024;
 const CALL_START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -35,6 +36,13 @@ const COOKIE: &str = "__Host-yonder-dispatch";
 const PAGE: &str = include_str!("dispatch_web/index.html");
 const STYLE: &str = include_str!("dispatch_web/dispatch.css");
 const SCRIPT: &str = include_str!("dispatch_web/dispatch.js");
+const MANIFEST: &str = include_str!("dispatch_web/manifest.webmanifest");
+const ICON_180: &[u8] = include_bytes!("dispatch_web/icon-180.png");
+const ICON_192: &[u8] = include_bytes!("dispatch_web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("dispatch_web/icon-512.png");
+const SERVICE_WORKER: &str = include_str!("dispatch_web/sw.js");
+/// Long enough for a reply to wait out a thread that's starting.
+const WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(clap::Args)]
 pub struct Options {
@@ -52,6 +60,13 @@ pub struct Options {
 impl Options {
     pub fn enabled(&self) -> bool {
         self.dispatch_web_listen.is_some()
+    }
+
+    /// Phone notifications, which keep their key next to the TLS files.
+    pub fn load_push(&self) -> Option<Result<Push>> {
+        let directory = self.dispatch_web_directory.as_ref()?;
+        let origin = self.dispatch_web_origin.clone()?;
+        Some(Push::load(directory, origin))
     }
 }
 
@@ -87,7 +102,8 @@ pub async fn serve(options: Options, events: mpsc::UnboundedSender<Event>) -> Re
     }
     let content_security_policy = HeaderValue::from_str(&format!(
         concat!(
-            "default-src 'none'; script-src 'self'; style-src 'self'; media-src 'self' blob:; ",
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; ",
+            "manifest-src 'self'; worker-src 'self'; media-src 'self' blob:; ",
             "connect-src 'self' wss://{}; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         ),
         authority
@@ -178,6 +194,13 @@ fn router(state: WebState) -> Router {
         .route("/dispatch/sessions", get(sessions))
         .route("/dispatch/sessions/:id", get(history))
         .route("/dispatch/call", get(call))
+        .route("/dispatch/push/key", get(push_key))
+        .route("/dispatch/push/subscribe", post(push_subscribe))
+        .route("/dispatch/push/unsubscribe", post(push_unsubscribe))
+        .route("/dispatch/push/test", post(push_test))
+        .route("/dispatch/sessions/:id/approval", post(answer_approval))
+        .route("/dispatch/sessions/:id/reply", post(reply))
+        .layer(DefaultBodyLimit::max(16 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_pairing,
@@ -193,6 +216,14 @@ fn router(state: WebState) -> Router {
             "/dispatch/dispatch.js",
             get(|| async { asset("text/javascript; charset=utf-8", SCRIPT) }),
         )
+        .route(
+            "/dispatch/manifest.webmanifest",
+            get(|| async { asset("application/manifest+json", MANIFEST) }),
+        )
+        .route("/dispatch/icon-180.png", get(|| async { image(ICON_180) }))
+        .route("/dispatch/icon-192.png", get(|| async { image(ICON_192) }))
+        .route("/dispatch/icon-512.png", get(|| async { image(ICON_512) }))
+        .route("/dispatch/sw.js", get(service_worker))
         .route(
             "/dispatch/pair",
             post(pair).layer(DefaultBodyLimit::max(256)),
@@ -254,8 +285,10 @@ async fn pair(State(state): State<WebState>, headers: HeaderMap, body: String) -
         )
             .into_response();
     }
+    // A session cookie would unpair the Home Screen app every time iOS closes it
+    // in the background. 400 days is the longest lifetime browsers accept.
     let cookie = format!(
-        "{COOKIE}={}; Path=/; Secure; HttpOnly; SameSite=Strict",
+        "{COOKIE}={}; Path=/; Max-Age=34560000; Secure; HttpOnly; SameSite=Strict",
         state.pairing_code
     );
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
@@ -298,6 +331,175 @@ async fn secure_headers(
 
 fn asset(content_type: &'static str, text: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], text).into_response()
+}
+
+fn image(bytes: &'static [u8]) -> Response {
+    ([(header::CONTENT_TYPE, "image/png")], bytes).into_response()
+}
+
+/// The service worker shows notifications. It's allowed to cover `/dispatch`
+/// as well as `/dispatch/`, since the Home Screen app starts at the former.
+async fn service_worker() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (
+                header::HeaderName::from_static("service-worker-allowed"),
+                "/dispatch",
+            ),
+        ],
+        SERVICE_WORKER,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct BrowserSubscription {
+    endpoint: String,
+    keys: BrowserKeys,
+}
+
+#[derive(Deserialize)]
+struct BrowserKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Deserialize)]
+struct SubscribeBody {
+    subscription: BrowserSubscription,
+    #[serde(default)]
+    kinds: Kinds,
+}
+
+#[derive(Deserialize)]
+struct EndpointBody {
+    endpoint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalBody {
+    approval_id: String,
+    decision: String,
+}
+
+#[derive(Deserialize)]
+struct ReplyBody {
+    text: String,
+}
+
+async fn push_key(State(state): State<WebState>) -> Response {
+    web(&state, WebRequest::PushKey).await
+}
+
+async fn push_subscribe(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(body): Json<SubscribeBody>,
+) -> Response {
+    if !same_origin(&headers, &state) {
+        return forbidden();
+    }
+    let subscription = Subscription {
+        endpoint: body.subscription.endpoint,
+        p256dh: body.subscription.keys.p256dh,
+        auth: body.subscription.keys.auth,
+        kinds: body.kinds,
+    };
+    web(&state, WebRequest::Subscribe(subscription)).await
+}
+
+async fn push_unsubscribe(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(body): Json<EndpointBody>,
+) -> Response {
+    if !same_origin(&headers, &state) {
+        return forbidden();
+    }
+    let endpoint = body.endpoint;
+    web(&state, WebRequest::Unsubscribe { endpoint }).await
+}
+
+async fn push_test(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Json(body): Json<EndpointBody>,
+) -> Response {
+    if !same_origin(&headers, &state) {
+        return forbidden();
+    }
+    let endpoint = body.endpoint;
+    web(&state, WebRequest::TestPush { endpoint }).await
+}
+
+async fn answer_approval(
+    State(state): State<WebState>,
+    RequestPath(session): RequestPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ApprovalBody>,
+) -> Response {
+    if !same_origin(&headers, &state) {
+        return forbidden();
+    }
+    let approve = match body.decision.as_str() {
+        "approve" => true,
+        "reject" => false,
+        _ => return (StatusCode::BAD_REQUEST, "Answer approve or reject").into_response(),
+    };
+    let approval = body.approval_id;
+    web(
+        &state,
+        WebRequest::Answer {
+            session,
+            approval,
+            approve,
+        },
+    )
+    .await
+}
+
+async fn reply(
+    State(state): State<WebState>,
+    RequestPath(session): RequestPath<String>,
+    headers: HeaderMap,
+    Json(body): Json<ReplyBody>,
+) -> Response {
+    if !same_origin(&headers, &state) {
+        return forbidden();
+    }
+    let text = body.text;
+    web(&state, WebRequest::Reply { session, text }).await
+}
+
+fn forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        "Open Dispatch from its configured HTTPS address",
+    )
+        .into_response()
+}
+
+/// Hands a request to the hub and returns its answer.
+async fn web(state: &WebState, request: WebRequest) -> Response {
+    let (reply, response) = oneshot::channel();
+    if state
+        .events
+        .unbounded_send(Event::Web { request, reply })
+        .is_ok()
+        && let Ok(Ok(result)) = timeout(WEB_REQUEST_TIMEOUT, response).await
+    {
+        return match result {
+            Ok(data) => Json(data).into_response(),
+            Err(message) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+        };
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "The Yonder hub is unavailable",
+    )
+        .into_response()
 }
 
 async fn sessions(State(state): State<WebState>) -> Response {
@@ -395,25 +597,31 @@ async fn voice_socket(mut socket: WebSocket, events: mpsc::UnboundedSender<Event
         .await;
         return;
     }
+    log::info!("Dispatch voice call started from the phone");
     let deadline = sleep(CALL_START_TIMEOUT);
     tokio::pin!(deadline);
     let mut answered = false;
-    loop {
+    let ended = loop {
         tokio::select! {
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                _ => break,
+                Some(Ok(Message::Close(_))) | None => break "the phone hung up",
+                Some(Ok(_)) => break "the phone sent an unexpected message",
+                Some(Err(error)) => {
+                    log::info!("Dispatch call socket error: {error}");
+                    break "the phone's connection dropped";
+                }
             },
             update = messages.next() => {
-                let Some(update) = update else { break; };
+                let Some(update) = update else { break "Dispatch ended the call"; };
                 if update["type"] == "answer" {
                     answered = true;
                 }
-                if answered && matches!(update["type"].as_str(), Some("answer" | "transcript")) {
+                if answered && matches!(update["type"].as_str(), Some("answer" | "caption" | "transcript")) {
                     deadline.as_mut().reset(Instant::now() + CALL_IDLE_TIMEOUT);
                 }
                 if !send_update(&mut socket, update).await {
-                    break;
+                    break "the phone stopped receiving updates";
                 }
             },
             () = &mut deadline => {
@@ -423,12 +631,20 @@ async fn voice_socket(mut socket: WebSocket, events: mpsc::UnboundedSender<Event
                     json!({"type": "error", "message": "Dispatch took too long to connect"})
                 };
                 send_update(&mut socket, update).await;
-                break;
+                break if answered { "the call was quiet for two minutes" } else { "Dispatch took too long to connect" };
             },
         }
-    }
+    };
+    log::info!("Dispatch voice call ended: {ended}");
     if hangup.send(()).is_err() {
         log::trace!("Dispatch voice already ended");
+    }
+    // A close frame lets the page tell an ended call from a dropped connection.
+    if !matches!(
+        timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await,
+        Ok(Ok(()))
+    ) {
+        log::debug!("the phone's call socket was already closed");
     }
 }
 
@@ -471,6 +687,18 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
+        for (path, content_type) in [
+            (
+                "/dispatch/manifest.webmanifest",
+                "application/manifest+json",
+            ),
+            ("/dispatch/icon-180.png", "image/png"),
+        ] {
+            let response = app.call(request(path).body(Body::empty())?).await?;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
+        }
+
         let pair_request = |request_origin: &str| {
             request("/dispatch/pair")
                 .method("POST")
@@ -484,7 +712,7 @@ mod tests {
         let response = app.call(pair_request(origin)?).await?;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         let cookie = response.headers()[header::SET_COOKIE].to_str()?;
-        for attribute in ["Secure", "HttpOnly", "SameSite=Strict"] {
+        for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Max-Age="] {
             assert!(cookie.contains(attribute));
         }
         let pair_cookie = cookie.split(';').next().context("missing pairing cookie")?;

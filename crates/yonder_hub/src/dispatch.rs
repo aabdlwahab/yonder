@@ -21,6 +21,8 @@ use smol::process::{Child, ChildStdin, ChildStdout, Command};
 use crate::relay::Relay;
 
 pub const ASK_METHOD: &str = "_yonder/dispatch/ask";
+/// Lists Dispatch's saved conversations, newest first.
+pub const CONVERSATIONS_METHOD: &str = "_yonder/dispatch/conversations";
 pub const MAX_PROMPT_BYTES: usize = 8_192;
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_THREAD_MESSAGE_CHARS: usize = 4_000;
@@ -138,6 +140,32 @@ fn confirms_approval(text: &str) -> bool {
 
 pub type ToolCall = dyn Fn(&str, Value) -> LocalBoxFuture<'static, Result<ToolResult>>;
 
+/// Something that happened in a Dispatch conversation, for its saved record.
+pub enum Record<'a> {
+    Said {
+        role: &'a str,
+        text: &'a str,
+    },
+    /// Codex's written answer to the voice model, which the voice retells.
+    Notes(&'a str),
+    Tool {
+        call_id: &'a str,
+        name: &'a str,
+        arguments: &'a Value,
+        result: std::result::Result<&'a Value, &'a str>,
+    },
+    /// A command Codex ran while working on an answer.
+    Command(&'a Value),
+}
+
+pub type Recorder<'a> = dyn Fn(Record<'_>) + 'a;
+
+/// How a voice call ended without an error.
+pub enum CallEnd {
+    HungUp,
+    Closed(Option<String>),
+}
+
 pub struct VoiceCall {
     pub offer: String,
     pub updates: mpsc::Sender<Value>,
@@ -198,7 +226,15 @@ impl Dispatch {
         self.consent.clone()
     }
 
-    pub async fn ask(&self, prompt: &str, call_tool: &ToolCall) -> Result<DispatchReply> {
+    /// Answers a typed question. `context` goes before it for Codex but not
+    /// into what the user said, so it can't count as consent to an approval.
+    pub async fn ask(
+        &self,
+        prompt: &str,
+        context: Option<&str>,
+        call_tool: &ToolCall,
+        record: &Recorder<'_>,
+    ) -> Result<DispatchReply> {
         let Some(mut slot) = self.app.try_lock() else {
             bail!("Dispatch is already in use");
         };
@@ -206,7 +242,11 @@ impl Dispatch {
         // thread on the next request. Never start a second turn on it.
         let mut app = self.take_app(&mut slot).await?;
         self.consent.borrow_mut().heard(prompt);
-        let reply = app.ask(prompt, call_tool).await?;
+        let input = match context {
+            Some(context) => format!("{context}\n\nThe user now says: {prompt}"),
+            None => prompt.to_owned(),
+        };
+        let reply = app.ask(&input, call_tool, record).await?;
         app.persist_thread(&self.state_dir)?;
         *slot = Some(app);
         Ok(reply)
@@ -216,8 +256,9 @@ impl Dispatch {
         &self,
         call: &mut VoiceCall,
         call_tool: &ToolCall,
+        record: &Recorder<'_>,
         executor: &BackgroundExecutor,
-    ) -> Result<()> {
+    ) -> Result<CallEnd> {
         let Some(mut slot) = self.app.try_lock() else {
             bail!("Dispatch is already in use on another device");
         };
@@ -226,11 +267,11 @@ impl Dispatch {
             futures::pin_mut!(connect);
             match select(connect, &mut call.hangup).await {
                 Either::Left((app, _)) => app?,
-                Either::Right(_) => return Ok(()),
+                Either::Right(_) => return Ok(CallEnd::HungUp),
             }
         };
         let result = app
-            .voice(call, call_tool, &self.consent, &self.state_dir)
+            .voice(call, call_tool, record, &self.consent, &self.state_dir)
             .await;
         let stop = app.stop_voice();
         futures::pin_mut!(stop);
@@ -448,9 +489,10 @@ impl AppServer {
         &mut self,
         call: &mut VoiceCall,
         call_tool: &ToolCall,
+        record: &Recorder<'_>,
         consent: &RefCell<Consent>,
         state_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<CallEnd> {
         let request_id = self
             .send_request(
                 "thread/realtime/start",
@@ -470,7 +512,7 @@ impl AppServer {
                 futures::pin_mut!(read);
                 match select(read, &mut call.hangup).await {
                     Either::Left((message, _)) => message?,
-                    Either::Right(_) => return Ok(()),
+                    Either::Right(_) => return Ok(CallEnd::HungUp),
                 }
             };
             let Some(method) = message["method"].as_str() else {
@@ -487,24 +529,32 @@ impl AppServer {
                     continue;
                 }
                 let tool = params["tool"].as_str().unwrap_or_default();
+                let call_id = params["callId"].as_str().unwrap_or_default();
+                let arguments = &params["arguments"];
                 let result = {
-                    let result = call_tool(tool, params["arguments"].clone());
+                    let result = call_tool(tool, arguments.clone());
                     match select(result, &mut call.hangup).await {
                         Either::Left((result, _)) => result,
-                        Either::Right(_) => return Ok(()),
+                        Either::Right(_) => return Ok(CallEnd::HungUp),
                     }
                 };
                 match result {
                     Ok(result) => {
+                        record(Record::Tool {
+                            call_id,
+                            name: tool,
+                            arguments,
+                            result: Ok(&result.data),
+                        });
                         self.send_tool_result(id, true, result.data.to_string())
                             .await?;
                         if call
                             .updates
-                            .send(json!({ "type": "tool", "name": tool }))
+                            .send(call_update(tool, arguments, &result.data))
                             .await
                             .is_err()
                         {
-                            return Ok(());
+                            return Ok(CallEnd::HungUp);
                         }
                         if let Some(session) = result.open_session_id
                             && call
@@ -513,10 +563,19 @@ impl AppServer {
                                 .await
                                 .is_err()
                         {
-                            return Ok(());
+                            return Ok(CallEnd::HungUp);
                         }
                     }
-                    Err(error) => self.send_tool_result(id, false, error.to_string()).await?,
+                    Err(error) => {
+                        let failure = error.to_string();
+                        record(Record::Tool {
+                            call_id,
+                            name: tool,
+                            arguments,
+                            result: Err(&failure),
+                        });
+                        self.send_tool_result(id, false, failure).await?;
+                    }
                 }
                 continue;
             }
@@ -525,13 +584,41 @@ impl AppServer {
             }
             let event = match method {
                 "thread/realtime/sdp" => json!({ "type": "answer", "sdp": params["sdp"] }),
+                "thread/realtime/transcript/delta" => {
+                    json!({ "type": "caption", "role": params["role"], "delta": params["delta"] })
+                }
                 "thread/realtime/transcript/done" => {
-                    if params["role"] == "user"
-                        && let Some(text) = params["text"].as_str()
+                    if let Some(text) = params["text"]
+                        .as_str()
+                        .filter(|text| !text.trim().is_empty())
                     {
-                        consent.borrow_mut().heard(text);
+                        let role = if params["role"] == "user" {
+                            "user"
+                        } else {
+                            "assistant"
+                        };
+                        if role == "user" {
+                            consent.borrow_mut().heard(text);
+                        }
+                        record(Record::Said {
+                            role,
+                            text: text.trim(),
+                        });
                     }
                     json!({ "type": "transcript", "role": params["role"], "text": params["text"] })
+                }
+                "item/completed" => {
+                    let item = &params["item"];
+                    match item["type"].as_str() {
+                        Some("commandExecution") => record(Record::Command(item)),
+                        Some("agentMessage") if item["phase"] != "commentary" => {
+                            if let Some(text) = item["text"].as_str() {
+                                record(Record::Notes(text));
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
                 }
                 "thread/realtime/error" => {
                     bail!(
@@ -539,7 +626,24 @@ impl AppServer {
                         params["message"].as_str().unwrap_or("Dispatch voice error")
                     );
                 }
-                "thread/realtime/closed" => return Ok(()),
+                "thread/realtime/closed" => {
+                    let reason = params["reason"]
+                        .as_str()
+                        .filter(|reason| !reason.is_empty());
+                    log::info!(
+                        "Dispatch voice call closed by Codex: {}",
+                        reason.unwrap_or("no reason given")
+                    );
+                    if call
+                        .updates
+                        .send(json!({ "type": "closed", "reason": reason }))
+                        .await
+                        .is_err()
+                    {
+                        log::debug!("the phone left before the call closed");
+                    }
+                    return Ok(CallEnd::Closed(reason.map(str::to_owned)));
+                }
                 "turn/completed" if params.pointer("/turn/status") == Some(&json!("completed")) => {
                     self.persist_thread(state_dir)?;
                     continue;
@@ -547,12 +651,17 @@ impl AppServer {
                 _ => continue,
             };
             if call.updates.send(event).await.is_err() {
-                return Ok(());
+                return Ok(CallEnd::HungUp);
             }
         }
     }
 
-    async fn ask(&mut self, prompt: &str, call_tool: &ToolCall) -> Result<DispatchReply> {
+    async fn ask(
+        &mut self,
+        prompt: &str,
+        call_tool: &ToolCall,
+        record: &Recorder<'_>,
+    ) -> Result<DispatchReply> {
         let request_id = self
             .send_request(
                 "turn/start",
@@ -602,20 +711,40 @@ impl AppServer {
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let (success, text) = match call_tool(tool, params["arguments"].clone()).await {
+                let call_id = params["callId"].as_str().unwrap_or_default();
+                let arguments = &params["arguments"];
+                let (success, text) = match call_tool(tool, arguments.clone()).await {
                     Ok(result) => {
+                        record(Record::Tool {
+                            call_id,
+                            name: tool,
+                            arguments,
+                            result: Ok(&result.data),
+                        });
                         if result.open_session_id.is_some() {
                             reply.open_session_id = result.open_session_id;
                         }
                         (true, result.data.to_string())
                     }
-                    Err(error) => (false, error.to_string()),
+                    Err(error) => {
+                        let failure = error.to_string();
+                        record(Record::Tool {
+                            call_id,
+                            name: tool,
+                            arguments,
+                            result: Err(&failure),
+                        });
+                        (false, failure)
+                    }
                 };
                 self.send_tool_result(id, success, text).await?;
             } else if from_turn {
                 match method {
                     "item/completed" => {
                         let item = &params["item"];
+                        if item["type"] == "commandExecution" {
+                            record(Record::Command(item));
+                        }
                         if item["type"] == "agentMessage"
                             && item["phase"] != "commentary"
                             && let Some(text) = item["text"].as_str()
@@ -656,6 +785,206 @@ fn rpc_result(method: &str, mut message: Value) -> Result<Value> {
         .as_object_mut()
         .and_then(|message| message.remove("result"))
         .with_context(|| format!("{method} did not return a result"))
+}
+
+/// A Dispatch tool call as an ACP tool call, naming the thread it used and
+/// what it found there.
+pub fn tool_call_update(
+    relay: &Relay,
+    call_id: &str,
+    name: &str,
+    arguments: &Value,
+    result: std::result::Result<&Value, &str>,
+) -> Value {
+    let session = arguments["id"]
+        .as_str()
+        .filter(|id| relay.dispatch_title(id).is_some());
+    let thread = session
+        .and_then(|id| relay.dispatch_title(id))
+        .unwrap_or("a thread");
+    let (verb, target, kind) = match name {
+        "list_sessions" => ("Listed", "threads".to_owned(), "search"),
+        "session_now" => ("Checked", thread.to_owned(), "read"),
+        "read_session" => ("Read", thread.to_owned(), "read"),
+        "open_session" => ("Opened", thread.to_owned(), "other"),
+        "tell_session" => ("Told", thread.to_owned(), "other"),
+        "ask_session" => ("Asked", thread.to_owned(), "other"),
+        "answer_approval" if arguments["decision"] == "reject" => {
+            ("Rejected", format!("a command in {thread}"), "other")
+        }
+        "answer_approval" => ("Approved", format!("a command in {thread}"), "other"),
+        other => ("Used", other.to_owned(), "other"),
+    };
+    let (status, text) = match result {
+        Ok(data) => ("completed", describe_tool_result(name, arguments, data)),
+        Err(error) => ("failed", error.to_owned()),
+    };
+    step(call_id, verb, &target, kind, status, session, &text)
+}
+
+/// A step in a saved Dispatch conversation. `_meta.yonder` names the verb and
+/// what it acted on, so apps can show "Told" + a link to the thread.
+pub fn step(
+    call_id: &str,
+    verb: &str,
+    target: &str,
+    kind: &str,
+    status: &str,
+    session: Option<&str>,
+    text: &str,
+) -> Value {
+    let mut update = json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": format!("{verb} {target}"),
+        "kind": kind,
+        "status": status,
+        "_meta": { "yonder": { "verb": verb, "target": target, "sessionId": session } },
+    });
+    if !text.is_empty() {
+        update["content"] =
+            json!([{ "type": "content", "content": { "type": "text", "text": text } }]);
+    }
+    update
+}
+
+fn describe_tool_result(name: &str, arguments: &Value, data: &Value) -> String {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    match name {
+        "list_sessions" => {
+            let sessions = data["sessions"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let total = data["total"].as_u64().unwrap_or(sessions.len() as u64);
+            let mut lines = vec![format!("{} of {total} threads", sessions.len())];
+            lines.extend(sessions.iter().take(20).map(|session| {
+                format!(
+                    "{} · {} · {}",
+                    session["title"].as_str().unwrap_or("Untitled thread"),
+                    session["state"].as_str().unwrap_or("unknown"),
+                    session["machine"].as_str().unwrap_or_default(),
+                )
+            }));
+            lines.join("\n")
+        }
+        "session_now" => {
+            let mut lines = vec![format!("State: {}", text(&data["state"]))];
+            if let Some(tool) = data.pointer("/recentTool/title").and_then(Value::as_str) {
+                lines.push(format!("Recent tool: {tool}"));
+            }
+            if let Some(command) = data
+                .pointer("/pendingApproval/command")
+                .and_then(Value::as_str)
+            {
+                lines.push(format!("Waiting to run: {command}"));
+            }
+            let last = text(&data["lastText"]);
+            if !last.is_empty() {
+                lines.push(format!("Last message: {last}"));
+            }
+            lines.join("\n")
+        }
+        "read_session" => data["messages"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .map(|message| {
+                let who = if message["role"] == "user" {
+                    "You"
+                } else {
+                    "Agent"
+                };
+                format!("{who}: {}", text(&message["text"]))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        "tell_session" => format!("{}\n\n{}", text(&arguments["message"]), text(&data["note"])),
+        "ask_session" => {
+            let answer = data["reply"]
+                .as_str()
+                .or_else(|| data["note"].as_str())
+                .unwrap_or_default();
+            format!("{}\n\n{answer}", text(&arguments["question"]))
+        }
+        "answer_approval" => text(&data["answer"]),
+        "open_session" => String::new(),
+        _ => data.to_string(),
+    }
+}
+
+/// A command Codex ran while answering, as an ACP tool call with its output.
+pub fn command_update(item: &Value) -> Value {
+    let command = match &item["command"] {
+        Value::String(command) => command.clone(),
+        Value::Array(parts) => {
+            let parts: Vec<&str> = parts.iter().filter_map(Value::as_str).collect();
+            match parts.as_slice() {
+                [_, flag, script] if matches!(*flag, "-c" | "-lc") => script.to_string(),
+                _ => parts.join(" "),
+            }
+        }
+        _ => "a command".to_owned(),
+    };
+    let command = [
+        "/bin/bash -lc ",
+        "bash -lc ",
+        "/bin/zsh -lc ",
+        "/bin/sh -c ",
+    ]
+    .iter()
+    .find_map(|shell| command.strip_prefix(shell))
+    .map(|script| {
+        script
+            .trim_matches(|character| character == '\'' || character == '"')
+            .to_owned()
+    })
+    .unwrap_or(command);
+    let status = match item["status"].as_str() {
+        Some("completed") => "completed",
+        Some("inProgress") => "in_progress",
+        _ => "failed",
+    };
+    let mut output = item["aggregatedOutput"]
+        .as_str()
+        .map(|text| crate::relay::tail(text, 1_500))
+        .unwrap_or_default();
+    if let Some(code) = item["exitCode"].as_i64().filter(|code| *code != 0) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!("Exit code {code}"));
+    }
+    json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": item["id"],
+        "title": command,
+        "kind": "execute",
+        "status": status,
+        "content": [{ "type": "content", "content": { "type": "text", "text": output } }],
+    })
+}
+
+/// What the phone shows for a tool Dispatch ran during a call: the approval
+/// it read back, how it answered one, or what happened to a message.
+fn call_update(tool: &str, arguments: &Value, data: &Value) -> Value {
+    let session = &arguments["id"];
+    match tool {
+        "session_now" if data["pendingApproval"].is_object() => json!({
+            "type": "approval",
+            "sessionId": session,
+            "command": data.pointer("/pendingApproval/command"),
+            "question": data.pointer("/pendingApproval/question"),
+        }),
+        "answer_approval" => {
+            json!({ "type": "answered", "sessionId": session, "answer": data["answer"] })
+        }
+        _ => {
+            json!({ "type": "tool", "name": tool, "sessionId": session, "status": data["status"] })
+        }
+    }
 }
 
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -823,6 +1152,10 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    pub fn data(&self) -> &Value {
+        &self.data
+    }
+
     pub fn new(data: Value) -> Self {
         Self {
             data,
@@ -972,6 +1305,50 @@ mod tests {
             Ok(ToolStep::Done(_)) => panic!("expected an action"),
             Err(error) => panic!("{error:#}"),
         }
+    }
+
+    #[test]
+    fn calls_show_the_approval_and_what_happened_to_messages() {
+        let thread = json!({ "id": "s1" });
+        let read = json!({ "pendingApproval": { "approvalId": "7", "command": "npm test", "question": "May I?" } });
+        assert_eq!(
+            call_update("session_now", &thread, &read),
+            json!({ "type": "approval", "sessionId": "s1", "command": "npm test", "question": "May I?" })
+        );
+        assert_eq!(
+            call_update("session_now", &thread, &json!({ "pendingApproval": null }))["type"],
+            "tool"
+        );
+        assert_eq!(
+            call_update(
+                "answer_approval",
+                &thread,
+                &json!({ "answer": "approved once" })
+            ),
+            json!({ "type": "answered", "sessionId": "s1", "answer": "approved once" })
+        );
+        assert_eq!(
+            call_update("tell_session", &thread, &json!({ "status": "queued" })),
+            json!({ "type": "tool", "name": "tell_session", "sessionId": "s1", "status": "queued" })
+        );
+    }
+
+    #[test]
+    fn commands_codex_ran_read_as_steps() {
+        let update = command_update(&json!({
+            "id": "exec-1",
+            "command": "/bin/bash -lc 'rg -n gexec src'",
+            "status": "failed",
+            "aggregatedOutput": "no matches",
+            "exitCode": 1,
+        }));
+        assert_eq!(update["title"], "rg -n gexec src");
+        assert_eq!(update["kind"], "execute");
+        assert_eq!(update["status"], "failed");
+        assert_eq!(
+            update["content"][0]["content"]["text"],
+            "no matches\nExit code 1"
+        );
     }
 
     #[test]
