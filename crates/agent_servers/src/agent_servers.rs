@@ -25,8 +25,9 @@ pub use acp::test_support::{
 };
 pub use acp::{
     AcpConnection, AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection,
-    AcpV2Connection, DecodedTerminalNotification, DecodedTerminalUpdate,
-    GEMINI_TERMINAL_AUTH_METHOD_ID, v2_terminal_client_builder,
+    AcpV2Connection, AgentProcess, AgentProcessGuard, DecodedTerminalNotification,
+    DecodedTerminalUpdate, GEMINI_TERMINAL_AUTH_METHOD_ID, spawn_agent_process,
+    v2_terminal_client_builder,
 };
 pub use claude_session::copy_claude_session;
 

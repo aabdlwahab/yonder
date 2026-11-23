@@ -247,6 +247,7 @@ members = [
     "crates/worktree_benchmarks",
     "crates/x_ai",
     "crates/x_ai_subscribed",
+    "crates/yonder_hub",
     "crates/zed",
     "crates/zed_actions",
     "crates/zed_credentials_provider",
@@ -273,8 +274,7 @@ members = [
     "tooling/compliance",
     "tooling/crates_io_client",
     "tooling/perf",
-    "tooling/xtask",
-]
+    "tooling/xtask",]
 default-members = ["crates/zed"]
 
 [workspace.package]
