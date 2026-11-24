@@ -191,14 +191,73 @@
   }, { passive: true });
 
   var width = 0, height = 0, ratio = 1;
+  // Where the constellation may go, in NDC: the empty space beside the hero's
+  // words, or above them when there's more room there. Measured from the page,
+  // so it holds at any window size and font.
+  var space = null;
+  var kicker = hero && hero.querySelector(".hero-kicker");
+  var words = hero ? hero.querySelectorAll(".hero-kicker, .hero-in h1, .hero-sub, .hero-in .ctas .btn") : [];
+  function measure() {
+    var heroRect = hero ? hero.getBoundingClientRect() : { left: 0, top: 0 };
+    var textRight = 0, textTop = height;
+    // The right edge of the words themselves, not of the boxes they sit in.
+    Array.prototype.forEach.call(words, function (element) {
+      var range = document.createRange();
+      range.selectNodeContents(element);
+      var rect = element.classList.contains("btn") ? element.getBoundingClientRect() : range.getBoundingClientRect();
+      textRight = Math.max(textRight, rect.right - heroRect.left);
+    });
+    if (kicker) textTop = kicker.getBoundingClientRect().top - heroRect.top;
+    // Labels hang to the right of and below their points.
+    var labelRoom = 120, edge = 36;
+    var regions = [
+      { x0: textRight + 70, x1: width - labelRoom, y0: edge, y1: height - 130 },
+      { x0: edge, x1: width - labelRoom, y0: edge, y1: textTop - 60 }
+    ];
+    space = regions
+      .filter(function (r) { return r.x1 - r.x0 > 160 && r.y1 - r.y0 > 140; })
+      .map(function (r, index) {
+        return {
+          x0: r.x0 / width * 2 - 1, x1: r.x1 / width * 2 - 1,
+          y0: 1 - r.y1 / height * 2, y1: 1 - r.y0 / height * 2,
+          // The side reads better whenever it's nearly as roomy as the top.
+          area: Math.min(r.x1 - r.x0, (r.y1 - r.y0) * 1.6) * (index === 0 ? 1.35 : 1)
+        };
+      })
+      .sort(function (a, b) { return b.area - a.area; })[0] || null;
+  }
   function resize() {
     ratio = Math.min(window.devicePixelRatio || 1, 2);
     width = canvas.clientWidth; height = canvas.clientHeight;
     canvas.width = Math.round(width * ratio); canvas.height = Math.round(height * ratio);
     gl.viewport(0, 0, canvas.width, canvas.height);
+    measure();
   }
   window.addEventListener("resize", resize);
   resize();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(measure);
+
+  var nodes = [here, hub].concat(machines.map(function (machine) { return machine.at; }));
+  var fit = null;
+  // Scales and moves the projected constellation (in clip space) so its points
+  // fill `space`. Measured on the camera without the scroll pull-back, so
+  // scrolling still makes it recede.
+  function fitTo(baseMvp) {
+    if (!space) return { s: 1, x: 0, y: 0 };
+    var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    nodes.forEach(function (p) {
+      var w = baseMvp[3] * p[0] + baseMvp[7] * p[1] + baseMvp[11] * p[2] + baseMvp[15];
+      var x = (baseMvp[0] * p[0] + baseMvp[4] * p[1] + baseMvp[8] * p[2] + baseMvp[12]) / w;
+      var y = (baseMvp[1] * p[0] + baseMvp[5] * p[1] + baseMvp[9] * p[2] + baseMvp[13]) / w;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    });
+    var s = Math.min((space.x1 - space.x0) / (maxX - minX), (space.y1 - space.y0) / (maxY - minY), 1.8);
+    return {
+      s: s,
+      x: (space.x0 + space.x1) / 2 - s * (minX + maxX) / 2,
+      y: (space.y0 + space.y1) / 2 - s * (minY + maxY) / 2
+    };
+  }
 
   function bind(buffer, location, size, stride, offset) {
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -242,21 +301,24 @@
     // The camera: a slow orbit, leaning toward the pointer, backing off with scroll.
     var yaw = Math.sin(t * 0.09) * 0.32 + lean[0] * 0.22;
     var pitch = 0.18 + Math.sin(t * 0.07) * 0.05 - lean[1] * 0.12;
-    var narrow = width < 700;
-    var distance = (narrow ? 16 : 11.5) + drop * 4.5;
     var target = [0.2, -0.1, -0.3];
-    var eye = [
-      target[0] + Math.sin(yaw) * Math.cos(pitch) * distance,
-      target[1] + Math.sin(pitch) * distance,
-      target[2] + Math.cos(yaw) * Math.cos(pitch) * distance
-    ];
-    var mvp = multiply(perspective(narrow ? 0.95 : 0.72, width / height, 0.1, 60), lookAt(eye, target));
-    // Keep the constellation clear of the headline: the right half of a wide
-    // screen, the upper half of a narrow one.
-    var shiftX = narrow ? -0.02 : 0.5, shiftY = narrow ? 0.5 : 0.06;
+    var projection = perspective(0.72, width / height, 0.1, 60);
+    function camera(distance) {
+      return multiply(projection, lookAt([
+        target[0] + Math.sin(yaw) * Math.cos(pitch) * distance,
+        target[1] + Math.sin(pitch) * distance,
+        target[2] + Math.cos(yaw) * Math.cos(pitch) * distance
+      ], target));
+    }
+    var mvp = camera(11.5 + drop * 4.5);
+    // Keep the constellation in the empty space beside (or above) the words,
+    // easing toward the new fit so the orbit doesn't make it jump.
+    var goal = fitTo(drop > 0 ? camera(11.5) : mvp);
+    if (!fit) fit = goal;
+    fit = { s: fit.s + (goal.s - fit.s) * 0.08, x: fit.x + (goal.x - fit.x) * 0.08, y: fit.y + (goal.y - fit.y) * 0.08 };
     for (var column = 0; column < 4; column++) {
-      mvp[column * 4] += shiftX * mvp[column * 4 + 3];
-      mvp[column * 4 + 1] += shiftY * mvp[column * 4 + 3];
+      mvp[column * 4] = fit.s * mvp[column * 4] + fit.x * mvp[column * 4 + 3];
+      mvp[column * 4 + 1] = fit.s * mvp[column * 4 + 1] + fit.y * mvp[column * 4 + 3];
     }
 
     // Packets along the arcs.
@@ -278,7 +340,7 @@
     gl.blendFunc(gl.ONE, gl.ONE);
     gl.useProgram(marks);
     gl.uniformMatrix4fv(gl.getUniformLocation(marks, "mvp"), false, new Float32Array(mvp));
-    gl.uniform1f(gl.getUniformLocation(marks, "scale"), ratio * Math.min(width, 1400) / 520);
+    gl.uniform1f(gl.getUniformLocation(marks, "scale"), ratio * Math.min(width, 1400) / 520 * Math.sqrt(fit.s));
     drawMarks(lines, gl.LINES, lineData.length / 8, false);
     drawMarks(points, gl.POINTS, pointData.length / 8, true);
     drawMarks(packets, gl.POINTS, arcs.length * 2, true);
