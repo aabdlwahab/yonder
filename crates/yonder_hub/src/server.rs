@@ -23,8 +23,10 @@ use futures::channel::oneshot;
 use futures::future::{self, Either, select};
 use futures::{AsyncReadExt as _, FutureExt as _, SinkExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, Task};
+use project::agent_server_store::{AgentServerCommand, AllAgentServersSettings};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
+use settings::Settings as _;
 
 use crate::dispatch::{
     self, Action, CallEnd, Consent, Dispatch, Record, ToolResult, ToolStep, VoiceCall,
@@ -145,6 +147,14 @@ pub fn serve(
         relay.restore(saved);
         let machines = Machines::new(app_state, local_name.clone());
         relay.set_machines(cx.update(|cx| machines.names(cx)));
+        relay.set_agents(cx.update(|cx| {
+            let mut agents: Vec<String> = AllAgentServersSettings::get_global(cx)
+                .keys()
+                .cloned()
+                .collect();
+            agents.sort();
+            agents
+        }));
 
         let (events, mut event_rx) = mpsc::unbounded::<Event>();
         let hub = Rc::new(RefCell::new(Hub {
@@ -898,6 +908,11 @@ const SEND_WAIT: Duration = Duration::from_secs(20);
 const REPLY_WAIT: Duration = Duration::from_secs(45);
 const TURN_START_WAIT: Duration = Duration::from_secs(60);
 const REPLY_CHARS: usize = 2_000;
+const FOLDER_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long starting a thread holds up Dispatch's answer. Starting goes on
+/// after that, and its outcome joins the conversation when it comes.
+/// Dispatch has to answer within ASK_TIMEOUT, thinking time included.
+const START_WAIT: Duration = Duration::from_secs(25);
 
 /// Dispatch's tools: reads answer at once, and sends and approvals act
 /// through the hub.
@@ -949,7 +964,201 @@ async fn run_action(
             text,
             wait_for_reply,
         } => send_to_thread(hub, session, text, wait_for_reply, conversation, cx).await,
+        Action::Start {
+            agent,
+            folder,
+            text,
+            title,
+        } => start_thread(hub, agent, folder, text, title, conversation, cx).await,
     }
+}
+
+/// Starts a thread and sends it its first message. The work runs on its own,
+/// so a slow machine or agent doesn't lose the thread when Dispatch stops
+/// waiting.
+async fn start_thread(
+    hub: Rc<RefCell<Hub>>,
+    agent: AgentKey,
+    folder: String,
+    text: String,
+    title: String,
+    conversation: ConversationId,
+    cx: AsyncApp,
+) -> Result<ToolResult> {
+    let (done, outcome) = oneshot::channel::<Result<Value>>();
+    cx.spawn({
+        let hub = hub.clone();
+        let agent = agent.clone();
+        async move |cx| {
+            let started = async {
+                let cwd = resolve_folder(&hub, &agent.machine, &folder, cx).await?;
+                let session = open_thread(&hub, &agent, &cwd, cx.background_executor()).await?;
+                let outputs = hub
+                    .borrow_mut()
+                    .relay
+                    .dispatch_name_session(&session, &title);
+                apply(&hub, outputs, cx);
+                anyhow::Ok((session, cwd))
+            }
+            .await;
+            let outcome = match started {
+                Ok((session, cwd)) => {
+                    let sent = send_to_thread(
+                        hub.clone(),
+                        session.clone(),
+                        text,
+                        false,
+                        conversation.clone(),
+                        cx.clone(),
+                    )
+                    .await;
+                    let note = match sent.as_ref().map(|sent| sent.data()["status"].as_str()) {
+                        Ok(Some("sent")) => "Started. The agent is working on the message.",
+                        Ok(_) => "Started. The message goes out once the agent is ready.",
+                        Err(_) => "Started, but the message couldn't be sent. Try tell_session.",
+                    };
+                    Ok(json!({
+                        "status": "started",
+                        "sessionId": session,
+                        "machine": agent.machine,
+                        "agent": agent.agent,
+                        "project": cwd,
+                        "note": note,
+                    }))
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(outcome) = done.send(outcome) {
+                record_late_start(&hub, &agent, outcome, &conversation, cx);
+            }
+        }
+    })
+    .detach();
+    let executor = cx.background_executor().clone();
+    match within(&executor, START_WAIT, outcome).await {
+        Some(Ok(Ok(data))) => {
+            let session = data["sessionId"].as_str().unwrap_or_default().to_owned();
+            Ok(ToolResult::opening(data, session))
+        }
+        Some(Ok(Err(error))) => Err(error),
+        Some(Err(_)) => bail!("The hub stopped starting the thread"),
+        None => Ok(ToolResult::new(json!({
+            "status": "starting",
+            "machine": agent.machine,
+            "agent": agent.agent,
+            "note": "Still starting the agent. Tell the user it's starting and don't wait for it: the thread shows up in list_sessions once it's up, and the message goes out then.",
+        }))),
+    }
+}
+
+/// A start that finished after Dispatch stopped waiting, as a step in its
+/// conversation.
+fn record_late_start(
+    hub: &Rc<RefCell<Hub>>,
+    agent: &AgentKey,
+    outcome: Result<Value>,
+    conversation: &ConversationId,
+    cx: &mut AsyncApp,
+) {
+    let call_id = format!("late-{:08x}", rand::random::<u32>());
+    let target = format!("a thread on {}", agent.machine);
+    let step = match &outcome {
+        Ok(data) => dispatch::step(
+            &call_id,
+            "Started",
+            &target,
+            "other",
+            "completed",
+            data["sessionId"].as_str(),
+            data["project"].as_str().unwrap_or_default(),
+        ),
+        Err(error) => {
+            log::warn!("Dispatch starting a thread on {}: {error:#}", agent.machine);
+            dispatch::step(
+                &call_id,
+                "Couldn't start",
+                &target,
+                "other",
+                "failed",
+                None,
+                &format!("{error:#}"),
+            )
+        }
+    };
+    let Some(id) = conversation.borrow().clone() else {
+        return;
+    };
+    let outputs = hub
+        .borrow_mut()
+        .relay
+        .dispatch_conversation_record(&id, step);
+    apply(hub, outputs, cx);
+}
+
+/// Turns `folder` (absolute, or under ~) into the absolute path on
+/// `machine`, and checks it's there.
+async fn resolve_folder(
+    hub: &Rc<RefCell<Hub>>,
+    machine: &str,
+    folder: &str,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    // `$1` is the folder as given; only a leading ~ means the home folder.
+    const SCRIPT: &str = r#"case $1 in "~") d=$HOME ;; "~/"*) d=$HOME/${1#"~/"} ;; *) d=$1 ;; esac; cd -- "$d" 2>/dev/null && pwd"#;
+    let project = cx.update(|cx| hub.borrow_mut().machines.project(machine, cx));
+    let project = project
+        .await
+        .map_err(|error| anyhow!("couldn't reach {machine}: {error:#}"))?;
+    let command = AgentServerCommand {
+        path: "sh".into(),
+        args: vec!["-c".into(), SCRIPT.into(), "sh".into(), folder.into()],
+        env: None,
+    };
+    let mut process = spawn_agent_process(&project, command, cx)
+        .with_context(|| format!("checking {folder} on {machine}"))?;
+    let line = within(
+        cx.background_executor(),
+        FOLDER_CHECK_TIMEOUT,
+        process.incoming.next(),
+    )
+    .await
+    .with_context(|| format!("checking {folder} on {machine} timed out"))?;
+    match line {
+        Some(Ok(path)) if path.trim().starts_with('/') => Ok(path.trim().to_owned()),
+        _ => bail!("There's no folder {folder} on {machine}"),
+    }
+}
+
+/// Asks the agent for a new thread in `cwd`, as an app would.
+async fn open_thread(
+    hub: &Rc<RefCell<Hub>>,
+    agent: &AgentKey,
+    cwd: &str,
+    executor: &BackgroundExecutor,
+) -> Result<String> {
+    let mut connection = HubConnection::open(hub, Endpoint::Agent(agent.clone()));
+    connection
+        .request_within(
+            executor,
+            AGENT_READY_TIMEOUT,
+            "initialize",
+            json!({ "protocolVersion": 2, "clientCapabilities": {} }),
+        )
+        .await
+        .with_context(|| format!("starting {} on {}", agent.agent, agent.machine))?;
+    let result = connection
+        .request_within(
+            executor,
+            THREAD_REQUEST_TIMEOUT,
+            "session/new",
+            json!({ "cwd": cwd, "mcpServers": [] }),
+        )
+        .await
+        .context("starting the thread")?;
+    result["sessionId"]
+        .as_str()
+        .map(str::to_owned)
+        .context("the agent didn't return the new thread's ID")
 }
 
 struct ThreadMessage {

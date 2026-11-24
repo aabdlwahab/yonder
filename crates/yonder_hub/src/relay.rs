@@ -195,6 +195,8 @@ pub struct Relay {
     sessions: HashMap<String, Session>,
     routes: HashMap<String, Route>,
     machines: Vec<String>,
+    /// The agents in the hub's settings.
+    configured_agents: Vec<String>,
 }
 
 impl Relay {
@@ -207,12 +209,96 @@ impl Relay {
             sessions: HashMap::default(),
             routes: HashMap::default(),
             machines: Vec::new(),
+            configured_agents: Vec::new(),
         }
     }
 
     /// The machines clients can start agents on.
     pub fn set_machines(&mut self, machines: Vec<String>) {
         self.machines = machines;
+    }
+
+    /// The agents Dispatch can start threads with.
+    pub fn set_agents(&mut self, agents: Vec<String>) {
+        self.configured_agents = agents;
+    }
+
+    /// The agents threads can start with: the hub's configured ones, and any
+    /// other agent a thread has used.
+    fn startable_agents(&self) -> Vec<&str> {
+        let mut agents: Vec<&str> = self.configured_agents.iter().map(String::as_str).collect();
+        for session in self.sessions.values() {
+            let agent = session.meta.agent.as_str();
+            if agent != DISPATCH_AGENT && !agents.contains(&agent) {
+                agents.push(agent);
+            }
+        }
+        agents
+    }
+
+    /// Where Dispatch can start a thread: each machine with the folders its
+    /// recent threads used, and the agents.
+    pub fn dispatch_start_options(&self) -> Value {
+        let mut sessions: Vec<&SessionMeta> = self
+            .sessions
+            .values()
+            .map(|session| &session.meta)
+            .filter(|meta| meta.agent != DISPATCH_AGENT && !meta.cwd.is_empty())
+            .collect();
+        sessions.sort_unstable_by_key(|meta| std::cmp::Reverse(meta.updated_at));
+        let machines: Vec<Value> = self
+            .machines
+            .iter()
+            .map(|machine| {
+                let mut folders: Vec<&str> = Vec::new();
+                for meta in sessions.iter().filter(|meta| &meta.machine == machine) {
+                    if folders.len() < 8 && !folders.contains(&meta.cwd.as_str()) {
+                        folders.push(&meta.cwd);
+                    }
+                }
+                json!({ "name": machine, "folders": folders })
+            })
+            .collect();
+        json!({ "machines": machines, "agents": self.startable_agents() })
+    }
+
+    /// The agent to start a thread with, from names as the user or Dispatch
+    /// wrote them.
+    pub fn dispatch_start_target(&self, machine: &str, agent: &str) -> Result<AgentKey> {
+        let machine = machine.trim();
+        let Some(machine) = self
+            .machines
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(machine))
+        else {
+            bail!(
+                "No machine named {machine} on the hub. Its machines are: {}",
+                self.machines.join(", ")
+            );
+        };
+        let agents = self.startable_agents();
+        let agent = agent.trim();
+        let Some(agent) = agents.iter().find(|name| name.eq_ignore_ascii_case(agent)) else {
+            bail!(
+                "No agent named {agent} on the hub. Its agents are: {}",
+                agents.join(", ")
+            );
+        };
+        Ok(AgentKey {
+            machine: machine.clone(),
+            agent: (*agent).to_owned(),
+        })
+    }
+
+    /// Names a thread Dispatch started, until its agent gives it a title.
+    pub fn dispatch_name_session(&mut self, id: &str, title: &str) -> Vec<Output> {
+        match self.sessions.get_mut(id) {
+            Some(session) if session.meta.title.is_none() && !title.is_empty() => {
+                session.meta.title = Some(title.to_owned());
+                vec![Output::SaveSessions]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Sessions saved before a restart. The agents don't know them until a
@@ -2869,6 +2955,32 @@ mod tests {
         let response = parse(&outputs[0]);
         assert_eq!(response["result"]["sessions"][0]["id"], "s1");
         assert_eq!(response["result"]["sessions"][0]["machine"], "gpu-07");
+    }
+
+    #[test]
+    fn dispatch_names_the_threads_it_starts_until_the_agent_does() {
+        let mut relay = Relay::new(|| 100);
+        relay.client_connected(1, Endpoint::Hub);
+        relay.client_message(
+            1,
+            &json!({"jsonrpc":"2.0","id":1,"method":"_yonder/hub/import","params":{"sessions":[
+                {"id":"s1","machine":"gpu-06","agent":"codex-acp","cwd":"/api"},
+                {"id":"s2","machine":"gpu-06","agent":"codex-acp","cwd":"/api","title":"Named"},
+            ]}})
+            .to_string(),
+        );
+        assert_eq!(
+            relay.dispatch_name_session("s1", "fix the tests"),
+            vec![Output::SaveSessions]
+        );
+        assert_eq!(relay.dispatch_title("s1"), Some("fix the tests"));
+        assert!(
+            relay
+                .dispatch_name_session("s2", "fix the tests")
+                .is_empty()
+        );
+        assert_eq!(relay.dispatch_title("s2"), Some("Named"));
+        assert!(relay.dispatch_name_session("missing", "x").is_empty());
     }
 
     #[test]

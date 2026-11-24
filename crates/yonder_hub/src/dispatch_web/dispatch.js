@@ -1203,6 +1203,10 @@ function addToolChip(update) {
     addChip(update.status === 'queued' ? `Queued for ${title}` : `Passed your message to ${title}`);
   } else if (update.name === 'ask_session') {
     addChip(update.status === 'answered' ? `${title} answered` : `Asked ${title}`);
+  } else if (update.name === 'start_session' && update.status === 'started') {
+    addChip(`Started a thread on ${update.machine}`);
+  } else if (update.name === 'start_session' && update.status === 'starting') {
+    addChip(`Starting a thread on ${update.machine}`);
   }
 }
 
