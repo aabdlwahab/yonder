@@ -28,7 +28,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Schibsted+Grotesk:wght@600;700;800&display=swap" />
-    <link rel="stylesheet" href="assets/site.css?v=1427ca357b" />
+    <link rel="stylesheet" href="assets/site.css?v=cd8ecd9bbe" />
     <link rel="icon" type="image/svg+xml" href="assets/mark.svg" />
     <link rel="apple-touch-icon" href="assets/icon-180.png" />
   </head>
@@ -49,7 +49,7 @@
           <a href="#threads">Threads</a>
           <a href="#dispatch">Dispatch</a>
           <a href="#program">The program</a>
-          <a href="#build">Build it</a>
+          <a href="#get">Get it</a>
         </nav>
         <div class="hdr-right">
           <button class="icon-btn" id="theme" type="button" aria-label="Switch between light and dark">
@@ -57,7 +57,7 @@
             <svg class="i-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
           </button>
           <a class="btn btn-line btn-small" href="https://github.com/aabdlwahab/yonder">GitHub</a>
-          <a class="btn btn-amber btn-small" href="#build">Build it</a>
+          <a class="btn btn-amber btn-small" href="#get">Get it</a>
         </div>
       </div>
       <div class="progress" aria-hidden="true"></div>
@@ -77,7 +77,7 @@
             agents stay on your machines, over SSH, and keep working after you close the laptop.
           </p>
           <div class="ctas">
-            <a class="btn btn-amber" href="#build">Build it</a>
+            <a class="btn btn-amber" href="#get">Get it</a>
             <a class="btn btn-line" href="https://github.com/aabdlwahab/yonder">Read the source</a>
           </div>
           <div class="hero-foot">
@@ -316,7 +316,7 @@ dedupe: <span class="kw">true</span></div>
             </p>
             <div class="plats">
               <div class="plat rv d1"><h3>macOS</h3><p>An app in Applications. The hub's token goes in your Keychain. <kbd>⌃⌘K</kbd> searches every project.</p></div>
-              <div class="plat rv d2"><h3>Ubuntu</h3><p>Installs in your home folder with a menu entry, no sudo. Wayland or X11. The token goes in your keyring. <kbd>ctrl-alt-k</kbd> searches.</p></div>
+              <div class="plat rv d2"><h3>Ubuntu</h3><p><code>apt install yonder</code>, and <code>apt upgrade</code> keeps it current. Wayland or X11. The token goes in your keyring. <kbd>ctrl-alt-k</kbd> searches.</p></div>
             </div>
           </div>
         </div>
@@ -423,21 +423,35 @@ dedupe: <span class="kw">true</span></div>
         </div>
       </section>
 
-      <!-- ========================= BUILD IT ========================= -->
-      <section class="sec" id="build">
+      <!-- ========================= GET IT ========================= -->
+      <section class="sec" id="get">
         <div class="wrap">
-          <h2 class="rv">Build it on your computer.</h2>
+          <h2 class="rv">Get it.</h2>
           <p class="lead rv d1">
-            There are no release downloads yet. Yonder builds like Zed, so set up Rust and the
-            system packages with Zed's guide for
-            <a href="https://github.com/aabdlwahab/yonder/blob/main/docs/src/development/macos.md">macOS</a> or
-            <a href="https://github.com/aabdlwahab/yonder/blob/main/docs/src/development/linux.md">Linux</a>,
-            then run the install script. A release build takes twenty minutes or so.
+            On Ubuntu and Debian, Yonder is a package from a signed apt repository, so
+            <code>apt upgrade</code> brings each new version. On a Mac you build it once on the
+            Mac that runs it, which takes twenty minutes or so.
           </p>
           <div class="get">
             <div class="rv d1">
+              <h3>On Ubuntu or Debian</h3>
+              <p>Ubuntu 22.04 or newer, Debian 12 or newer, on x86-64. Adds the key and the repository, then installs Yonder with a menu entry.</p>
+              <div class="term">
+                <div class="term-h"><span>Terminal</span><button class="copy" type="button" data-copy="get-apt">Copy</button></div>
+<pre id="get-apt"><span class="p">$ </span>curl -fsSL https://aabdlwahab.github.io/yonder/apt/yonder-archive-keyring.asc \
+  | sudo tee /usr/share/keyrings/yonder-archive-keyring.asc >/dev/null
+<span class="p">$ </span>sudo tee /etc/apt/sources.list.d/yonder.sources >/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://github.com/aabdlwahab/yonder/releases/download
+Suites: apt/
+Signed-By: /usr/share/keyrings/yonder-archive-keyring.asc
+EOF
+<span class="p">$ </span>sudo apt update && sudo apt install yonder</pre>
+              </div>
+            </div>
+            <div class="rv d2">
               <h3>On a Mac</h3>
-              <p>Builds the app, signs it for this Mac and installs it in Applications. <code>-l</code> also builds the program for your Linux machines on one of them.</p>
+              <p>Builds the app, signs it for this Mac and installs it in Applications. <code>-l</code> also builds the program for your Linux machines on one of them. Set up Rust first with <a href="https://github.com/aabdlwahab/yonder/blob/main/docs/src/development/macos.md">Zed's guide</a>.</p>
               <div class="term">
                 <div class="term-h"><span>Terminal</span><button class="copy" type="button" data-copy="get-mac">Copy</button></div>
 <pre id="get-mac"><span class="p">$ </span>git clone https://github.com/aabdlwahab/yonder.git
@@ -445,25 +459,14 @@ dedupe: <span class="kw">true</span></div>
 <span class="p">$ </span>script/install-mac -l build-box</pre>
               </div>
             </div>
-            <div class="rv d2">
-              <h3>On Ubuntu</h3>
-              <p>Installs the build packages (this step asks for sudo), then builds Yonder and installs it in <code>~/.local</code> with a menu entry.</p>
-              <div class="term">
-                <div class="term-h"><span>Terminal</span><button class="copy" type="button" data-copy="get-linux">Copy</button></div>
-<pre id="get-linux"><span class="p">$ </span>git clone https://github.com/aabdlwahab/yonder.git
-<span class="p">$ </span>cd yonder
-<span class="p">$ </span>script/linux
-<span class="p">$ </span>script/install-linux</pre>
-              </div>
-            </div>
           </div>
           <p class="after rv d1">
-            No build tools on your Ubuntu machine? <code>script/build-linux-docker build-box</code>
-            builds it in a container on any machine with Docker, and
-            <code>script/install-linux yonder-linux-x86_64.tar.gz</code> installs the result. Then add
-            your machines in Settings → Machines; Yonder installs itself on each one the first time
-            you open a project there. The Mac app isn't signed with an Apple Developer ID, so a
-            build runs on the Mac that made it.
+            Then add your machines in Settings → Machines; Yonder installs itself on each one the
+            first time you open a project there. The repository's key has fingerprint
+            <code>D7C2 4E77 D2E4 9943 B785 9D41 B35F B4E5 054B CFEE</code>. You can also
+            build the Linux app from source with <code>script/install-linux</code>, which installs
+            it in <code>~/.local</code> without sudo. The Mac app isn't signed with an Apple
+            Developer ID, so a build runs on the Mac that made it.
           </p>
         </div>
       </section>
@@ -490,7 +493,7 @@ dedupe: <span class="kw">true</span></div>
       </div>
     </footer>
 
-    <script src="assets/sky.js?v=1427ca357b"></script>
-    <script src="assets/site.js?v=1427ca357b"></script>
+    <script src="assets/sky.js?v=cd8ecd9bbe"></script>
+    <script src="assets/site.js?v=cd8ecd9bbe"></script>
   </body>
 </html>
