@@ -11664,8 +11664,18 @@ pub fn find_existing_workspace(
                             }
                         };
 
-                        let match_priority = visibility
-                            .map(|visible| (visible, Some(window.into()) == active_window));
+                        // When a project's server stops, reopening it connects
+                        // a fresh copy and the window keeps the dead one beside
+                        // it. Picking the dead copy again would start yet
+                        // another connection, and that one takes the server
+                        // from the live copy, ending its agent threads. So a
+                        // copy that's still connected always wins.
+                        let connected = project
+                            .remote_client()
+                            .is_none_or(|client| !client.read(cx).is_disconnected());
+                        let match_priority = visibility.map(|visible| {
+                            (connected, visible, Some(window.into()) == active_window)
+                        });
                         if match_priority > best_match {
                             existing = Some(WorkspaceOpenTarget {
                                 window,

@@ -1447,6 +1447,113 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    async fn test_reopening_prefers_the_copy_that_is_still_connected(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let executor = cx.executor();
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+        let remote_fs = FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(path!("/project"), json!({ "main.rs": "fn main() {}" }))
+            .await;
+        server_cx.update(HeadlessProject::init);
+        let start_server = |session, server_cx: &mut TestAppContext| {
+            let fs = remote_fs.clone();
+            server_cx.new(|cx| {
+                HeadlessProject::new(
+                    HeadlessAppState {
+                        session,
+                        fs,
+                        http_client: Arc::new(BlockedHttpClient),
+                        node_runtime: NodeRuntime::unavailable(),
+                        languages: Arc::new(language::LanguageRegistry::new(
+                            cx.background_executor().clone(),
+                        )),
+                        extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                        startup_time: std::time::Instant::now(),
+                    },
+                    false,
+                    cx,
+                )
+            })
+        };
+
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let _first_server = start_server(server_session, server_cx);
+        drop(connect_guard);
+        let paths = vec![PathBuf::from(path!("/project"))];
+        let mut async_cx = cx.to_async();
+        let first_window = open_remote_project(
+            opts.clone(),
+            paths.clone(),
+            app_state.clone(),
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("the first open should succeed");
+        executor.run_until_parked();
+        let dead_copy = first_window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+
+        // The server stops while the laptop sleeps.
+        dead_copy.update(cx, |workspace, cx| {
+            let client = workspace
+                .project()
+                .read(cx)
+                .remote_client()
+                .expect("the project is remote");
+            client.update(cx, |client, cx| client.force_server_not_running(cx));
+        });
+        executor.run_until_parked();
+
+        // Opening the project again connects a fresh copy, and the dead one
+        // stays where it was.
+        let (server_session, connect_guard) =
+            RemoteClient::fake_server_with_opts(&opts, cx, server_cx);
+        let _second_server = start_server(server_session, server_cx);
+        drop(connect_guard);
+        let second_window = open_remote_project(
+            opts.clone(),
+            paths.clone(),
+            app_state,
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .expect("reopening should connect a fresh copy");
+        executor.run_until_parked();
+        let live_copy = second_window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert_ne!(live_copy, dead_copy, "reopening should make a fresh copy");
+
+        // Coming back to the project from the dead copy's window must find the
+        // live copy: picking the dead one would connect again and take the
+        // server from the live copy, ending its agent threads.
+        first_window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        executor.run_until_parked();
+        let found = find_existing_workspace(
+            &paths,
+            &workspace::OpenOptions::default(),
+            &ProjectHost::Remote(&opts),
+            &mut async_cx,
+        )
+        .expect("the project is open");
+        assert_eq!(
+            found.workspace, live_copy,
+            "the copy that is still connected should win"
+        );
+    }
+
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
