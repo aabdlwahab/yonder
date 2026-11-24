@@ -45,6 +45,24 @@ Fleet reads machine names from `ssh_connections`. You can also save folders for 
 
 Open a folder over SSH to add it to Fleet. See [Remote Development](./docs/src/remote-development.md) for the full connection options, such as ports, SSH arguments and port forwards.
 
+## Installing on Ubuntu and Debian
+
+Yonder is a package from a signed apt repository, for Ubuntu 22.04 and newer and Debian 12 and newer on x86-64. `apt upgrade` keeps it current:
+
+```bash
+curl -fsSL https://aabdlwahab.github.io/yonder/apt/yonder-archive-keyring.asc \
+  | sudo tee /usr/share/keyrings/yonder-archive-keyring.asc >/dev/null
+sudo tee /etc/apt/sources.list.d/yonder.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://github.com/aabdlwahab/yonder/releases/download
+Suites: apt/
+Signed-By: /usr/share/keyrings/yonder-archive-keyring.asc
+EOF
+sudo apt update && sudo apt install yonder
+```
+
+The key has fingerprint `D7C24E77D2E49943B7859D41B35FB4E5054BCFEE`; `gpg --show-keys /usr/share/keyrings/yonder-archive-keyring.asc` shows the one your machine trusts. The packages are in the [`apt` release](https://github.com/aabdlwahab/yonder/releases/tag/apt), because GitHub Pages can't serve files that big.
+
 ## Building and installing
 
 Yonder runs on macOS and on Ubuntu (22.04 and newer, Wayland or X11). It builds the same way as Zed, so set up Rust and the system packages with the upstream guides first:
@@ -56,9 +74,13 @@ Then:
 
 - **Mac:** `script/install-mac` builds a release, signs it for this Mac and installs `/Applications/Yonder.app`. Add `-l <ssh host>` to also build the program for Linux machines on one of them and carry it inside the app.
 - **Ubuntu:** `script/install-linux` builds a release and installs it in `~/.local/yonder.app`, with `~/.local/bin/yonder` and a menu entry. It needs no sudo.
-- **Ubuntu without build tools:** `script/build-linux-docker <host>` builds `yonder-linux-x86_64.tar.gz` in an Ubuntu 22.04 container on any machine with Docker, and `script/install-linux yonder-linux-x86_64.tar.gz` installs it.
+- **Ubuntu without build tools:** `script/build-linux-docker <host>` builds `yonder-linux-x86_64.tar.gz` and the Debian package `yonder_<version>_amd64.deb` in an Ubuntu 22.04 container on any machine with Docker. `script/install-linux yonder-linux-x86_64.tar.gz` installs the first.
 
-`cargo run` starts a development build of the `yonder` binary. There are no Yonder release downloads yet.
+`cargo run` starts a development build of the `yonder` binary.
+
+### Publishing the apt repository
+
+`script/build-linux-docker <host>` builds the package from HEAD, then `script/publish-apt` signs the repository and uploads it to the `apt` release, replacing the previous package. The signing key is made the first time, in `~/.config/yonder/apt-signing`; back that folder up, because machines that installed Yonder only accept updates signed with it. If `site/apt/yonder-archive-keyring.asc` changes, commit it and run `script/publish-site`.
 
 ## Status and plans
 

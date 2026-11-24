@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+# Publishes the Debian package script/build-linux-docker made
+# (target/release/yonder_<version>_amd64.deb) as a signed apt repository, so
+# Ubuntu and Debian install Yonder with `apt install yonder` and get new
+# versions with `apt upgrade`.
+#
+#   script/publish-apt [-n] [-f]
+#
+#   -n  build and sign the repository in target/apt-repo, but don't upload it.
+#   -f  publish a package that wasn't built from HEAD.
+#
+# The repository lives in the GitHub release named "apt", because Pages takes
+# files of at most 100 MB and the package is bigger. apt reads it from
+#   https://github.com/aabdlwahab/yonder/releases/download/apt/
+# as a flat repository: the package, Packages, Release, and Release signed
+# twice (InRelease and Release.gpg). Only the newest package is kept.
+#
+# The signing key lives in ~/.config/yonder/apt-signing, a GnuPG home of its
+# own, and is made there the first time. Every machine that installs Yonder
+# trusts it, so back that folder up: with a new key, those machines stop
+# accepting updates until they fetch it. The public half is
+# site/apt/yonder-archive-keyring.asc, which the site serves.
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+upload=true
+force=false
+while getopts 'nfh' flag; do
+  case "${flag}" in
+    n) upload=false ;;
+    f) force=true ;;
+    *) sed -n '3,23p' "$0"; exit 0 ;;
+  esac
+done
+
+repo="aabdlwahab/yonder"
+tag="apt"
+keyring_name="yonder-archive-keyring.asc"
+export GNUPGHOME="${YONDER_APT_GNUPGHOME:-${HOME}/.config/yonder/apt-signing}"
+
+for tool in gpg gh shasum md5 gzip; do
+  command -v "${tool}" >/dev/null || { echo "${tool} isn't installed." >&2; exit 1; }
+done
+
+shopt -s nullglob
+debs=(target/release/yonder_*_amd64.deb)
+shopt -u nullglob
+if [[ ${#debs[@]} -ne 1 ]]; then
+  echo "Expected one target/release/yonder_*_amd64.deb; script/build-linux-docker <host> makes it." >&2
+  exit 1
+fi
+deb="${debs[0]}"
+deb_name="$(basename "${deb}")"
+version="${deb_name#yonder_}"
+version="${version%_amd64.deb}"
+if [[ "${version}" == *.dirty ]]; then
+  echo "${deb_name} was built from uncommitted changes; build it from a commit to publish it." >&2
+  exit 1
+fi
+head="g$(git rev-parse --short=10 HEAD)"
+if [[ "${version}" != *".${head}" && "${force}" = false ]]; then
+  echo "${deb_name} wasn't built from HEAD (${head#g}). Rebuild it, or pass -f to publish it anyway." >&2
+  exit 1
+fi
+
+# The key: made once, then reused forever.
+if [[ ! -d "${GNUPGHOME}" ]]; then
+  mkdir -p "${GNUPGHOME}"
+  chmod 0700 "${GNUPGHOME}"
+fi
+if ! gpg --batch --list-secret-keys --with-colons 2>/dev/null | grep -q '^sec'; then
+  echo "Making the signing key in ${GNUPGHOME}. Back this folder up."
+  gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-gen-key "Yonder apt repository" ed25519 sign never
+fi
+fingerprint="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')"
+mkdir -p site/apt
+gpg --batch --armor --export "${fingerprint}" > "site/apt/${keyring_name}"
+
+# The repository.
+out="target/apt-repo"
+rm -rf "${out}"
+mkdir -p "${out}"
+cp "${deb}" "${out}/"
+cp "site/apt/${keyring_name}" "${out}/"
+
+# A flat repository's Filename is relative to the URI in sources.list
+# (.../releases/download), so it names the release folder too.
+control="$(tar -xOf "${deb}" control.tar.xz | tar -xOf - ./control | sed -e '/^[[:space:]]*$/d')"
+{
+  printf '%s\n' "${control}"
+  echo "Filename: ${tag}/${deb_name}"
+  echo "Size: $(wc -c < "${deb}" | tr -d ' ')"
+  echo "MD5sum: $(md5 -q "${deb}")"
+  echo "SHA1: $(shasum -a 1 "${deb}" | cut -d' ' -f1)"
+  echo "SHA256: $(shasum -a 256 "${deb}" | cut -d' ' -f1)"
+  echo
+} > "${out}/Packages"
+gzip -9nc "${out}/Packages" > "${out}/Packages.gz"
+
+hashes() {
+  local title="$1" command="$2"
+  echo "${title}:"
+  for file in Packages Packages.gz; do
+    printf ' %s %s %s\n' "$(${command} "${out}/${file}" | cut -d' ' -f1)" "$(wc -c < "${out}/${file}" | tr -d ' ')" "${file}"
+  done
+}
+{
+  echo "Origin: Yonder"
+  echo "Label: Yonder"
+  # apt warns unless this matches the suite in sources.list.
+  echo "Codename: ${tag}/"
+  echo "Architectures: amd64"
+  echo "Date: $(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
+  echo "Description: Yonder, the editor for code on your other machines"
+  hashes MD5Sum "md5 -r"
+  hashes SHA1 "shasum -a 1"
+  hashes SHA256 "shasum -a 256"
+} > "${out}/Release"
+gpg --batch --yes --local-user "${fingerprint}" --digest-algo SHA512 --clearsign --output "${out}/InRelease" "${out}/Release"
+gpg --batch --yes --local-user "${fingerprint}" --digest-algo SHA512 --armor --detach-sign --output "${out}/Release.gpg" "${out}/Release"
+echo "Signed the repository for yonder ${version} in ${out} (key ${fingerprint})."
+
+if [[ "${upload}" = false ]]; then
+  exit 0
+fi
+
+if ! gh release view "${tag}" -R "${repo}" >/dev/null 2>&1; then
+  gh release create "${tag}" -R "${repo}" --target main --latest=false \
+    --title "apt repository" \
+    --notes "The apt repository for Ubuntu and Debian. See https://aabdlwahab.github.io/yonder/#get for how to add it; \`apt upgrade\` then keeps Yonder current. Only the newest package is kept here."
+fi
+
+# The package first and the index after it, so the index never names a
+# package that isn't there yet. Older packages go last.
+existing="$(gh release view "${tag}" -R "${repo}" --json assets --jq '.assets[].name')"
+if ! grep -qx "${deb_name}" <<<"${existing}"; then
+  echo "Uploading ${deb_name}"
+  gh release upload "${tag}" -R "${repo}" "${out}/${deb_name}"
+fi
+gh release upload "${tag}" -R "${repo}" --clobber "${out}/Packages" "${out}/Packages.gz" "${out}/${keyring_name}"
+gh release upload "${tag}" -R "${repo}" --clobber "${out}/Release" "${out}/Release.gpg" "${out}/InRelease"
+grep -E '^yonder_.*\.deb$' <<<"${existing}" | grep -vx "${deb_name}" | while read -r old; do
+  gh release delete-asset "${tag}" "${old}" -R "${repo}" -y
+done
+
+echo "Published yonder ${version}: sudo apt update && sudo apt install yonder"
+if ! git diff --quiet -- "site/apt/${keyring_name}" 2>/dev/null || ! git ls-files --error-unmatch "site/apt/${keyring_name}" >/dev/null 2>&1; then
+  echo "site/apt/${keyring_name} changed: commit it and run script/publish-site so the site serves the key."
+fi

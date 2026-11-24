@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
 # Builds Yonder for Linux desktops in an Ubuntu 22.04 container on a machine
-# with Docker, and copies target/release/yonder-linux-x86_64.tar.gz back here.
+# with Docker, and copies target/release/yonder-linux-x86_64.tar.gz and the
+# Debian package made from it (target/release/yonder_<version>_amd64.deb)
+# back here.
 # The container has every build dependency, so the machine needs only Docker
 # (and you in its `docker` group); nothing is installed on it. Building on
 # 22.04 means the result runs on Ubuntu 22.04 and newer, on X11 or Wayland.
@@ -17,6 +19,7 @@
 #
 # Install the result on an Ubuntu machine with
 #   script/install-linux yonder-linux-x86_64.tar.gz
+# or put the package in the apt repository with script/publish-apt.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,8 +43,18 @@ if [[ -z "${host}" ]]; then
 fi
 
 commit=$(git rev-parse HEAD)
+# The package version: the app's, then the commit's time and hash, so each
+# commit sorts after the one before it and `apt upgrade` picks it up.
+# Read from Cargo.toml, since this machine needn't have cargo.
+app_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/zed/Cargo.toml | head -n 1)"
+deb_version="${app_version}+$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S).g$(git rev-parse --short=10 HEAD)"
 if [[ "${working_tree}" = true ]]; then
   commit="${commit}-dirty"
+  deb_version="${deb_version}.dirty"
+fi
+if [[ ! "${deb_version}" =~ ^[0-9][A-Za-z0-9.+~]*$ ]]; then
+  echo "Couldn't make a package version from crates/zed/Cargo.toml (got '${deb_version}')." >&2
+  exit 1
 fi
 
 remote() {
@@ -114,18 +127,19 @@ remote "
     -e CARGO_PROFILE_RELEASE_LTO=${YONDER_LINUX_LTO:-thin} \
     -v \$c/src:/src -v \$c/target:/cache/target -v \$c/cargo:/cache/cargo -v \$c/home:/cache/home \
     -w /src yonder-linux-build:22.04 \
-    bash -c 'git config --global --add safe.directory /src >/dev/null 2>&1 || true; script/bundle-linux' \
+    bash -c 'git config --global --add safe.directory /src >/dev/null 2>&1 || true; script/bundle-linux && script/bundle-linux-deb /cache/target/release/yonder-linux-\$(uname -m).tar.gz ${deb_version} /cache/target/release/deb' \
     > \$c/build.log 2>&1 || { tail -40 \$c/build.log; exit 1; }
   tail -1 \$c/build.log
 "
 
 mkdir -p target/release
+rm -f target/release/yonder_*_amd64.deb
 if [[ "${host}" == local ]]; then
-  cp ~/.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz target/release/
+  cp ~/.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz ~/.cache/yonder-linux/target/release/deb/yonder_*.deb target/release/
 else
-  scp -q -o BatchMode=yes "${host}:.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz" target/release/
+  scp -q -o BatchMode=yes "${host}:.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz" "${host}:.cache/yonder-linux/target/release/deb/yonder_*.deb" target/release/
 fi
-echo "Copied target/release/yonder-linux-x86_64.tar.gz"
+echo "Copied target/release/yonder-linux-x86_64.tar.gz and target/release/yonder_${deb_version}_amd64.deb"
 fi
 
 if [[ "${smoke}" = true ]]; then

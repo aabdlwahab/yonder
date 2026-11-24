@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+
+# Turns a Linux build (yonder-linux-<arch>.tar.gz from script/bundle-linux)
+# into a Debian package, for the apt repository script/publish-apt serves.
+# Runs on Debian or Ubuntu, or in script/build-linux-docker's container: it
+# needs dpkg-deb and objdump.
+#
+#   script/bundle-linux-deb <yonder-linux-ARCH.tar.gz> <version> [outdir]
+#
+# The package installs:
+#   /usr/lib/yonder/                  the app, as the archive has it
+#   /usr/bin/yonder                   a launcher that tells the app apt updates it
+#   /usr/share/applications, icons    the menu entry and its icon
+#
+# Only stable builds are packaged: the other channels have their own names,
+# data and menu entries, and nothing publishes them.
+
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  sed -n '3,15p' "$0"
+  exit 1
+fi
+archive="$1"
+version="$2"
+out="${3:-.}"
+
+# dpkg's rule: a leading digit, then letters, digits and . + ~ only (no '-',
+# since there's no Debian revision).
+if ! printf '%s' "${version}" | grep -qE '^[0-9][A-Za-z0-9.+~]*$'; then
+  echo "'${version}' isn't a Debian version: start with a digit, then use only letters, digits and . + ~" >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64) arch=arm64 ;;
+  *) echo "No Debian architecture for $(uname -m)." >&2; exit 1 ;;
+esac
+case "${archive}" in
+  *"-linux-$(uname -m).tar.gz") ;;
+  *) echo "${archive} isn't a build for $(uname -m)." >&2; exit 1 ;;
+esac
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+tar -xzf "${archive}" -C "${work}"
+if [[ ! -d "${work}/yonder.app" ]]; then
+  echo "${archive} doesn't hold yonder.app; only stable builds are packaged." >&2
+  exit 1
+fi
+
+root="${work}/root"
+app_id="io.github.aabdlwahab.Yonder"
+mkdir -p "${root}/usr/lib" "${root}/usr/bin" "${root}/usr/share/applications" "${root}/usr/share/doc/yonder"
+mv "${work}/yonder.app" "${root}/usr/lib/yonder"
+lib="${root}/usr/lib/yonder"
+
+# The app answers "Check for Updates" with this message instead of looking
+# for one.
+cat > "${root}/usr/bin/yonder" <<'EOF'
+#!/bin/sh
+export ZED_UPDATE_EXPLANATION="apt keeps Yonder up to date: sudo apt update && sudo apt upgrade"
+exec /usr/lib/yonder/bin/yonder "$@"
+EOF
+chmod 0755 "${root}/usr/bin/yonder"
+
+for size in 512x512 1024x1024; do
+  mkdir -p "${root}/usr/share/icons/hicolor/${size}/apps"
+  mv "${lib}/share/icons/hicolor/${size}/apps/${app_id}.png" "${root}/usr/share/icons/hicolor/${size}/apps/"
+done
+rm -rf "${lib}/share/icons"
+# The build's entry already runs `yonder` from PATH and names the icon by ID.
+mv "${lib}/share/applications/${app_id}.desktop" "${root}/usr/share/applications/"
+rmdir "${lib}/share/applications"
+chmod 0644 "${root}/usr/share/applications/${app_id}.desktop"
+cp "${lib}/licenses.md" "${root}/usr/share/doc/yonder/copyright"
+
+# What the app needs from the system. The archive carries its own copies of
+# the libraries older releases lack (lib/), so this is the rest: glibc at the
+# newest symbol version the binaries use, the GLib family it must share with
+# the system, ALSA, and what it opens at run time for drawing (Vulkan) and
+# for Wayland. SSH is how it reaches every machine. libasound2 and
+# libglib2.0-0 are also what the renamed packages on Ubuntu 24.04 and
+# Debian 13 provide.
+glibc="$(objdump -T "${lib}/libexec/yonder-editor" "${lib}/bin/yonder" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -uV | tail -n 1)"
+depends="libc6 (>= ${glibc}), libgcc-s1, libglib2.0-0, libasound2, libvulkan1, libwayland-client0, openssh-client"
+recommends="mesa-vulkan-drivers | vulkan-icd, git"
+
+installed_size="$(du -sk "${root}" | cut -f1)"
+mkdir -p "${root}/DEBIAN"
+cat > "${root}/DEBIAN/control" <<EOF
+Package: yonder
+Version: ${version}
+Architecture: ${arch}
+Maintainer: Yonder <aabdlwahab@users.noreply.github.com>
+Installed-Size: ${installed_size}
+Depends: ${depends}
+Recommends: ${recommends}
+Section: editors
+Priority: optional
+Homepage: https://aabdlwahab.github.io/yonder/
+Description: native editor for code on your other machines
+ Yonder is a code editor built on Zed. Projects, terminals and coding agents
+ run on your machines over SSH and keep running when the laptop is shut.
+EOF
+
+mkdir -p "${out}"
+deb="${out}/yonder_${version}_${arch}.deb"
+rm -f "${out}"/yonder_*_"${arch}".deb
+dpkg-deb --root-owner-group -Zxz --build "${root}" "${deb}" >/dev/null
+echo "Built ${deb}"
