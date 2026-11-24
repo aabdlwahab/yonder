@@ -28,6 +28,10 @@ fi
 git -C "${work}" read-tree --empty
 find "${work}" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 git archive HEAD site | tar -x -C "${work}" --strip-components=1
+# Browsers keep Pages files for 10 minutes; a new name per publish makes them
+# fetch the new scripts and styles straight away.
+sed -i.bak -E "s#(href|src)=\"(assets/[^\"?]+\.(css|js))\"#\1=\"\2?v=${commit}\"#g" "${work}/index.html"
+rm -f "${work}/index.html.bak"
 
 git -C "${work}" add -A
 if git -C "${work}" diff --cached --quiet; then
