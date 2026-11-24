@@ -868,9 +868,13 @@ mod linux {
                 let dir = cli.parent().context("no parent path for cli")?;
 
                 // libexec is the standard, lib/zed is for Arch (and other non-libexec distros),
-                // ./zed is for the target directory in development builds.
-                let possible_locations =
-                    ["../libexec/zed-editor", "../lib/zed/zed-editor", "./zed"];
+                // ./yonder is for the target directory in development builds.
+                let possible_locations = [
+                    "../libexec/yonder-editor",
+                    "../libexec/zed-editor",
+                    "../lib/zed/zed-editor",
+                    "./yonder",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))

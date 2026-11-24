@@ -282,17 +282,23 @@ pub struct Program {
 }
 
 /// The program for `platform` (`linux-x86_64`, `macos-aarch64` …) that this
-/// app can install, if it has one: the copy inside the app bundle, else one
-/// left in `remote_servers/yonder/<platform>/` of Yonder's data folder. A Mac
-/// of this Mac's kind gets this app's own binary.
+/// app can install, if it has one: the copy inside the app (in
+/// `Contents/Resources/machines/` of the Mac app, or `share/yonder/machines/`
+/// of the Linux one), else one left in `remote_servers/yonder/<platform>/` of
+/// Yonder's data folder. A Mac of this Mac's kind gets this app's own binary.
 pub fn carried_program(platform: &str) -> Option<Program> {
     let exe = std::env::current_exe().ok()?;
-    let bundle = exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|contents| contents.join("Resources").join("machines").join(platform));
+    let bundle = exe.parent().and_then(Path::parent).map(|root| {
+        [
+            root.join("Resources").join("machines").join(platform),
+            root.join("share")
+                .join("yonder")
+                .join("machines")
+                .join(platform),
+        ]
+    });
     let data = paths::remote_servers_dir().join("yonder").join(platform);
-    for directory in bundle.into_iter().chain([data]) {
+    for directory in bundle.into_iter().flatten().chain([data]) {
         let path = directory.join("yonder.gz");
         if path.is_file() {
             let version = std::fs::read_to_string(directory.join("yonder.version"))
@@ -306,7 +312,9 @@ pub fn carried_program(platform: &str) -> Option<Program> {
             });
         }
     }
-    if platform == this_platform() {
+    // A Linux desktop binary needs display libraries that servers don't have,
+    // so only a Mac's own binary doubles as a machine's program.
+    if cfg!(target_os = "macos") && platform == this_platform() {
         return Some(Program {
             path: exe,
             compressed: false,

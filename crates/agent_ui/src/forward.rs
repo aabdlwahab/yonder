@@ -30,7 +30,11 @@ use crate::{
 };
 
 const FORWARD_LINKS_KEY: &str = "agent_forward_links";
-const LOCAL_MACHINE_LABEL: &str = "This Mac";
+const LOCAL_MACHINE_LABEL: &str = if cfg!(target_os = "macos") {
+    "This Mac"
+} else {
+    "This Computer"
+};
 
 /// Opens a thread wherever it lives: its own project, machine and window.
 /// The threads sidebar knows how to do that, and it depends on this crate, so

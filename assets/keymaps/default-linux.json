@@ -647,6 +647,7 @@
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],
       "alt-ctrl-o": "projects::OpenRecent",
+      "ctrl-alt-k": "fleet_panel::OpenSwitcher",
       "ctrl-r": "projects::OpenRecent",
       "alt-shift-open": ["projects::OpenRemote", { "from_existing_connection": false }],
       // Change to open path modal for existing remote connection by setting the parameter

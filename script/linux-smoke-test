@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+
+# Starts a built Yonder on a virtual X display and saves screenshots, so a Linux
+# build can be looked at without a Linux desktop. script/build-linux-docker -t
+# runs it inside its container; it needs Xvfb, xdotool, ImageMagick and a
+# Vulkan driver (Mesa's software one is enough).
+#
+#   script/linux-smoke-test <yonder.app folder> <output folder>
+
+set -uo pipefail
+
+app="$1"
+out="$2"
+mkdir -p "${out}"
+
+export DISPLAY=:91
+Xvfb "${DISPLAY}" -screen 0 1440x900x24 +extension Present +extension GLX -nolisten tcp >/dev/null 2>&1 &
+xvfb=$!
+trap 'kill "${editor:-}" "${xvfb}" 2>/dev/null' EXIT
+sleep 2
+
+dbus-run-session -- "${app}/libexec/yonder-editor" >"${out}/app.log" 2>&1 &
+editor=$!
+
+# Yonder's window: the first visible one that belongs to the editor process
+# (dbus-run-session is its parent, so look at its children too).
+window=""
+for _ in $(seq 1 60); do
+  for pid in "${editor}" $(pgrep -P "${editor}"); do
+    window=$(xdotool search --onlyvisible --pid "${pid}" 2>/dev/null | head -n 1)
+    [[ -n "${window}" ]] && break 2
+  done
+  sleep 1
+done
+if [[ -z "${window}" ]]; then
+  echo "No Yonder window appeared; see ${out}/app.log" >&2
+  exit 1
+fi
+echo "window ${window}: $(xdotool getwindowname "${window}" 2>/dev/null)"
+sleep 12
+
+# The window has a 32-bit visual; with no compositor the root window shows it
+# black, so capture the window itself.
+shot() {
+  timeout 20 import -window "${window}" "${out}/$1.png" && echo "saved $1.png"
+}
+
+shot 1-window
+xdotool windowactivate --sync "${window}" 2>/dev/null
+xdotool key --window "${window}" --clearmodifiers ctrl+alt+k
+sleep 3
+shot 2-switcher
+xdotool key --window "${window}" Escape
+xdotool key --window "${window}" --clearmodifiers ctrl+comma
+sleep 6
+# Settings opens its own window.
+settings=$(xdotool search --onlyvisible --pid "$(pgrep -P "${editor}" | head -n 1)" 2>/dev/null | grep -v "^${window}$" | head -n 1)
+if [[ -n "${settings}" ]]; then
+  window="${settings}"
+  shot 3-settings
+fi

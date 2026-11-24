@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+
+# Builds Yonder for Linux desktops in an Ubuntu 22.04 container on a machine
+# with Docker, and copies target/release/yonder-linux-x86_64.tar.gz back here.
+# The container has every build dependency, so the machine needs only Docker
+# (and you in its `docker` group); nothing is installed on it. Building on
+# 22.04 means the result runs on Ubuntu 22.04 and newer, on X11 or Wayland.
+#
+#   script/build-linux-docker [-w] [-t] [HOST]
+#
+#   HOST  an SSH host with Docker (default: $YONDER_LINUX_BUILD_HOST), or
+#         "local" to use Docker on this machine.
+#   -w    send the working tree, uncommitted changes included, instead of HEAD.
+#   -t    afterwards, start the app on a virtual display in the container and
+#         save screenshots to target/linux-smoke/.
+#   -r    skip sending and building; reuse the last build there (with -t).
+#
+# Install the result on an Ubuntu machine with
+#   script/install-linux yonder-linux-x86_64.tar.gz
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+working_tree=false
+smoke=false
+reuse=false
+while getopts 'wtrh' flag; do
+  case "${flag}" in
+    w) working_tree=true ;;
+    t) smoke=true ;;
+    r) reuse=true ;;
+    *) sed -n '3,19p' "$0"; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+host="${1:-${YONDER_LINUX_BUILD_HOST:-}}"
+if [[ -z "${host}" ]]; then
+  echo "Name a Linux machine with Docker, or set YONDER_LINUX_BUILD_HOST." >&2
+  exit 1
+fi
+
+commit=$(git rev-parse HEAD)
+if [[ "${working_tree}" = true ]]; then
+  commit="${commit}-dirty"
+fi
+
+remote() {
+  if [[ "${host}" == local ]]; then
+    bash -c "$1"
+  else
+    ssh -o BatchMode=yes "${host}" "$1"
+  fi
+}
+
+send_source() {
+  if [[ "${working_tree}" = true ]]; then
+    git ls-files -co --exclude-standard -z | while IFS= read -r -d '' file; do
+      [[ -e "${file}" ]] && printf '%s\0' "${file}"
+    done | COPYFILE_DISABLE=1 tar --null -T - -cf - 2>/dev/null
+  else
+    git archive --format=tar HEAD
+  fi
+}
+
+# The image: Zed's Ubuntu build dependencies, the pinned Rust toolchain with
+# everything rust-toolchain.toml asks for, cargo-about for the license list,
+# and what the smoke test needs to draw without a GPU (Xvfb and Mesa's
+# software Vulkan).
+read -r -d '' dockerfile <<'EOF' || true
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc g++ libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev \
+      libva-dev libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev \
+      make cmake clang lld llvm jq git curl ca-certificates gettext-base elfutils \
+      libsqlite3-dev musl-tools musl-dev build-essential libstdc++-12-dev pkg-config file \
+      xvfb xauth mesa-vulkan-drivers libegl1 libgl1 dbus-x11 xdotool imagemagick \
+      fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && rustup toolchain install 1.98.1 --profile minimal \
+         -c rustfmt,clippy,rust-analyzer,rust-src,llvm-tools \
+         -t wasm32-wasip2,wasm32-unknown-unknown,x86_64-unknown-linux-musl \
+    && rustup default 1.98.1 \
+    && cargo install --locked cargo-about@0.8.2 \
+    && rm -rf /opt/cargo/registry /opt/cargo/git \
+    && chmod -R a+rX /opt/rustup /opt/cargo
+# Rust's own llvm-objcopy, which understands everything rustc's LLVM writes.
+ENV PATH=/opt/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin:$PATH
+EOF
+
+if [[ "${reuse}" = false ]]; then
+echo "Sending the source (${commit}) to ${host}"
+remote 'rm -rf ~/.cache/yonder-linux/src && mkdir -p ~/.cache/yonder-linux/src ~/.cache/yonder-linux/target ~/.cache/yonder-linux/cargo ~/.cache/yonder-linux/home'
+if [[ "${host}" == local ]]; then
+  send_source | tar -x -C ~/.cache/yonder-linux/src
+else
+  send_source | gzip -1 | ssh -o BatchMode=yes "${host}" 'tar -xzf - -C ~/.cache/yonder-linux/src'
+fi
+
+echo "Building the image (cached after the first time)"
+printf '%s\n' "${dockerfile}" | remote 'docker build -q -t yonder-linux-build:22.04 - >/dev/null'
+
+echo "Building Yonder for Linux"
+remote "
+  set -e
+  c=\$HOME/.cache/yonder-linux
+  docker run --rm --user \$(id -u):\$(id -g) \
+    -e HOME=/cache/home -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target \
+    -e PATH=/cache/cargo/bin:/opt/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin:/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    -e RUSTUP_HOME=/opt/rustup \
+    -e ZED_RELEASE_CHANNEL=stable -e ZED_COMMIT_SHA=${commit} \
+    -e CARGO_PROFILE_RELEASE_LTO=${YONDER_LINUX_LTO:-thin} \
+    -v \$c/src:/src -v \$c/target:/cache/target -v \$c/cargo:/cache/cargo -v \$c/home:/cache/home \
+    -w /src yonder-linux-build:22.04 \
+    bash -c 'git config --global --add safe.directory /src >/dev/null 2>&1 || true; script/bundle-linux' \
+    > \$c/build.log 2>&1 || { tail -40 \$c/build.log; exit 1; }
+  tail -1 \$c/build.log
+"
+
+mkdir -p target/release
+if [[ "${host}" == local ]]; then
+  cp ~/.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz target/release/
+else
+  scp -q -o BatchMode=yes "${host}:.cache/yonder-linux/target/release/yonder-linux-x86_64.tar.gz" target/release/
+fi
+echo "Copied target/release/yonder-linux-x86_64.tar.gz"
+fi
+
+if [[ "${smoke}" = true ]]; then
+  echo "Starting it on a virtual display"
+  remote "
+    set -e
+    c=\$HOME/.cache/yonder-linux
+    rm -rf \$c/smoke && mkdir -p \$c/smoke/home/.config/yonder
+    tar -xzf \$c/target/release/yonder-linux-x86_64.tar.gz -C \$c/smoke
+    cat > \$c/smoke/home/.config/yonder/settings.json <<'JSON'
+{
+  \"ssh_connections\": [
+    { \"host\": \"build-box.example.com\", \"nickname\": \"build-box\", \"projects\": [{ \"paths\": [\"~/api\"] }, { \"paths\": [\"~/web\"] }] },
+    { \"host\": \"gpu-a.example.com\", \"nickname\": \"gpu-a\", \"projects\": [{ \"paths\": [\"~/trainer\"] }] }
+  ]
+}
+JSON
+    cp ~/.cache/yonder-linux/src/script/linux-smoke-test \$c/smoke/
+    docker run --rm --user \$(id -u):\$(id -g) -e HOME=/smoke/home -e USER=\$(id -un) \
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v \$c/smoke:/smoke yonder-linux-build:22.04 \
+      timeout 180 /smoke/linux-smoke-test /smoke/yonder.app /smoke/shots || true
+    ls \$c/smoke/shots/
+  "
+  mkdir -p target/linux-smoke
+  if [[ "${host}" == local ]]; then
+    cp ~/.cache/yonder-linux/smoke/shots/* target/linux-smoke/
+  else
+    scp -q -o BatchMode=yes "${host}:.cache/yonder-linux/smoke/shots/*" target/linux-smoke/
+  fi
+  echo "Screenshots in target/linux-smoke/"
+fi

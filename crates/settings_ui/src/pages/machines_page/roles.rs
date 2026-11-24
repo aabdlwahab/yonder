@@ -309,7 +309,8 @@ impl MachinesPage {
                 let message = match saved {
                     Err(error) => Action::Failed(
                         format!(
-                            "The hub runs on {name}, but its token couldn't go in your Keychain: {error:#}"
+                            "The hub runs on {name}, but its token couldn't go in your {}: {error:#}",
+                            agent_servers::TOKEN_STORE_NAME
                         )
                         .into(),
                     ),

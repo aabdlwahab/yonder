@@ -45,17 +45,20 @@ Fleet reads machine names from `ssh_connections`. You can also save folders for 
 
 Open a folder over SSH to add it to Fleet. See [Remote Development](./docs/src/remote-development.md) for the full connection options, such as ports, SSH arguments and port forwards.
 
-## Building
+## Building and installing
 
-Yonder builds the same way as Zed. Follow the upstream guides:
+Yonder runs on macOS and on Ubuntu (22.04 and newer, Wayland or X11). It builds the same way as Zed, so set up Rust and the system packages with the upstream guides first:
 
 - [Building on macOS](./docs/src/development/macos.md)
-- [Building on Linux](./docs/src/development/linux.md)
-- [Building on Windows](./docs/src/development/windows.md)
+- [Building on Linux](./docs/src/development/linux.md) (`script/linux` installs the packages)
 
-`cargo run` starts a development build of the `yonder` binary. `script/bundle-mac` packages a macOS app named Yonder and a `Yonder-<arch>.dmg`.
+Then:
 
-There are no Yonder release downloads yet.
+- **Mac:** `script/install-mac` builds a release, signs it for this Mac and installs `/Applications/Yonder.app`. Add `-l <ssh host>` to also build the program for Linux machines on one of them and carry it inside the app.
+- **Ubuntu:** `script/install-linux` builds a release and installs it in `~/.local/yonder.app`, with `~/.local/bin/yonder` and a menu entry. It needs no sudo.
+- **Ubuntu without build tools:** `script/build-linux-docker <host>` builds `yonder-linux-x86_64.tar.gz` in an Ubuntu 22.04 container on any machine with Docker, and `script/install-linux yonder-linux-x86_64.tar.gz` installs it.
+
+`cargo run` starts a development build of the `yonder` binary. There are no Yonder release downloads yet.
 
 ## Status and plans
 

@@ -261,9 +261,10 @@ fn handle_rpc_messages_over_child_process_stdio(
 /// A prebuilt server on this computer for `platform`, if there is one. In
 /// order:
 ///
-/// - the `yonder` program the app bundle carries, in
-///   `Contents/Resources/machines/<os>-<arch>/yonder.gz`, built from the same
-///   commit as the app;
+/// - the `yonder` program the app carries, in
+///   `Contents/Resources/machines/<os>-<arch>/yonder.gz` of the Mac app or
+///   `share/yonder/machines/<os>-<arch>/yonder.gz` of the Linux one, built from
+///   the same commit as the app;
 /// - one kept in `remote_servers/yonder/<os>-<arch>/` inside Yonder's data
 ///   folder (for example `linux-x86_64/zed-remote-server-dev-build.gz`);
 /// - for a Mac like this one, the app's own binary, which does the server's
@@ -276,15 +277,16 @@ pub(crate) fn bundled_server_binary(
 ) -> Option<std::path::PathBuf> {
     let platform_name = format!("{}-{}", platform.os.as_str(), platform.arch.as_str());
     let exe = std::env::current_exe().ok();
+    // The Mac app carries it in Contents/Resources, the Linux one in share/yonder.
     let bundle = exe
         .as_deref()
         .and_then(|exe| exe.parent()?.parent())
-        .map(|contents| {
-            contents
-                .join("Resources")
-                .join("machines")
-                .join(&platform_name)
-                .join("yonder.gz")
+        .map(|root| {
+            [
+                root.join("Resources").join("machines"),
+                root.join("share").join("yonder").join("machines"),
+            ]
+            .map(|machines| machines.join(&platform_name).join("yonder.gz"))
         });
     let directory = paths::remote_servers_dir()
         .join("yonder")
@@ -294,6 +296,7 @@ pub(crate) fn bundled_server_binary(
     });
     bundle
         .into_iter()
+        .flatten()
         .chain([
             directory.join(format!("{binary_name}.gz")),
             directory.join(binary_name),

@@ -737,7 +737,11 @@ impl MachinesPage {
             let result = agent_servers::write_hub_token(&address, &token_text, cx).await;
             this.update(cx, |this, cx| {
                 this.hub_message = Some(match &result {
-                    Ok(()) => "Saved. The token is in your Keychain.".into(),
+                    Ok(()) => format!(
+                        "Saved. The token is in your {}.",
+                        agent_servers::TOKEN_STORE_NAME
+                    )
+                    .into(),
                     Err(error) => format!("Couldn't save the token: {error:#}").into(),
                 });
                 agent_servers::HubBoard::refresh(cx);

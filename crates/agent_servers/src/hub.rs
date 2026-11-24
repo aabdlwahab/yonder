@@ -289,6 +289,14 @@ pub fn route_for(
     })
 }
 
+/// Where the hub's token is kept, as people know it on this system: the
+/// macOS Keychain, or the Secret Service keyring on Linux.
+pub const TOKEN_STORE_NAME: &str = if cfg!(target_os = "macos") {
+    "Keychain"
+} else {
+    "keyring"
+};
+
 fn keychain_url(address: &str) -> String {
     format!("yonder-hub://{address}")
 }

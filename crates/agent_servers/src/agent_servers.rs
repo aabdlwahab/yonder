@@ -33,8 +33,8 @@ pub use acp::{
 pub use claude_session::copy_claude_session;
 pub use hub::{
     DISPATCH_AGENT_ID, DISPATCH_CONVERSATIONS_METHOD, DISPATCH_MACHINE, HubAgentServer, HubBoard,
-    HubRoute, HubSettings, HubStatus, call_hub, is_dispatch, machine_name, read_hub_token,
-    route_for, write_hub_token,
+    HubRoute, HubSettings, HubStatus, TOKEN_STORE_NAME, call_hub, is_dispatch, machine_name,
+    read_hub_token, route_for, write_hub_token,
 };
 
 pub struct AgentServerDelegate {

@@ -646,6 +646,7 @@
       // "ctrl-alt-o": ["projects::OpenRecent", { "create_new_window": true }],
       "f11": "zed::ToggleFullScreen",
       "ctrl-r": "projects::OpenRecent",
+      "ctrl-alt-k": "fleet_panel::OpenSwitcher",
       // Change to open path modal for existing remote connection by setting the parameter
       // "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": true }],
       "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false }],

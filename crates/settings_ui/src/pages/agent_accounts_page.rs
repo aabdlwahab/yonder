@@ -19,7 +19,11 @@ const CLAUDE_AGENT: &str = "claude-acp";
 const CODEX_AGENT: &str = "codex-acp";
 const DEFAULT_CLAUDE_DIR: &str = "~/.claude";
 const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
-const LOCAL_MACHINE: &str = "This Mac";
+const LOCAL_MACHINE: &str = if cfg!(target_os = "macos") {
+    "This Mac"
+} else {
+    "This Computer"
+};
 
 pub(crate) fn render_agent_accounts_page(
     settings_window: &SettingsWindow,
@@ -534,9 +538,7 @@ impl AgentAccountsPage {
                         "Signed in".to_string(),
                         Some(format!("Sign-in last refreshed {date}")),
                     ),
-                    (_, Some(email)) => {
-                        status(Color::Success, email.clone(), Some(email.clone()))
-                    }
+                    (_, Some(email)) => status(Color::Success, email.clone(), Some(email.clone())),
                     (_, None) => status(Color::Success, "Signed in".to_string(), None),
                 },
                 _ if account.sign_in_command().is_none() => {

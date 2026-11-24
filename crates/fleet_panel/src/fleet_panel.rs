@@ -70,7 +70,11 @@ const PREWARM_HOVER_DELAY: Duration = Duration::from_millis(250);
 
 /// The laptop itself, listed above the SSH machines.
 const LOCAL_MACHINE_KEY: &str = "local";
-const LOCAL_MACHINE_LABEL: &str = "This Mac";
+const LOCAL_MACHINE_LABEL: &str = if cfg!(target_os = "macos") {
+    "This Mac"
+} else {
+    "This Computer"
+};
 /// Past projects listed per machine, after the open ones. High enough that a
 /// machine's whole project history fits; machines can be collapsed.
 const RECENT_PROJECTS_PER_MACHINE: usize = 50;

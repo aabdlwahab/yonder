@@ -1,22 +1,68 @@
 #!/usr/bin/env bash
 
-set -euxo pipefail
+# Installs Yonder for this Linux user in ~/.local: the app in ~/.local/yonder.app,
+# the `yonder` command in ~/.local/bin, and a menu entry. Needs no sudo.
+#
+#   script/install-linux                              build, then install
+#   script/install-linux yonder-linux-x86_64.tar.gz   install a build made
+#                                                     elsewhere (for example by
+#                                                     script/build-linux-docker)
 
-if [[ $# -gt 0 ]]; then
-  echo "
-  Usage: ${0##*/}
-  Builds and installs zed onto your system into ~/.local, making it available as ~/.local/bin/zed.
+set -euo pipefail
 
-  Before running this you should ensure you have all the build dependencies installed with `./script/linux`.
-  "
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -gt 1 ]]; then
+  echo "Usage: ${0##*/} [yonder-linux-<arch>.tar.gz]"
+  exit 0
+fi
+
+cd "$(dirname "$0")/.."
+
+archive="${1:-}"
+if [[ -z "${archive}" ]]; then
+  # Stable gives the app its own name, menu entry and data, apart from dev builds.
+  ZED_RELEASE_CHANNEL=stable script/bundle-linux
+  archive="${CARGO_TARGET_DIR:-target}/release/yonder-linux-$(uname -m).tar.gz"
+fi
+archive="$(cd "$(dirname "${archive}")" && pwd)/$(basename "${archive}")"
+
+staging="$(mktemp -d "${TMPDIR:-/tmp}/yonder-install-XXXXXX")"
+trap 'rm -rf "${staging}"' EXIT
+tar -xzf "${archive}" -C "${staging}"
+app_name="$(ls "${staging}" | grep -E '^yonder(-[a-z]+)?\.app$' | head -n 1)"
+if [[ -z "${app_name}" ]]; then
+  echo "${archive} doesn't hold a yonder*.app folder." >&2
   exit 1
 fi
-export ZED_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
-export ZED_UPDATE_EXPLANATION="You need to fetch and rebuild zed in $(pwd)"
-script/bundle-linux
 
-arch="$(uname -m)"
-commit=$(git rev-parse HEAD | cut -c 1-7)
-archive="zed-linux-${arch}.tar.gz"
-export ZED_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
-script/install.sh
+# Replace the previous install in one move, so a running Yonder keeps its files
+# until it's restarted.
+app="${HOME}/.local/${app_name}"
+mkdir -p "${HOME}/.local/bin" "${HOME}/.local/share/applications"
+if [[ -d "${app}" ]]; then
+  rm -rf "${app}.previous"
+  mv "${app}" "${app}.previous"
+fi
+mv "${staging}/${app_name}" "${app}"
+
+ln -sf "${app}/bin/yonder" "${HOME}/.local/bin/yonder"
+
+# The menu entry, pointed at this install by absolute path.
+for entry in "${app}"/share/applications/*.desktop; do
+  app_id="$(basename "${entry}" .desktop)"
+  icon="$(ls "${app}"/share/icons/hicolor/512x512/apps/*.png | head -n 1)"
+  sed -e "s|^TryExec=.*|TryExec=${app}/bin/yonder|" \
+      -e "s|^Exec=yonder|Exec=${app}/bin/yonder|" \
+      -e "s|^Icon=.*|Icon=${icon}|" \
+      "${entry}" > "${HOME}/.local/share/applications/${app_id}.desktop"
+  chmod +x "${HOME}/.local/share/applications/${app_id}.desktop"
+done
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
+fi
+rm -rf "${app}.previous"
+
+echo "Installed Yonder in ${app}."
+case ":${PATH}:" in
+  *":${HOME}/.local/bin:"*) echo "Start it from your app menu, or run 'yonder'." ;;
+  *) echo "Start it from your app menu, or run ~/.local/bin/yonder (add ~/.local/bin to PATH to use 'yonder')." ;;
+esac
