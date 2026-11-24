@@ -142,7 +142,7 @@ if ! grep -qx "${deb_name}" <<<"${existing}"; then
 fi
 gh release upload "${tag}" -R "${repo}" --clobber "${out}/Packages" "${out}/Packages.gz" "${out}/${keyring_name}"
 gh release upload "${tag}" -R "${repo}" --clobber "${out}/Release" "${out}/Release.gpg" "${out}/InRelease"
-grep -E '^yonder_.*\.deb$' <<<"${existing}" | grep -vx "${deb_name}" | while read -r old; do
+for old in $(grep -E '^yonder_.*\.deb$' <<<"${existing}" | grep -vx "${deb_name}" || true); do
   gh release delete-asset "${tag}" "${old}" -R "${repo}" -y
 done
 
