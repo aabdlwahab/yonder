@@ -595,7 +595,7 @@ impl PickerDelegate for ForwardPickerDelegate {
                     .thread_view
                     .update(cx, |view, cx| {
                         if exact {
-                            view.resume_claude_account(agent, window, cx)
+                            view.switch_agent(agent, window, cx)
                         } else {
                             view.fork_conversation(agent, None, false, window, cx)
                         }

@@ -61,6 +61,17 @@ use super::subagent_card::{
 };
 use super::*;
 
+fn switch_agent_label(agent: &AgentId) -> SharedString {
+    match agent.as_ref() {
+        "codex-acp" => "Codex".into(),
+        "claude-acp" => "Claude · Default".into(),
+        id => match project::agent_server_store::account_for_agent(id) {
+            Some(account) => format!("Claude · {account}").into(),
+            None => agent.0.clone(),
+        },
+    }
+}
+
 /// How a parent's view names a subagent. An ACP parent's own title for the subagent
 /// describes it in that view, so it wins over the subagent's title for itself.
 pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
@@ -742,6 +753,7 @@ pub struct ThreadView {
     pub agent_icon_from_external_svg: Option<SharedString>,
     pub agent_id: AgentId,
     pub agent_display_name: SharedString,
+    switching_agent: bool,
     /// Whether this Claude thread was last asked to connect to Remote Control.
     remote_control_on: bool,
     pub focus_handle: FocusHandle,
@@ -1302,6 +1314,7 @@ impl ThreadView {
             agent_icon_from_external_svg,
             agent_id,
             agent_display_name,
+            switching_agent: false,
             remote_control_on: false,
             workspace,
             entry_view_state,
@@ -2236,6 +2249,9 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switching_agent {
+            return;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!(
@@ -5767,6 +5783,7 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .children(self.render_agent_switcher(cx))
                                     .children(self.render_activity_status_label(cx))
                                     .children(self.render_guest_recipient_label(cx))
                                     .children(discard_draft_button)
@@ -6804,7 +6821,14 @@ impl ThreadView {
         let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating && !is_tagged;
         let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
 
-        if self.is_loading_contents {
+        if self.switching_agent {
+            div()
+                .id("switching-agent")
+                .px_1()
+                .tooltip(Tooltip::text("Switching Agents…"))
+                .child(loading_contents_spinner(IconSize::default()))
+                .into_any_element()
+        } else if self.is_loading_contents {
             div()
                 .id("loading-message-content")
                 .px_1()
@@ -7813,12 +7837,12 @@ impl ThreadView {
             && registry_id(agent_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
     }
 
-    pub(crate) fn resume_claude_account(&self, agent_id: AgentId, window: &Window, cx: &mut App) {
+    pub(crate) fn switch_agent(&self, agent_id: AgentId, window: &Window, cx: &mut App) {
         let conversation = self.server_view.clone();
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
             let result = conversation.update(cx, |conversation, cx| {
-                conversation.resume_claude_account(agent_id, window, cx)
+                conversation.switch_agent(agent_id, window, cx)
             });
             if let Err(error) = result.and_then(|result| result) {
                 workspace
@@ -7826,6 +7850,119 @@ impl ThreadView {
                     .log_err();
             }
         });
+    }
+
+    pub(super) fn set_switching_agent(&mut self, switching: bool, cx: &mut Context<Self>) {
+        self.switching_agent = switching;
+        cx.notify();
+    }
+
+    fn render_agent_switcher(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.thread.read(cx);
+        let registry_id = project::agent_server_store::registry_id_for_agent;
+        let is_claude = registry_id(self.agent_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID;
+        let hub = crate::hub_sync::HubSync::try_global(cx);
+        let hub = hub
+            .as_ref()
+            .map(|hub| hub.read(cx))
+            .filter(|hub| hub.route(thread.project().read(cx), cx).is_some());
+        if !is_claude && !(hub.is_some() && self.agent_id.as_ref() == "codex-acp") {
+            return None;
+        }
+        let hub_agents = hub.and_then(|hub| hub.thread_agents());
+        let mut agents: Vec<_> = self
+            .fork_targets(cx)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| {
+                registry_id(id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
+                    || (hub.is_some() && id.as_ref() == "codex-acp")
+            })
+            .collect();
+        for id in hub_agents.into_iter().flatten() {
+            if !agents
+                .iter()
+                .any(|candidate| candidate.as_ref() == id.as_str())
+            {
+                agents.push(AgentId(id.clone().into()));
+            }
+        }
+        if !agents.contains(&self.agent_id) {
+            agents.push(self.agent_id.clone());
+        }
+        agents.sort_by(|left, right| {
+            (left.as_ref() == "codex-acp", left.as_ref())
+                .cmp(&(right.as_ref() == "codex-acp", right.as_ref()))
+        });
+        let current = self.agent_id.clone();
+        let title = switch_agent_label(&current);
+        let busy = !thread.is_idle_for_retention()
+            || !self.message_queue.is_empty()
+            || self.is_loading_contents;
+        let is_draft = thread.is_draft_thread();
+        let has_hub = hub.is_some();
+        let hub_agents = hub_agents.map(<[String]>::to_vec);
+        let view = cx.weak_entity();
+        let trigger = ButtonLike::new("agent-selector-trigger")
+            .disabled(self.switching_agent)
+            .child(Label::new(title).size(LabelSize::Small))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            );
+        Some(
+            PopoverMenu::new("agent-selector")
+                .trigger_with_tooltip(trigger, Tooltip::text("Switch Agent in This Chat"))
+                .menu(move |window, cx| {
+                    Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                        menu = menu.header(if is_draft {
+                            "Send a message before switching agents"
+                        } else if busy {
+                            "Wait for the current reply before switching"
+                        } else {
+                            "Reply with"
+                        });
+                        for id in &agents {
+                            let selected = &current == id;
+                            let mut name = switch_agent_label(id);
+                            let available = hub_agents.as_ref().is_some_and(|agents| {
+                                agents.iter().any(|agent| agent == id.as_ref())
+                            });
+                            if has_hub && !selected && !available {
+                                let reason = if hub_agents.is_some() {
+                                    "Setup needed"
+                                } else {
+                                    "Update hub"
+                                };
+                                name = format!("{name} · {reason}").into();
+                            }
+                            let view = view.clone();
+                            let id = id.clone();
+                            menu.push_item(
+                                ContextMenuEntry::new(name)
+                                    .toggleable(IconPosition::End, selected)
+                                    .disabled(
+                                        selected || is_draft || busy || (has_hub && !available),
+                                    )
+                                    .handler(move |window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.switch_agent(id.clone(), window, cx)
+                                        })
+                                        .log_err();
+                                    }),
+                            );
+                        }
+                        menu.separator().action(
+                            "Manage Agent Accounts…",
+                            Box::new(zed_actions::OpenSettingsPage {
+                                page: "Agent Accounts".into(),
+                                target: Some(zed_actions::OpenSettingsAtTarget::User),
+                            }),
+                        )
+                    }))
+                }),
+        )
     }
 
     /// Starts a new thread on `agent_id` from this conversation up to and including
@@ -8611,6 +8748,16 @@ impl ThreadView {
                 is_subagent_output: _,
             }) => {
                 let mut is_blank = true;
+                let author = chunks
+                    .iter()
+                    .find_map(|chunk| {
+                        let meta = match chunk {
+                            AssistantMessageChunk::Message { meta, .. }
+                            | AssistantMessageChunk::Thought { meta, .. } => meta,
+                        };
+                        meta.as_ref()?.get("yonder/agent")?.as_str()
+                    })
+                    .map(|id| switch_agent_label(&AgentId::new(id)));
 
                 let message_body = v_flex()
                     .w_full()
@@ -8666,14 +8813,26 @@ impl ThreadView {
                                 .border_l_2()
                                 .border_color(cx.theme().colors().text_accent)
                                 .child(
-                                    Label::new(self.agent_display_name.clone())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    Label::new(
+                                        author
+                                            .clone()
+                                            .unwrap_or_else(|| self.agent_display_name.clone()),
+                                    )
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                                 )
                                 .child(message_body)
                                 .into_any_element()
                         } else {
-                            message_body
+                            v_flex()
+                                .gap_1()
+                                .children(author.map(|author| {
+                                    Label::new(author)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                }))
+                                .child(message_body)
+                                .into_any_element()
                         })
                         .when_some(
                             self.entry_view_state

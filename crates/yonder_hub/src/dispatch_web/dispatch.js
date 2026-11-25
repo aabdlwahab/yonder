@@ -922,12 +922,12 @@ function createNotes(text, label) {
   return notes;
 }
 
-function createMessage({ role, text }, conversation = false) {
+function createMessage({ role, text, agent }, conversation = false) {
   const viaDispatch = role === 'user' && text.startsWith(DISPATCH_PREFIX);
   const message = element('div', 'message');
   message.dataset.role = role;
   if (viaDispatch) message.dataset.via = 'dispatch';
-  const assistant = conversation ? 'Dispatch' : 'Agent';
+  const assistant = conversation ? 'Dispatch' : agentName(agent) || 'Agent';
   const who = role === 'user' ? (viaDispatch ? 'You, via Dispatch' : 'You') : assistant;
   message.append(
     element('span', 'message-who', who),

@@ -1009,6 +1009,7 @@ impl AcpV2Connection {
         work_dirs: PathList,
         title: Option<SharedString>,
         replay_history: bool,
+        switch_from: Option<AgentId>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         if is_connection_closed(&self.connection) {
@@ -1047,43 +1048,70 @@ impl AcpV2Connection {
             closing,
         )) = existing
         {
-            if closing {
-                return Task::ready(Err(anyhow!("Session is closing")));
-            }
-            if let Some(thread) = thread.upgrade() {
-                if previous_context != context || project_entity_id != project.entity_id() {
-                    return Task::ready(Err(anyhow!(
-                        "Session is already open with a different context"
-                    )));
+            if switch_from.is_some() && initialization.is_none() && !closing {
+                // A previous turn in this Yonder thread used this connection.
+                // Its provider session has since been superseded by the hub.
+                self.remove_session(&session_id, thread.entity_id());
+            } else {
+                if closing {
+                    return Task::ready(Err(anyhow!("Session is closing")));
                 }
-                if replay_history && !history_loaded {
-                    return Task::ready(Err(anyhow!(
-                        "Cannot replay history into an already resumed session"
-                    )));
-                }
-                return match initialization {
-                    Some(initialization) => Self::initialized_thread(thread, initialization, cx),
-                    None => Task::ready(Ok(thread)),
-                };
-            }
-            if let Some(initialization) = initialization {
-                return cx.spawn(async move |cx| {
-                    if let Err(error) = initialization.task.await {
-                        log::debug!("Abandoned session initialization ended: {error:#}");
+                if let Some(thread) = thread.upgrade() {
+                    if previous_context != context || project_entity_id != project.entity_id() {
+                        return Task::ready(Err(anyhow!(
+                            "Session is already open with a different context"
+                        )));
                     }
-                    cx.update(|cx| {
-                        self.open_session(session_id, project, work_dirs, title, replay_history, cx)
-                    })
-                    .await
-                });
+                    if replay_history && !history_loaded {
+                        return Task::ready(Err(anyhow!(
+                            "Cannot replay history into an already resumed session"
+                        )));
+                    }
+                    return match initialization {
+                        Some(initialization) => {
+                            Self::initialized_thread(thread, initialization, cx)
+                        }
+                        None => Task::ready(Ok(thread)),
+                    };
+                }
+                if let Some(initialization) = initialization {
+                    return cx.spawn(async move |cx| {
+                        if let Err(error) = initialization.task.await {
+                            log::debug!("Abandoned session initialization ended: {error:#}");
+                        }
+                        cx.update(|cx| {
+                            self.open_session(
+                                session_id,
+                                project,
+                                work_dirs,
+                                title,
+                                replay_history,
+                                switch_from,
+                                cx,
+                            )
+                        })
+                        .await
+                    });
+                }
+                self.remove_session(&session_id, thread.entity_id());
             }
-            self.remove_session(&session_id, thread.entity_id());
         }
         let mut request = acp::ResumeSessionRequest::new(session_id.clone(), context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
             .mcp_servers(context.mcp_servers.clone());
         if replay_history {
             request = request.replay_from(acp::ReplayFrom::Start(acp::ReplayFromStart::new()));
+        }
+        let switching = switch_from.is_some();
+        if let Some(source) = switch_from {
+            request = request.meta(
+                [(
+                    "yonder/switchFrom".into(),
+                    serde_json::json!(source.as_ref()),
+                )]
+                .into_iter()
+                .collect::<acp::Meta>(),
+            );
         }
         let thread =
             match self.create_session_thread(session_id.clone(), project, context, title, cx) {
@@ -1109,6 +1137,17 @@ impl AcpV2Connection {
                 let this = Rc::downgrade(&self);
                 let thread = thread.downgrade();
                 move |response, cx| {
+                    if switching
+                        && !response
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("yonder/switched"))
+                            .is_some_and(|value| value == &serde_json::Value::Bool(true))
+                    {
+                        anyhow::bail!(
+                            "The hub did not confirm the agent switch. Update the hub and try again."
+                        );
+                    }
                     let this = this.upgrade().context("Connection was released")?;
                     let thread = thread.upgrade().context("Session was released")?;
                     cx.update(|cx| {
@@ -1189,6 +1228,18 @@ impl AcpV2Connection {
             owner.initialization = Some(initialization.clone());
         }
         Self::initialized_thread(thread, initialization, cx)
+    }
+
+    pub fn switch_hub_agent(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        from: AgentId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_session(session_id, project, work_dirs, title, true, Some(from), cx)
     }
 
     fn ordered_response<Request: JsonRpcRequest + 'static>(
@@ -1512,7 +1563,7 @@ impl AgentConnection for AcpV2Connection {
         title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
-        self.open_session(session_id, project, work_dirs, title, true, cx)
+        self.open_session(session_id, project, work_dirs, title, true, None, cx)
     }
 
     fn resume_session(
@@ -1523,7 +1574,7 @@ impl AgentConnection for AcpV2Connection {
         title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
-        self.open_session(session_id, project, work_dirs, title, false, cx)
+        self.open_session(session_id, project, work_dirs, title, false, None, cx)
     }
 
     fn supports_close_session(&self) -> bool {
