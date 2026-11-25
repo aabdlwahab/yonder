@@ -5478,14 +5478,24 @@ impl AcpThread {
         chunk: acp_v2::ContentChunk,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        // Chunk-envelope metadata does not patch the message's metadata.
         let acp_v2::ContentChunk {
             message_id,
             content,
+            meta,
             ..
         } = chunk;
         let previous_entry_count = self.entries.len();
         let location = self.keyed_message_location(kind, message_id, cx)?;
+        // Carry the hub's author tag across replay without applying unrelated
+        // chunk-scoped metadata to the message.
+        if matches!(kind, MessageKind::Assistant | MessageKind::Thought)
+            && let Some(author) = meta.as_ref().and_then(|meta| meta.get("yonder/agent"))
+            && let Some((_, message_meta)) = location.fields_mut(&mut self.entries)
+        {
+            message_meta
+                .get_or_insert_with(Default::default)
+                .insert("yonder/agent".into(), author.clone());
+        }
         self.append_message_content(location, kind, content, previous_entry_count, cx)
     }
 

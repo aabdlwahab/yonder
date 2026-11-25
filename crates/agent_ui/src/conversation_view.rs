@@ -824,7 +824,7 @@ pub struct ConversationView {
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
-    claude_resume_task: Option<Task<()>>,
+    switch_agent_task: Option<Task<()>>,
     /// Reconnects a thread that runs on the Yonder hub after the connection
     /// drops, e.g. when the laptop sleeps.
     hub_retry: Option<Task<()>>,
@@ -1160,7 +1160,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
-            claude_resume_task: None,
+            switch_agent_task: None,
             hub_retry: None,
             hub_retry_attempt: 0,
             loading_status: None,
@@ -1260,6 +1260,18 @@ impl ConversationView {
     /// Drops the cached connection for this agent (so the next request spawns a
     /// fresh server process) and rebuilds the thread state from scratch.
     pub(crate) fn retry_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::hub_sync::HubSync::try_global(cx)
+            .and_then(|hub| hub.read(cx).route(self.project.read(cx), cx))
+            .is_some()
+            && let Some(store) = ThreadMetadataStore::try_global(cx)
+            && let Some(metadata) = store.read(cx).entry(self.thread_id)
+            && metadata.agent_id != self.connection_key.id()
+        {
+            self.connection_key = Agent::from(metadata.agent_id.clone());
+            self.agent = self
+                .connection_key
+                .server(self.project.read(cx).fs().clone(), ThreadStore::global(cx));
+        }
         self.connection_store.update(cx, |store, cx| {
             store.restart_connection(self.connection_key.clone(), self.agent.clone(), cx);
         });
@@ -1954,30 +1966,54 @@ impl ConversationView {
         &self.connection_key
     }
 
-    fn resume_claude_account(
+    fn switch_agent(
         &mut self,
         target: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.claude_resume_task.is_none(),
-            "A Claude account switch is already in progress"
+            self.switch_agent_task.is_none(),
+            "An agent switch is already in progress"
         );
-        let view = self
-            .root_thread_view()
-            .context("Open the Claude session first")?;
+        let view = self.root_thread_view().context("Open the chat first")?;
         let thread = view.read(cx).thread.clone();
         let source = thread.read(cx);
         anyhow::ensure!(
             !source.is_draft_thread(),
-            "Send a message before resuming this Claude session on another account"
+            "Send a message before switching agents in this chat"
         );
         anyhow::ensure!(
             source.is_idle_for_retention() && view.read(cx).message_queue.is_empty(),
-            "Wait for this Claude session to finish before switching accounts"
+            "Wait for the current reply and queued messages before switching agents"
         );
         let source_id = source.connection().agent_id();
+        anyhow::ensure!(
+            source_id != target,
+            "This agent is already replying in this chat"
+        );
+        let hub = crate::hub_sync::HubSync::try_global(cx);
+        let hub_backed = hub
+            .as_ref()
+            .is_some_and(|hub| hub.read(cx).route(self.project.read(cx), cx).is_some());
+        if hub_backed {
+            let agents = hub
+                .as_ref()
+                .and_then(|hub| hub.read(cx).thread_agents())
+                .context("Update the Yonder hub to switch agents in an open chat")?;
+            anyhow::ensure!(
+                agents.iter().any(|agent| agent == target.as_ref()),
+                "Set up {} on the hub in Agent Accounts first",
+                target
+            );
+        } else {
+            let registry_id = project::agent_server_store::registry_id_for_agent;
+            anyhow::ensure!(
+                registry_id(source_id.as_ref()) == agent_servers::CLAUDE_AGENT_ID
+                    && registry_id(target.as_ref()) == agent_servers::CLAUDE_AGENT_ID,
+                "Switching between Claude and Codex in one chat requires a Yonder hub"
+            );
+        }
         let session_id = source.session_id().clone();
         let submission = source.latest_submission_id();
         let entry_count = source.entries().len();
@@ -1995,7 +2031,8 @@ impl ConversationView {
         });
         let connect = entry.read(cx).wait_for_connection();
 
-        self.claude_resume_task = Some(cx.spawn_in(window, async move |this, cx| {
+        view.update(cx, |view, cx| view.set_switching_agent(true, cx));
+        self.switch_agent_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
                 let connection = connect
                     .await
@@ -2003,20 +2040,36 @@ impl ConversationView {
                     .connection;
                 anyhow::ensure!(
                     connection.supports_load_session(),
-                    "This Claude adapter cannot load saved sessions"
+                    "This adapter cannot load saved sessions"
                 );
-                cx.update(|_, cx| {
-                    agent_servers::copy_claude_session(
-                        project.clone(),
-                        source_id,
-                        target,
-                        session_id.clone(),
-                        cx,
-                    )
-                })?
-                .await?;
-                let resumed = cx
-                    .update(|_, cx| {
+                let resumed = if hub_backed {
+                    let destination = connection
+                        .clone()
+                        .downcast::<agent_servers::AcpV2Connection>()
+                        .context("The destination does not support hub agent switching")?;
+                    cx.update(|_, cx| {
+                        destination.switch_hub_agent(
+                            session_id.clone(),
+                            source_id,
+                            project,
+                            work_dirs,
+                            title,
+                            cx,
+                        )
+                    })?
+                    .await?
+                } else {
+                    cx.update(|_, cx| {
+                        agent_servers::copy_claude_session(
+                            project.clone(),
+                            source_id,
+                            target.clone(),
+                            session_id.clone(),
+                            cx,
+                        )
+                    })?
+                    .await?;
+                    cx.update(|_, cx| {
                         connection.clone().load_session(
                             session_id.clone(),
                             project,
@@ -2025,27 +2078,28 @@ impl ConversationView {
                             cx,
                         )
                     })?
-                    .await
-                    .context("The destination Claude account could not load this session")?;
+                    .await?
+                };
 
                 let installed = this
                     .update_in(cx, |this, window, cx| {
                         anyhow::ensure!(
                             resumed.read(cx).session_id() == &session_id,
-                            "Claude did not reopen the original session ID"
+                            "The agent did not reopen the original thread"
                         );
                         let current = this
                             .root_thread_view()
-                            .context("The original Claude session is no longer open")?;
+                            .context("The original chat is no longer open")?;
                         let current_view = current.read(cx);
                         let current_thread = current_view.thread.read(cx);
                         anyhow::ensure!(
                             current_view.thread == thread
-                                && current_thread.is_idle_for_retention()
-                                && current_thread.latest_submission_id() == submission
-                                && current_thread.entries().len() == entry_count
+                                && (hub_backed
+                                    || (current_thread.is_idle_for_retention()
+                                        && current_thread.latest_submission_id() == submission
+                                        && current_thread.entries().len() == entry_count))
                                 && current_view.message_queue.is_empty(),
-                            "The original Claude session changed while switching accounts"
+                            "The chat changed while switching agents"
                         );
 
                         let draft = current_view
@@ -2055,6 +2109,13 @@ impl ConversationView {
                         if !draft.is_empty() {
                             resumed
                                 .update(cx, |thread, cx| thread.set_draft_prompt(Some(draft), cx));
+                        }
+                        if let Some(store) = ThreadMetadataStore::try_global(cx)
+                            && let Some(mut metadata) =
+                                store.read(cx).entry(this.thread_id).cloned()
+                        {
+                            metadata.agent_id = target;
+                            store.update(cx, |store, cx| store.save(metadata, cx));
                         }
                         this.agent = server;
                         this.connection_key = target_agent;
@@ -2072,7 +2133,7 @@ impl ConversationView {
                     })
                     .and_then(|result| result);
 
-                if installed.is_err() && connection.supports_close_session() {
+                if installed.is_err() && !hub_backed && connection.supports_close_session() {
                     cx.update(|_, cx| {
                         let resumed_id = resumed.read(cx).session_id().clone();
                         connection.close_session(&resumed_id, cx)
@@ -2083,18 +2144,20 @@ impl ConversationView {
                 installed
             }
             .await;
-            this.update(cx, |this, _| {
-                if let Some(task) = this.claude_resume_task.take() {
+            this.update(cx, |this, cx| {
+                if let Some(task) = this.switch_agent_task.take() {
                     task.detach();
+                }
+                if let Some(view) = this.root_thread_view() {
+                    view.update(cx, |view, cx| view.set_switching_agent(false, cx));
                 }
             })
             .log_err();
             if let Err(error) = result {
-                log::error!("Could not resume Claude session on another account: {error:#}");
+                log::error!("Could not switch agents: {error:#}");
                 workspace
                     .update(cx, |workspace, cx| {
-                        workspace
-                            .show_error(format!("Could not resume Claude session: {error:#}"), cx)
+                        workspace.show_error(format!("Could not switch agents: {error:#}"), cx)
                     })
                     .log_err();
             }

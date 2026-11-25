@@ -32,6 +32,7 @@ pub struct HubSync {
     settings: HubSettings,
     token: Option<String>,
     machines: Vec<String>,
+    thread_agents: Option<Vec<String>>,
     status: HubStatus,
     conversations: Vec<DispatchConversation>,
     conversation_total: usize,
@@ -52,6 +53,8 @@ struct HubSession {
     id: String,
     machine: String,
     agent: String,
+    #[serde(default)]
+    native_session: Option<String>,
     cwd: String,
     #[serde(default)]
     title: Option<String>,
@@ -156,6 +159,7 @@ pub fn init(cx: &mut App) {
             settings: HubSettings::default(),
             token: None,
             machines: Vec::new(),
+            thread_agents: None,
             status: HubStatus::Off,
             conversations: Vec::new(),
             conversation_total: 0,
@@ -213,6 +217,10 @@ impl HubSync {
             &self.machines,
             machine.as_deref(),
         )
+    }
+
+    pub(crate) fn thread_agents(&self) -> Option<&[String]> {
+        self.thread_agents.as_deref()
     }
 
     /// Dispatch's saved conversations, newest first.
@@ -378,6 +386,7 @@ impl HubSync {
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.settings = HubSettings::get_global(cx).clone();
         self._sync = None;
+        self.thread_agents = None;
         self.conversations.clear();
         self.conversation_total = 0;
         let Some(address) = self
@@ -494,6 +503,10 @@ impl HubSync {
             .and_then(|sessions| serde_json::from_value(sessions.clone()).ok())
             .unwrap_or_default();
         self.token = Some(token.to_string());
+        self.thread_agents = results
+            .first()
+            .and_then(|result| result.get("threadAgents"))
+            .and_then(|agents| serde_json::from_value(agents.clone()).ok());
         self.machines = machines.clone();
         self.status = HubStatus::Connected {
             machines,
@@ -574,15 +587,26 @@ fn add_hub_sessions(sessions: Vec<HubSession>, cx: &mut App) {
         .ssh_connections
         .clone()
         .unwrap_or_default();
-    let missing: Vec<ThreadMetadata> = sessions
+    let changed: Vec<ThreadMetadata> = sessions
         .into_iter()
-        .filter(|session| {
-            store
-                .read(cx)
-                .entry_by_session(&acp::SessionId::new(session.id.clone()))
-                .is_none()
-        })
         .filter_map(|session| {
+            let session_id = acp::SessionId::new(session.id);
+            if let Some(existing) = store.read(cx).entry_by_session(&session_id) {
+                if session.native_session.is_some()
+                    && existing.agent_id.as_ref() != session.agent.as_str()
+                    && existing
+                        .remote_connection
+                        .as_ref()
+                        .and_then(agent_servers::machine_name)
+                        .as_deref()
+                        == Some(session.machine.as_str())
+                {
+                    let mut metadata = existing.clone();
+                    metadata.agent_id = AgentId(session.agent.into());
+                    return Some(metadata);
+                }
+                return None;
+            }
             let connection = connections.iter().find(|connection| {
                 connection.nickname.as_deref() == Some(session.machine.as_str())
                     || connection.host == session.machine
@@ -594,7 +618,7 @@ fn add_hub_sessions(sessions: Vec<HubSession>, cx: &mut App) {
             let created_at = Utc.timestamp_opt(session.created_at, 0).single();
             Some(ThreadMetadata {
                 thread_id: ThreadId::new(),
-                session_id: Some(acp::SessionId::new(session.id)),
+                session_id: Some(session_id),
                 agent_id: AgentId(session.agent.into()),
                 title: session.title.map(Into::into),
                 title_override: None,
@@ -611,12 +635,12 @@ fn add_hub_sessions(sessions: Vec<HubSession>, cx: &mut App) {
             })
         })
         .collect();
-    if missing.is_empty() {
+    if changed.is_empty() {
         return;
     }
-    log::info!("adding {} threads from the hub", missing.len());
+    log::info!("syncing {} threads from the hub", changed.len());
     store.update(cx, |store, cx| {
-        for thread in missing {
+        for thread in changed {
             store.save(thread, cx);
         }
     });

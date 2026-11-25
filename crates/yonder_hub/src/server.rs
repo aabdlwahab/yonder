@@ -348,6 +348,31 @@ fn apply(hub: &Rc<RefCell<Hub>>, outputs: Vec<Output>, cx: &mut AsyncApp) {
             } => continue_dispatch(hub.clone(), client, id, session, prompt, cx),
             Output::Notify(notice) => send_notice(hub, &notice, cx),
             Output::SaveSessions => save = true,
+            Output::FinishSwitch {
+                client,
+                request,
+                session,
+                agent,
+                setup,
+                replay,
+            } => {
+                let outputs = {
+                    let mut state = hub.borrow_mut();
+                    let Hub {
+                        relay, registry, ..
+                    } = &mut *state;
+                    match relay.finish_switch(&session, agent, setup, |sessions| {
+                        registry.save_sessions(sessions)
+                    }) {
+                        Ok(()) => relay.attach_live(client, session, &request, replay),
+                        Err(error) => vec![Output::ToClient(
+                            client,
+                            error_response(&request, &format!("{error:#}")),
+                        )],
+                    }
+                };
+                apply(hub, outputs, cx);
+            }
             Output::AppendLog { session, line } => {
                 if let Err(error) = hub.borrow().registry.append_log(&session, &line) {
                     log::error!("saving the log of {session}: {error:#}");
